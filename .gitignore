@@ -1,0 +1,29 @@
+# 字节码与缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 密钥与本地配置
+.env
+
+# 运行时数据
+data/
+workspace/documents/*
+workspace/notes/*
+workspace/audit/*
+workspace/skills/
+workspace/AGENTS.md
+!workspace/README.md
+!workspace/documents/.gitkeep
+!workspace/notes/.gitkeep
+
+# 系统杂项
+.DS_Store
+*.log
