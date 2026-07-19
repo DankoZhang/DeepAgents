@@ -9,13 +9,13 @@ Checkpointer + HITL」组装成一个可 ``invoke`` / ``ainvoke`` / ``stream`` �
 
 | 能力 | 本文件用法 |
 |------|------------|
-| 子 Agent 委派 | ``subagents=build_all_subagents()`` |
+| 子 Agent 委派 | ``subagents=build_all_subagents()``（YAML 配置） |
 | 虚拟文件系统 | ``backend=FilesystemBackend(...)`` |
 | Memory | ``memory=[AGENTS.md 路径]`` |
-| Skills | ``skills=[skills 目录]`` |
+| Skills | 挂在各子 Agent ``skills=[专属 source]`` |
 | 自定义 Middleware | ``middleware=[Logging, Timing, Audit]`` |
 | Human-in-the-loop | ``interrupt_on={...}``（开关控制） |
-| 多轮持久化 | ``checkpointer=SqliteSaver`` |
+| 多轮持久化 | ``checkpointer=RedisSaver`` |
 | 路径权限 | ``permissions=[...]`` |
 """
 
@@ -94,20 +94,30 @@ def _build_checkpointer(settings: Settings):
     """
     构建 checkpointer，用于多轮对话的 thread 级状态持久化。
 
-    优先尝试 ``langgraph-checkpoint-sqlite``（跨进程）；
-    未安装时回退到 ``InMemorySaver``（进程内有效，适合演示）。
+    优先 ``langgraph-checkpoint-redis``（跨进程 / 跨服务）。
+    ``require_redis_checkpointer=True`` 时 Redis 不可用则抛错；
+    否则回退 ``InMemorySaver``（进程内有效，适合本地演示）。
+
+    注意：RedisSaver 需要 Redis 8+（自带 RedisJSON/RediSearch）或 Redis Stack。
     """
     try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        import sqlite3
+        from langgraph.checkpoint.redis import RedisSaver
 
-        settings.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(settings.checkpoint_db), check_same_thread=False)
-        saver = SqliteSaver(conn)
-        logger.info("Checkpointer: SqliteSaver -> %s", settings.checkpoint_db)
+        # 不用 from_conn_string 上下文管理器：工厂返回的 saver 需与 Agent 同生命周期
+        saver = RedisSaver(redis_url=settings.redis_url)
+        saver.setup()
+        logger.info("Checkpointer: RedisSaver -> %s", settings.redis_url)
         return saver
     except Exception as exc:  # noqa: BLE001
-        logger.info("使用 InMemorySaver（Sqlite 不可用：%s）", exc)
+        if settings.require_redis_checkpointer:
+            raise RuntimeError(
+                f"Redis checkpointer 不可用（REQUIRE_REDIS_CHECKPOINTER=true）：{exc}"
+            ) from exc
+        logger.warning(
+            "使用 InMemorySaver（Redis 不可用：%s）。"
+            "多 worker / 重启后对话状态会丢失；生产请设 REQUIRE_REDIS_CHECKPOINTER=true",
+            exc,
+        )
         return InMemorySaver()
 
 
@@ -150,61 +160,6 @@ def _configure_general_purpose_profile(settings: Settings) -> None:
         logger.warning("HarnessProfile 注册失败（可忽略）：%s", exc)
 
 
-def build_deep_agent(settings: Settings | None = None):
-    """
-    创建完整的 Deep Agent 图。
-
-    Returns:
-        LangGraph ``CompiledStateGraph``，可直接::
-
-            agent.invoke(
-                {"messages": [{"role": "user", "content": "..."}]},
-                config={"configurable": {"thread_id": "session-1"}},
-            )
-    """
-    settings = settings or get_settings()
-    model = build_chat_model(settings)
-    backend = build_filesystem_backend(settings)
-    subagents = build_all_subagents()
-    middleware = _build_middleware(settings)
-    interrupt_on = _build_interrupt_on(settings)
-    checkpointer = _build_checkpointer(settings)
-    permissions = _build_permissions()
-
-    _configure_general_purpose_profile(settings)
-
-    # Memory / Skills：FilesystemBackend 虚拟根 = workspace，
-    # 因此先把项目级 AGENTS.md / skills 同步进 workspace，再传虚拟路径。
-    _sync_memory_and_skills_into_workspace(settings)
-
-    memory_paths = ["/AGENTS.md"] if (settings.workspace_dir / "AGENTS.md").exists() else None
-    skills_paths = ["/skills/"] if (settings.workspace_dir / "skills").exists() else None
-
-    logger.info(
-        "组装 Deep Agent：subagents=%s middleware=%d hitl=%s memory=%s skills=%s",
-        [s["name"] for s in subagents],
-        len(middleware),
-        bool(interrupt_on),
-        memory_paths,
-        skills_paths,
-    )
-
-    agent = create_deep_agent(
-        model=model,
-        system_prompt=SUPERVISOR_SYSTEM_PROMPT,
-        subagents=subagents,
-        backend=backend,
-        middleware=middleware,
-        memory=memory_paths,
-        skills=skills_paths,
-        permissions=permissions,
-        interrupt_on=interrupt_on,
-        checkpointer=checkpointer,
-        name="deepagents-supervisor",
-    )
-    return agent
-
-
 def _sync_memory_and_skills_into_workspace(settings: Settings) -> None:
     """
     把项目级 AGENTS.md 与 skills/ 同步到 workspace，供 FilesystemBackend 读取。
@@ -221,9 +176,65 @@ def _sync_memory_and_skills_into_workspace(settings: Settings) -> None:
         shutil.copy2(src_memory, dst_memory)
 
     # Skills：整个目录树复制
+    # 期望结构（与 deepagents SkillsMiddleware 一层扫描一致）：
+    #   skills/<subagent-name>/<skill-name>/SKILL.md
     src_skills = settings.skills_dir
     dst_skills = settings.workspace_dir / "skills"
     if src_skills.exists():
         if dst_skills.exists():
             shutil.rmtree(dst_skills)
         shutil.copytree(src_skills, dst_skills)
+
+
+def build_deep_agent(settings: Settings | None = None):
+    """
+    创建完整的 Deep Agent 图。
+
+    Returns:
+        LangGraph ``CompiledStateGraph``，可直接::
+
+            agent.invoke(
+                {"messages": [{"role": "user", "content": "..."}]},
+                config={"configurable": {"thread_id": "session-1"}},
+            )
+    """
+    settings = settings or get_settings()
+    model = build_chat_model(settings)
+    backend = build_filesystem_backend(settings)
+    subagents = build_all_subagents(settings.subagents_config)
+    middleware = _build_middleware(settings)
+    interrupt_on = _build_interrupt_on(settings)
+    checkpointer = _build_checkpointer(settings)
+    permissions = _build_permissions()
+
+    _configure_general_purpose_profile(settings)
+
+    # Memory / Skills：FilesystemBackend 虚拟根 = workspace，
+    # 因此先把项目级 AGENTS.md / skills 同步进 workspace，再传虚拟路径。
+    # Skills 挂在各子 Agent 的 skills 字段（见 subagents/*），主 Agent 不加载。
+    _sync_memory_and_skills_into_workspace(settings)
+
+    memory_paths = ["/AGENTS.md"] if (settings.workspace_dir / "AGENTS.md").exists() else None
+
+    logger.info(
+        "组装 Deep Agent：subagents=%s middleware=%d hitl=%s memory=%s skills=%s",
+        [s["name"] for s in subagents],
+        len(middleware),
+        bool(interrupt_on),
+        memory_paths,
+        {s["name"]: s.get("skills") for s in subagents},
+    )
+
+    agent = create_deep_agent(
+        model=model,
+        system_prompt=SUPERVISOR_SYSTEM_PROMPT,
+        subagents=subagents,
+        backend=backend,
+        middleware=middleware,
+        memory=memory_paths,
+        permissions=permissions,
+        interrupt_on=interrupt_on,
+        checkpointer=checkpointer,
+        name="deepagents-supervisor",
+    )
+    return agent

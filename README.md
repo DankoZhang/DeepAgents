@@ -1,41 +1,20 @@
-# DeepAgents 演示框架
+# DeepAgents 方法论平台（后端）
 
-基于 [LangChain Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)（`deepagents`）搭建的**完整可运行示例**：主 Agent 负责调度，三个专业子 Agent 分别处理文档、计算机操作与智能问答，并演示 Middleware、Memory、Skills、Filesystem Backend、Permissions、Checkpointer、Human-in-the-loop 等核心能力。
+基于 [LangChain Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview) 的**可配置方法论驱动多 Agent 平台**后端。
 
-## 架构一览
+支持：
 
-```
-用户
-  │
-  ▼
-┌─────────────────────────────────────────┐
-│  Supervisor（主 Agent）                   │
-│  - system_prompt 调度策略                 │
-│  - write_todos / task（deepagents 内置）  │
-│  - Logging / Timing / Audit Middleware    │
-│  - Memory(AGENTS.md) + Skills             │
-│  - FilesystemBackend + Permissions        │
-└────────────┬────────────────────────────┘
-             │ task(subagent_type=…)
-     ┌───────┼──────────────┐
-     ▼       ▼              ▼
- document-  computer-     qa-expert
-  writer    operator
- (写文档)   (文件/Shell)   (知识问答)
-```
+- FastAPI 配置与会话 API
+- PostgreSQL 方法论 / Agent / Tool / Middleware 配置库
+- Redis（LangGraph checkpoint）多轮会话隔离
+- 按方法论动态 `create_deep_agent()` + 进程内缓存
+- 方法论版本快照（旧会话锁定创建时版本）
 
-| 组件 | 路径 | 说明 |
-|------|------|------|
-| 工厂组装 | `deepagents_app/factory.py` | `create_deep_agent(...)` 一站式装配 |
-| 主提示词 | `deepagents_app/supervisor/` | 调度策略与路由表 |
-| 子 Agent | `deepagents_app/subagents/` | 三个 SubAgent 规格 |
-| 工具 | `deepagents_app/tools/` | 文档 / 计算机 / 问答工具 |
-| 中间件 | `deepagents_app/middleware/` | 日志、计时、审计 |
-| Skills | `deepagents_app/skills/*/SKILL.md` | 渐进披露领域知识 |
-| Memory | `AGENTS.md` | 启动即加载的行为准则 |
-| 工作区 | `workspace/` | Agent 可读写沙箱 |
+前端仓库：[`../DeepAgents-frontend`](../DeepAgents-frontend)
 
-## 快速开始
+---
+
+## 平台模式（推荐）
 
 ```bash
 cd Agents-Project/DeepAgents
@@ -45,14 +24,61 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# 编辑 .env，填入 OPENAI_API_KEY 或 ANTHROPIC_API_KEY
+# 编辑 .env，填入 API Key
 
+# 启动 PostgreSQL + Redis
+docker compose up -d
+
+# 启动 FastAPI（默认 http://0.0.0.0:8000）
+python server.py
+```
+
+另开终端启动前端：
+
+```bash
+cd Agents-Project/DeepAgents-frontend
+npm install
+npm run dev
+# http://localhost:5173
+```
+
+API 文档：http://localhost:8000/docs
+
+主要接口：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/methodology` | 创建方法论 |
+| GET | `/api/methodology/list` | 列表 |
+| POST | `/api/methodology/{id}/publish` | 发布 |
+| POST | `/api/agent` | 创建 Agent |
+| GET | `/api/tool/list` | 工具注册表 |
+| GET | `/api/middleware/list` | 中间件注册表 |
+| POST | `/api/conversation` | 创建会话（绑定方法论版本） |
+| GET | `/api/conversation/{thread_id}/messages` | 历史消息 |
+| POST | `/api/chat` | 聊天 |
+| POST | `/api/chat/resume` | HITL 恢复 |
+
+冒烟测试（不依赖 LLM）：
+
+```bash
+python -m pytest tests/test_api_mvp.py -q
+```
+
+---
+
+## CLI 演示模式（YAML）
+
+不走配置库时，可用 YAML 演示工厂：
+
+```bash
 python main.py
-# 或单次提问
+# 或按数据库方法论组装
+python main.py --methodology demo_deepagents
 python main.py -q "什么是 Deep Agents 的 Middleware？"
 ```
 
-兼容第三方 OpenAI API（如 DeepSeek）时：
+兼容第三方 OpenAI API（如 DeepSeek）：
 
 ```env
 MODEL_PROVIDER=openai_compatible
@@ -63,45 +89,34 @@ OPENAI_API_KEY=sk-...
 
 ## 已演示的 Deep Agents 能力
 
-1. **主从调度**：Supervisor + `task` 委派三个专业子 Agent  
-2. **自定义 Middleware**：`wrap_model_call` / `wrap_tool_call` 做日志、计时、审计  
-3. **Filesystem Backend**：本地 `workspace/` 作为虚拟文件系统根  
-4. **Permissions**：拒绝写入 `/audit/**`，其余允许  
-5. **Memory**：`AGENTS.md` 注入长期行为准则  
-6. **Skills**：`SKILL.md` 渐进披露  
-7. **Checkpointer**：多轮 `thread_id` 状态（优先 Sqlite，回退内存）  
-8. **HITL**：`ENABLE_HITL=true` 或 `python main.py --hitl`，危险工具前暂停  
-9. **HarnessProfile**：定制默认 `general-purpose` 子 Agent 描述  
+1. **主从调度**：Supervisor + `task` 委派多个 SubAgent
+2. **自定义 Middleware**：日志、计时、审计
+3. **Filesystem Backend**：本地 `workspace/` 沙箱
+4. **Permissions**：路径级读写控制
+5. **Memory / Skills**：`AGENTS.md` + `SKILL.md`
+6. **Checkpointer**：Redis 多轮 `thread_id` 隔离
+7. **HITL**：危险工具前暂停（`ENABLE_HITL=true`）
+8. **方法论驱动**：DB 配置 → Agent Factory → 版本缓存
 
 ## 目录结构
 
 ```
 DeepAgents/
-├── main.py                      # CLI 入口
-├── AGENTS.md                    # Memory
-├── requirements.txt
-├── .env.example
-├── examples/quickstart.py
+├── main.py                 # CLI 入口
+├── server.py               # FastAPI 入口
+├── docker-compose.yml      # PostgreSQL + Redis
 ├── deepagents_app/
-│   ├── factory.py               # 核心：create_deep_agent 组装
-│   ├── config.py
-│   ├── models.py
-│   ├── backends.py
-│   ├── supervisor/
-│   ├── subagents/
+│   ├── api/                # FastAPI 路由与 schemas
+│   ├── db/                 # ORM / session / seed
+│   ├── services/           # 方法论 / Agent Factory / 会话 / Chat
+│   ├── registries/         # Tool / Middleware class_path 加载
+│   ├── factory.py          # YAML 演示组装
 │   ├── tools/
 │   ├── middleware/
 │   └── skills/
-└── workspace/                   # 运行时沙箱（自动创建）
+└── workspace/
 ```
-
-## 试用提示词
-
-- 「请解释 Deep Agents 里 Memory 和 Skills 的区别」（走 `qa-expert`）  
-- 「写一份本项目的 README 并保存」（走 `document-writer`）  
-- 「列出 workspace 里有什么文件」（走 `computer-operator`）  
-- 「先查一下 Middleware 是什么，再写一篇介绍文档保存」（主 Agent 串行/并行调度）  
 
 ## 说明
 
-本仓库是**教学与脚手架**性质：Shell 白名单、路径沙箱均为演示级。生产环境请改用官方 Sandbox Backend，并加强密钥脱敏、审计与 HITL 策略。
+本仓库含教学与脚手架性质配置。生产环境请加强密钥脱敏、审计与 HITL 策略，并按需收紧 CORS。

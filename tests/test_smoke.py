@@ -29,6 +29,32 @@ def test_subagent_specs() -> None:
         assert isinstance(s["tools"], list) and s["tools"]
 
 
+def test_subagent_yaml_loader_respects_enabled(tmp_path) -> None:
+    """enabled: false 的条目应被跳过。"""
+    from deepagents_app.subagents.loader import load_subagents_from_yaml
+
+    cfg = tmp_path / "subagents.yaml"
+    cfg.write_text(
+        """
+subagents:
+  - name: only-qa
+    description: 仅启用的问答专家
+    system_prompt: 你是问答 Agent。
+    tools: qa
+    enabled: true
+  - name: disabled-one
+    description: 应被跳过
+    system_prompt: unused
+    tools: document
+    enabled: false
+""",
+        encoding="utf-8",
+    )
+    subs = load_subagents_from_yaml(cfg)
+    assert [s["name"] for s in subs] == ["only-qa"]
+    assert subs[0]["tools"]
+
+
 def test_knowledge_search() -> None:
     from deepagents_app.tools.qa_tools import search_knowledge
 

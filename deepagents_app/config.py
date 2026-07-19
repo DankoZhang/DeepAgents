@@ -46,8 +46,24 @@ class Settings(BaseSettings):
     memory_file: Path = Field(default=PROJECT_ROOT / "AGENTS.md")
     # Skills 根目录——渐进披露的领域知识包
     skills_dir: Path = Field(default=PROJECT_ROOT / "deepagents_app" / "skills")
-    # SQLite checkpointer 路径（多轮对话持久化）
-    checkpoint_db: Path = Field(default=PROJECT_ROOT / "data" / "checkpoints.db")
+    # SubAgent 声明式配置（YAML）；构建 graph 时自动加载
+    subagents_config: Path = Field(
+        default=PROJECT_ROOT / "deepagents_app" / "config" / "subagents.yaml"
+    )
+    # Redis checkpointer 连接串（多轮对话持久化）
+    # 需要 Redis 8+ 或 Redis Stack（含 RedisJSON + RediSearch）
+    redis_url: str = "redis://localhost:6379"
+    # True：Redis 不可用时直接失败（生产建议开启）；False：回退 InMemorySaver
+    require_redis_checkpointer: bool = False
+
+    # PostgreSQL：方法论 / Agent / Tool / Middleware / Conversation 配置库
+    database_url: str = (
+        "postgresql+psycopg://deepagents:deepagents@localhost:5432/deepagents"
+    )
+
+    # FastAPI
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
 
     # ── 功能开关 ──────────────────────────────────────────────────────
     # 是否在危险工具（shell / 写文件）前暂停等待人工批准
@@ -57,7 +73,13 @@ class Settings(BaseSettings):
     # 日志级别
     log_level: str = "INFO"
 
-    @field_validator("workspace_dir", "memory_file", "skills_dir", "checkpoint_db", mode="before")
+    @field_validator(
+        "workspace_dir",
+        "memory_file",
+        "skills_dir",
+        "subagents_config",
+        mode="before", # 在 Pydantic 对参数进行类型转换和验证之前解析路径
+    )
     @classmethod
     def _resolve_path(cls, value: str | Path) -> Path:
         """相对路径一律相对项目根解析，保证启动目录无关。"""
@@ -69,7 +91,6 @@ class Settings(BaseSettings):
     def ensure_directories(self) -> None:
         """创建运行时必需的目录（幂等）。"""
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
         (self.workspace_dir / "documents").mkdir(parents=True, exist_ok=True)
         (self.workspace_dir / "notes").mkdir(parents=True, exist_ok=True)
 

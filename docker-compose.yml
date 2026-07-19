@@ -1,0 +1,36 @@
+# DeepAgents MVP 基础设施：PostgreSQL（配置库）+ Redis Stack（checkpoint）
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: deepagents-postgres
+    environment:
+      POSTGRES_USER: deepagents
+      POSTGRES_PASSWORD: deepagents
+      POSTGRES_DB: deepagents
+    ports:
+      - "5432:5432"
+    volumes:
+      - deepagents_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deepagents -d deepagents"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    # Redis Stack：自带 RedisJSON + RediSearch，满足 langgraph-checkpoint-redis
+    image: redis/redis-stack-server:latest
+    container_name: deepagents-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - deepagents_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  deepagents_pg_data:
+  deepagents_redis_data:
