@@ -23,6 +23,7 @@ workspace/AGENTS.md
 !workspace/README.md
 !workspace/documents/.gitkeep
 !workspace/notes/.gitkeep
+database/
 
 # 系统杂项
 .DS_Store

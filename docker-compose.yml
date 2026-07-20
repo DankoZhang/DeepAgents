@@ -10,7 +10,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - deepagents_pg_data:/var/lib/postgresql/data
+      - ./database/deepagents_pg_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U deepagents -d deepagents"]
       interval: 5s
@@ -24,13 +24,9 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - deepagents_redis_data:/data
+      - ./database/deepagents_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
-
-volumes:
-  deepagents_pg_data:
-  deepagents_redis_data:
