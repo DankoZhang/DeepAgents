@@ -42,6 +42,7 @@ def create_methodology(
     description: str = "",
     methodology_id: str | None = None,
 ) -> Methodology:
+    """创建草稿方法论，并写入 v1 初始快照。"""
     mid = methodology_id or _slug_id(name)
     if db.get(Methodology, mid) is not None:
         raise ValueError(f"方法论已存在：{mid}")
@@ -98,6 +99,11 @@ def delete_methodology(db: Session, methodology_id: str) -> None:
 
 
 def publish_methodology(db: Session, methodology_id: str) -> Methodology:
+    """
+    发布方法论：校验存在 Supervisor → status=published → 快照。
+
+    只有 published 状态才能创建新会话。
+    """
     row = db.get(Methodology, methodology_id)
     if row is None:
         raise LookupError(f"方法论不存在：{methodology_id}")

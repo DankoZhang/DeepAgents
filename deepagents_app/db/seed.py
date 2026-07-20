@@ -125,6 +125,7 @@ def _read_prompt(name: str) -> str:
 
 
 def seed_tools_and_middlewares(db: Session) -> None:
+    """幂等写入内置 Tool / Middleware 元信息（已存在则跳过）。"""
     for item in DEFAULT_TOOLS:
         if db.get(ToolDefinition, item["id"]) is None:
             create_tool(
@@ -147,6 +148,13 @@ def seed_tools_and_middlewares(db: Session) -> None:
 
 
 def seed_demo_methodology(db: Session) -> None:
+    """
+    写入演示方法论（Supervisor + 三个 SubAgent）。
+
+    仅在方法论不存在时执行；已存在不覆盖用户后续编辑。
+    批量建 Agent 时 ``bump_version=False``，最后统一 publish + snapshot，
+    避免每个 Agent 都触发一次版本递增。
+    """
     if db.get(Methodology, DEMO_METHODOLOGY_ID) is not None:
         return
 
@@ -240,5 +248,6 @@ def seed_demo_methodology(db: Session) -> None:
 
 
 def seed_defaults(db: Session) -> None:
+    """应用启动入口：工具/中间件 → 演示方法论。"""
     seed_tools_and_middlewares(db)
     seed_demo_methodology(db)

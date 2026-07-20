@@ -1,4 +1,10 @@
-"""聊天 API。"""
+"""
+聊天 API
+========
+
+- ``POST /chat``：按 thread 发一轮消息
+- ``POST /chat/resume``：HITL 中断后批准 / 拒绝工具调用
+"""
 
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ router = APIRouter(tags=["chat"])
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(body: ChatRequest, db: Session = Depends(get_db)):
+    """按会话绑定的方法论版本 invoke Agent。"""
     try:
         result = run_chat(db, thread_id=body.thread_id, message=body.message)
         return ChatResponse(**result)

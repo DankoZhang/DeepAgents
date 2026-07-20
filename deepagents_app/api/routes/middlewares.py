@@ -1,4 +1,9 @@
-"""Middleware 注册 API。"""
+"""
+Middleware 注册 API
+===================
+
+元信息 CRUD；运行时按 class_path 实例化并挂到 Agent。
+"""
 
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ def list_middlewares(db: Session = Depends(get_db)):
 
 @router.post("/middleware", response_model=MiddlewareOut)
 def create_middleware(body: MiddlewareCreate, db: Session = Depends(get_db)):
+    """``class_path`` 指向 Middleware 类，config 作为构造参数。"""
     try:
         return mw_svc.create_middleware(
             db,

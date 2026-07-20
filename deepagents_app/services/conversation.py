@@ -1,4 +1,10 @@
-"""会话服务：创建 Conversation，绑定方法论版本。"""
+"""
+会话服务
+========
+
+创建 Conversation 时锁定方法论 version；后续聊天始终按该版本重建 Agent，
+不受 live 表后续编辑影响。
+"""
 
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ def create_conversation(
         thread_id=tid,
         user_id=user_id,
         methodology_id=methodology.id,
+        # 锁定此刻的版本号；Agent Factory 据此选择 live 或 snapshot
         methodology_version=methodology.version,
     )
     db.add(row)

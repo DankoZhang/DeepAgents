@@ -1,4 +1,9 @@
-"""Tool 注册 API。"""
+"""
+Tool 注册 API
+=============
+
+只管理元信息（name / class_path / schema）；运行时由 registry 按 class_path 动态加载。
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ router = APIRouter(tags=["tools"])
 
 @router.get("/tool/list", response_model=list[ToolOut])
 def list_tools(
-    status: str | None = Query(None),
+    status: str | None = Query(None, description="active | disabled"),
     db: Session = Depends(get_db),
 ):
     return tools_svc.list_tools(db, status=status)
@@ -22,6 +27,7 @@ def list_tools(
 
 @router.post("/tool", response_model=ToolOut)
 def create_tool(body: ToolCreate, db: Session = Depends(get_db)):
+    """``class_path`` 格式：``module.path:attr_name``。"""
     try:
         return tools_svc.create_tool(
             db,

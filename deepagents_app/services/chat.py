@@ -1,4 +1,10 @@
-"""聊天服务：按 thread 加载方法论 → Agent Factory → invoke / resume。"""
+"""
+聊天服务
+========
+
+按 thread 加载 Conversation → Agent Factory（锁定 methodology_version）→
+invoke / resume / 读取 checkpointer 历史。
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_content(content: Any) -> str:
+    """统一把 str / multimodal block 列表转为纯文本。"""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -28,6 +35,7 @@ def _normalize_content(content: Any) -> str:
 
 
 def _msg_role(msg: Any) -> str:
+    """LangChain Message.type / OpenAI role → 前端 role。"""
     raw = getattr(msg, "type", None) or (
         msg.get("role") if isinstance(msg, dict) else None
     )
@@ -83,6 +91,7 @@ def _pack_result(
     methodology_id: str,
     methodology_version: int,
 ) -> dict[str, Any]:
+    """统一 chat / resume 响应结构；``__interrupt__`` 表示 HITL 暂停。"""
     interrupts = result.get("__interrupt__")
     return {
         "thread_id": thread_id,
@@ -117,11 +126,13 @@ def chat(
     if conversation is None:
         raise LookupError(f"会话不存在：thread_id={thread_id}")
 
+    # 必须按会话创建时的 version 构建，避免方法论升级影响进行中的对话
     agent = build_agent_from_methodology(
         db,
         conversation.methodology_id,
         version=conversation.methodology_version,
     )
+    # LangGraph 用 thread_id 隔离多轮 checkpointer 状态
     config = {"configurable": {"thread_id": thread_id}}
     logger.info(
         "chat thread=%s methodology=%s v%s",
@@ -208,6 +219,7 @@ def get_conversation_messages(
         values = getattr(state, "values", None) or {}
         if isinstance(values, dict):
             messages = values.get("messages") or []
+        # tasks 上挂着未解决的 interrupt（HITL 暂停中）
         tasks = getattr(state, "tasks", None) or ()
         for task in tasks:
             interrupts = getattr(task, "interrupts", None) or ()

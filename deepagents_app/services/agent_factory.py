@@ -219,6 +219,11 @@ def _assemble_create_kwargs(
     supervisor_config: dict[str, Any],
     subagents: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """
+    live / snapshot 两条路径共用的 ``create_deep_agent`` 参数组装。
+
+    HITL：方法论可覆盖 ``interrupt_on``；全局开关关闭时强制为 None。
+    """
     interrupt_cfg = supervisor_config.get("interrupt_on")
     if interrupt_cfg is None:
         interrupt_on = _build_interrupt_on(settings)
@@ -235,6 +240,7 @@ def _assemble_create_kwargs(
     checkpointer = _build_checkpointer(settings)
     permissions = _build_permissions()
     _configure_general_purpose_profile(settings)
+    # FilesystemBackend 根 = workspace，需先同步 AGENTS.md / skills
     _sync_memory_and_skills_into_workspace(settings)
     memory_paths = ["/AGENTS.md"] if (settings.workspace_dir / "AGENTS.md").exists() else None
 
@@ -260,6 +266,7 @@ def _build_from_live(
     methodology: Methodology,
     settings: Settings,
 ) -> Any:
+    """从当前 live 表组装 Agent（会话版本 == 方法论当前 version）。"""
     from deepagents import create_deep_agent
 
     agents = [a for a in methodology.agents if _agent_enabled(a)]
@@ -306,6 +313,7 @@ def _build_from_snapshot(
     version: int,
     settings: Settings,
 ) -> Any:
+    """从 MethodologyRevision 快照组装 Agent（旧会话锁定历史版本）。"""
     from deepagents import create_deep_agent
 
     revision = get_revision(db, methodology_id, version)
@@ -366,6 +374,7 @@ def build_agent_from_methodology(
     """
     settings = settings or get_settings()
     methodology = get_methodology_config(db, methodology_id, version=version)
+    # 未指定 version 时跟 live；指定时优先保证会话创建时的版本一致性
     target_version = version if version is not None else methodology.version
     key = cache_key(methodology.id, target_version)
 
@@ -376,6 +385,7 @@ def build_agent_from_methodology(
                 logger.info("命中 Agent 缓存：%s", key)
                 return cached
 
+    # 版本一致走 live（含关系预加载）；否则必须从快照重建
     if target_version == methodology.version:
         agent = _build_from_live(db, methodology, settings)
     else:

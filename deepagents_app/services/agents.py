@@ -34,7 +34,7 @@ def list_agents(db: Session, methodology_id: str) -> list[AgentDefinition]:
 
 
 def get_agent(db: Session, agent_id: str) -> AgentDefinition | None:
-    # 避免 identity map 中旧的 tools/middlewares 集合导致绑定后仍为空
+    # 绑定关系后 identity map 可能仍持有旧集合；expire 强制从 DB 重新加载
     db.expire_all()
     return (
         db.query(AgentDefinition)
@@ -61,6 +61,12 @@ def create_agent(
     middleware_ids: list[str] | None = None,
     bump_version: bool = True,
 ) -> AgentDefinition:
+    """
+    在方法论下创建 Agent。
+
+    ``config.role`` 默认为 ``subagent``；Supervisor 需显式传 ``role=supervisor``。
+    ``bump_version=False`` 用于批量种子写入，由调用方统一快照。
+    """
     methodology = db.get(Methodology, methodology_id)
     if methodology is None:
         raise LookupError(f"方法论不存在：{methodology_id}")
@@ -76,6 +82,7 @@ def create_agent(
     if existing is not None:
         raise ValueError(f"方法论内已存在同名 Agent：{name}")
 
+    # role / enabled 等扩展字段存在 JSON config，ORM 列只保留核心属性
     cfg = dict(config or {})
     cfg.setdefault("role", "subagent")
     cfg.setdefault("enabled", True)
@@ -245,6 +252,11 @@ def _bind_middlewares(
 
 
 def _bump_and_snapshot(db: Session, methodology: Methodology) -> None:
+    """
+    配置变更后的统一收尾：version+1 → 失效缓存 → 写版本快照。
+
+    旧会话仍按 Conversation.methodology_version 从快照重建，不受 live 表影响。
+    """
     methodology.version += 1
     methodology.updated_time = datetime.now(timezone.utc)
     invalidate_agent_cache(methodology.id)
