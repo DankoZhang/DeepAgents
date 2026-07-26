@@ -3,7 +3,7 @@ Deep Agent 共享组装工具
 ======================
 
 供 ``agent_factory`` 复用的底层能力：
-checkpointer / HITL / permissions / middleware / HarnessProfile / workspace 同步。
+checkpointer / HITL / permissions / HarnessProfile / workspace 同步。
 
 方法论驱动的完整 Agent 组装见 ``deepagents_app.services.agent_factory``。
 """
@@ -11,7 +11,6 @@ checkpointer / HITL / permissions / middleware / HarnessProfile / workspace 同�
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from deepagents import (
     FilesystemPermission,
@@ -25,21 +24,16 @@ from deepagents_app.config import Settings
 
 logger = logging.getLogger(__name__)
 
-
-def _build_middleware(settings: Settings) -> list[Any]:
-    """组装主 Agent 自定义 middleware 列表（遗留辅助；方法论路径按 DB 绑定加载）。"""
-    if not settings.enable_custom_middleware:
-        return []
-    from deepagents_app.middleware import AuditMiddleware, LoggingMiddleware, TimingMiddleware
-
-    return [
-        LoggingMiddleware(),
-        TimingMiddleware(),
-        AuditMiddleware(),
-    ]
+__all__ = [
+    "build_permissions",
+    "build_interrupt_on",
+    "build_checkpointer",
+    "configure_general_purpose_profile",
+    "sync_memory_and_skills_into_workspace",
+]
 
 
-def _build_permissions() -> list[FilesystemPermission]:
+def build_permissions() -> list[FilesystemPermission]:
     """
     声明式路径权限（first-match-wins）。
 
@@ -61,7 +55,7 @@ def _build_permissions() -> list[FilesystemPermission]:
     ]
 
 
-def _build_interrupt_on(settings: Settings) -> dict[str, bool] | None:
+def build_interrupt_on(settings: Settings) -> dict[str, bool] | None:
     """危险工具人工审批配置；关闭 HITL 时返回 None。"""
     if not settings.enable_hitl:
         return None
@@ -74,7 +68,7 @@ def _build_interrupt_on(settings: Settings) -> dict[str, bool] | None:
     }
 
 
-def _build_checkpointer(settings: Settings):
+def build_checkpointer(settings: Settings):
     """
     构建 checkpointer，用于多轮对话的 thread 级状态持久化。
 
@@ -104,7 +98,7 @@ def _build_checkpointer(settings: Settings):
         return InMemorySaver()
 
 
-def _configure_general_purpose_profile(settings: Settings) -> None:
+def configure_general_purpose_profile(settings: Settings) -> None:
     """
     通过 HarnessProfile 定制自动注入的 ``general-purpose`` 子 Agent。
 
@@ -141,7 +135,7 @@ def _configure_general_purpose_profile(settings: Settings) -> None:
         logger.warning("HarnessProfile 注册失败（可忽略）：%s", exc)
 
 
-def _sync_memory_and_skills_into_workspace(settings: Settings) -> None:
+def sync_memory_and_skills_into_workspace(settings: Settings) -> None:
     """
     把项目级 AGENTS.md 与 skills/ 同步到 workspace，供 FilesystemBackend 读取。
 

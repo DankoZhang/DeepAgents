@@ -31,11 +31,11 @@ from deepagents_app.db.models import (
     MiddlewareDefinition,
 )
 from deepagents_app.factory import (
-    _build_checkpointer,
-    _build_interrupt_on,
-    _build_permissions,
-    _configure_general_purpose_profile,
-    _sync_memory_and_skills_into_workspace,
+    build_checkpointer,
+    build_interrupt_on,
+    build_permissions,
+    configure_general_purpose_profile,
+    sync_memory_and_skills_into_workspace,
 )
 from deepagents_app.models import build_chat_model
 from deepagents_app.registries.middleware import load_middleware_object
@@ -213,7 +213,7 @@ def _assemble_create_kwargs(
     """
     interrupt_cfg = supervisor_config.get("interrupt_on")
     if interrupt_cfg is None:
-        interrupt_on = _build_interrupt_on(settings)
+        interrupt_on = build_interrupt_on(settings)
     else:
         interrupt_on = interrupt_cfg if settings.enable_hitl else None
 
@@ -224,11 +224,11 @@ def _assemble_create_kwargs(
     )
 
     backend = build_filesystem_backend(settings)
-    checkpointer = _build_checkpointer(settings)
-    permissions = _build_permissions()
-    _configure_general_purpose_profile(settings)
+    checkpointer = build_checkpointer(settings)
+    permissions = build_permissions()
+    configure_general_purpose_profile(settings)
     # FilesystemBackend 根 = workspace，需先同步 AGENTS.md / skills
-    _sync_memory_and_skills_into_workspace(settings)
+    sync_memory_and_skills_into_workspace(settings)
     memory_paths = ["/AGENTS.md"] if (settings.workspace_dir / "AGENTS.md").exists() else None
 
     create_kwargs: dict[str, Any] = {
