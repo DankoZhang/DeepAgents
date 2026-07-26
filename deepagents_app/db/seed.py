@@ -3,24 +3,28 @@
 ============
 
 幂等写入：
-1. 内置 Tool / Middleware 元信息
-2. demo 方法论（Supervisor + 三个 SubAgent），对齐原 YAML 演示配置
+1. 内置 Tool（builtin）/ Middleware
+2. 全局 demo Agents
+3. demo 方法论勾选上述 Agents 并发布
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 from sqlalchemy.orm import Session
 
 from deepagents_app.config import PROJECT_ROOT
 from deepagents_app.db.models import Methodology, MiddlewareDefinition, ToolDefinition
 from deepagents_app.services.agents import create_agent
-from deepagents_app.services.methodology import create_methodology, publish_methodology
+from deepagents_app.services.methodology import (
+    bind_methodology_agents,
+    create_methodology,
+    publish_methodology,
+)
 from deepagents_app.services.middlewares import create_middleware
 from deepagents_app.services.revisions import snapshot_methodology
-from deepagents_app.services.tools import create_tool
+from deepagents_app.services.tools import create_builtin_tool
 from deepagents_app.supervisor.prompts import SUPERVISOR_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -115,6 +119,12 @@ DEFAULT_MIDDLEWARES: list[dict] = [
 ]
 
 DEMO_METHODOLOGY_ID = "demo_deepagents"
+DEMO_AGENT_IDS = [
+    "agent_demo_supervisor",
+    "agent_demo_document_writer",
+    "agent_demo_computer_operator",
+    "agent_demo_qa_expert",
+]
 
 
 def _read_prompt(name: str) -> str:
@@ -125,10 +135,10 @@ def _read_prompt(name: str) -> str:
 
 
 def seed_tools_and_middlewares(db: Session) -> None:
-    """幂等写入内置 Tool / Middleware 元信息（已存在则跳过）。"""
+    """幂等写入内置 Tool / Middleware。"""
     for item in DEFAULT_TOOLS:
         if db.get(ToolDefinition, item["id"]) is None:
-            create_tool(
+            create_builtin_tool(
                 db,
                 tool_id=item["id"],
                 name=item["name"],
@@ -147,23 +157,9 @@ def seed_tools_and_middlewares(db: Session) -> None:
             logger.info("种子中间件：%s", item["name"])
 
 
-def seed_demo_methodology(db: Session) -> None:
-    """
-    写入演示方法论（Supervisor + 三个 SubAgent）。
-
-    仅在方法论不存在时执行；已存在不覆盖用户后续编辑。
-    批量建 Agent 时 ``bump_version=False``，最后统一 publish + snapshot，
-    避免每个 Agent 都触发一次版本递增。
-    """
-    if db.get(Methodology, DEMO_METHODOLOGY_ID) is not None:
-        return
-
-    create_methodology(
-        db,
-        name="DeepAgents 演示方法论",
-        description="Supervisor + document-writer / computer-operator / qa-expert",
-        methodology_id=DEMO_METHODOLOGY_ID,
-    )
+def seed_demo_agents(db: Session) -> None:
+    """幂等写入全局 demo Agents（已存在则跳过）。"""
+    from deepagents_app.db.models import AgentDefinition
 
     doc_tools = [
         "tool_create_document",
@@ -183,71 +179,95 @@ def seed_demo_methodology(db: Session) -> None:
         "tool_save_qa_note",
     ]
 
-    create_agent(
-        db,
-        methodology_id=DEMO_METHODOLOGY_ID,
-        agent_id="agent_demo_supervisor",
-        name="supervisor",
-        system_prompt=SUPERVISOR_SYSTEM_PROMPT,
-        config={"role": "supervisor", "enabled": True, "description": "主调度 Agent"},
-        middleware_ids=["mw_logging", "mw_timing", "mw_audit"],
-        bump_version=False,
-    )
-    create_agent(
-        db,
-        methodology_id=DEMO_METHODOLOGY_ID,
-        agent_id="agent_demo_document_writer",
-        name="document-writer",
-        system_prompt=_read_prompt("document-writer.md"),
-        config={
-            "role": "subagent",
-            "enabled": True,
-            "description": "文档撰写专家。适用于撰写/改写 Markdown 文档。",
-            "skills": ["/skills/document-writer/"],
+    specs = [
+        {
+            "agent_id": "agent_demo_supervisor",
+            "name": "supervisor",
+            "system_prompt": SUPERVISOR_SYSTEM_PROMPT,
+            "config": {
+                "role": "supervisor",
+                "enabled": True,
+                "description": "主调度 Agent",
+            },
+            "tool_ids": [],
+            "middleware_ids": ["mw_logging", "mw_timing", "mw_audit"],
         },
-        tool_ids=doc_tools,
-        middleware_ids=["mw_logging", "mw_timing"],
-        bump_version=False,
-    )
-    create_agent(
-        db,
-        methodology_id=DEMO_METHODOLOGY_ID,
-        agent_id="agent_demo_computer_operator",
-        name="computer-operator",
-        system_prompt=_read_prompt("computer-operator.md"),
-        config={
-            "role": "subagent",
-            "enabled": True,
-            "description": "计算机操作专家。适用于浏览 workspace、执行白名单 shell。",
-            "skills": ["/skills/computer-operator/"],
+        {
+            "agent_id": "agent_demo_document_writer",
+            "name": "document-writer",
+            "system_prompt": _read_prompt("document-writer.md"),
+            "config": {
+                "role": "subagent",
+                "enabled": True,
+                "description": "文档撰写专家。适用于撰写/改写 Markdown 文档。",
+                "skills": ["/skills/document-writer/"],
+            },
+            "tool_ids": doc_tools,
+            "middleware_ids": ["mw_logging", "mw_timing"],
         },
-        tool_ids=computer_tools,
-        middleware_ids=["mw_logging", "mw_timing", "mw_audit"],
-        bump_version=False,
-    )
-    create_agent(
-        db,
-        methodology_id=DEMO_METHODOLOGY_ID,
-        agent_id="agent_demo_qa_expert",
-        name="qa-expert",
-        system_prompt=_read_prompt("qa-expert.md"),
-        config={
-            "role": "subagent",
-            "enabled": True,
-            "description": "智能问答专家。适用于概念解释与知识库检索。",
-            "skills": ["/skills/qa-expert/"],
+        {
+            "agent_id": "agent_demo_computer_operator",
+            "name": "computer-operator",
+            "system_prompt": _read_prompt("computer-operator.md"),
+            "config": {
+                "role": "subagent",
+                "enabled": True,
+                "description": "计算机操作专家。适用于浏览 workspace、执行白名单 shell。",
+                "skills": ["/skills/computer-operator/"],
+            },
+            "tool_ids": computer_tools,
+            "middleware_ids": ["mw_logging", "mw_timing", "mw_audit"],
         },
-        tool_ids=qa_tools,
-        middleware_ids=["mw_logging"],
-        bump_version=False,
-    )
+        {
+            "agent_id": "agent_demo_qa_expert",
+            "name": "qa-expert",
+            "system_prompt": _read_prompt("qa-expert.md"),
+            "config": {
+                "role": "subagent",
+                "enabled": True,
+                "description": "智能问答专家。适用于概念解释与知识库检索。",
+                "skills": ["/skills/qa-expert/"],
+            },
+            "tool_ids": qa_tools,
+            "middleware_ids": ["mw_logging"],
+        },
+    ]
 
+    for spec in specs:
+        if db.get(AgentDefinition, spec["agent_id"]) is not None:
+            continue
+        create_agent(
+            db,
+            agent_id=spec["agent_id"],
+            name=spec["name"],
+            system_prompt=spec["system_prompt"],
+            config=spec["config"],
+            tool_ids=spec["tool_ids"],
+            middleware_ids=spec["middleware_ids"],
+            bump_related=False,
+        )
+        logger.info("种子 Agent：%s", spec["name"])
+
+
+def seed_demo_methodology(db: Session) -> None:
+    """写入演示方法论并勾选全局 demo Agents。"""
+    if db.get(Methodology, DEMO_METHODOLOGY_ID) is not None:
+        return
+
+    create_methodology(
+        db,
+        name="DeepAgents 演示方法论",
+        description="Supervisor + document-writer / computer-operator / qa-expert",
+        methodology_id=DEMO_METHODOLOGY_ID,
+        agent_ids=DEMO_AGENT_IDS,
+    )
     publish_methodology(db, DEMO_METHODOLOGY_ID)
     snapshot_methodology(db, DEMO_METHODOLOGY_ID)
     logger.info("已种子化演示方法论：%s", DEMO_METHODOLOGY_ID)
 
 
 def seed_defaults(db: Session) -> None:
-    """应用启动入口：工具/中间件 → 演示方法论。"""
+    """应用启动入口：内置工具/中间件 → 全局 Agents → 演示方法论。"""
     seed_tools_and_middlewares(db)
+    seed_demo_agents(db)
     seed_demo_methodology(db)

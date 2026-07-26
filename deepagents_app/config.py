@@ -46,10 +46,6 @@ class Settings(BaseSettings):
     memory_file: Path = Field(default=PROJECT_ROOT / "AGENTS.md")
     # Skills 根目录——渐进披露的领域知识包
     skills_dir: Path = Field(default=PROJECT_ROOT / "deepagents_app" / "skills")
-    # SubAgent 声明式配置（YAML）；构建 graph 时自动加载
-    subagents_config: Path = Field(
-        default=PROJECT_ROOT / "deepagents_app" / "config" / "subagents.yaml"
-    )
     # Redis checkpointer 连接串（多轮对话持久化）
     # 需要 Redis 8+ 或 Redis Stack（含 RedisJSON + RediSearch）
     redis_url: str = "redis://localhost:6379"
@@ -77,8 +73,7 @@ class Settings(BaseSettings):
         "workspace_dir",
         "memory_file",
         "skills_dir",
-        "subagents_config",
-        mode="before", # 在 Pydantic 对参数进行类型转换和验证之前解析路径
+        mode="before",
     )
     @classmethod
     def _resolve_path(cls, value: str | Path) -> Path:

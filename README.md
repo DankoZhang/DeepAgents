@@ -67,13 +67,12 @@ python -m pytest tests/test_api_mvp.py -q
 
 ---
 
-## CLI 演示模式（YAML）
+## CLI（方法论驱动）
 
-不走配置库时，可用 YAML 演示工厂：
+需 PostgreSQL（`docker compose up -d`）。默认使用种子方法论 `demo_deepagents`：
 
 ```bash
 python main.py
-# 或按数据库方法论组装
 python main.py --methodology demo_deepagents
 python main.py -q "什么是 Deep Agents 的 Middleware？"
 ```
@@ -90,28 +89,28 @@ OPENAI_API_KEY=sk-...
 ## 已演示的 Deep Agents 能力
 
 1. **主从调度**：Supervisor + `task` 委派多个 SubAgent
-2. **自定义 Middleware**：日志、计时、审计
+2. **自定义 Middleware**：日志、计时、审计（种子内置，Agent 勾选）
 3. **Filesystem Backend**：本地 `workspace/` 沙箱
 4. **Permissions**：路径级读写控制
 5. **Memory / Skills**：`AGENTS.md` + `SKILL.md`
-6. **Checkpointer**：Redis 多轮 `thread_id` 隔离
+6. **Checkpointer**：Redis Stack 多轮 `thread_id` 隔离
 7. **HITL**：危险工具前暂停（`ENABLE_HITL=true`）
-8. **方法论驱动**：DB 配置 → Agent Factory → 版本缓存
+8. **方法论驱动**：DB 配置 → Agent Factory → 版本缓存；支持 MCP 工具
 
 ## 目录结构
 
 ```
 DeepAgents/
-├── main.py                 # CLI 入口
+├── main.py                 # CLI 入口（方法论组装）
 ├── server.py               # FastAPI 入口
-├── docker-compose.yml      # PostgreSQL + Redis
+├── docker-compose.yml      # PostgreSQL + Redis Stack
 ├── deepagents_app/
 │   ├── api/                # FastAPI 路由与 schemas
 │   ├── db/                 # ORM / session / seed
 │   ├── services/           # 方法论 / Agent Factory / 会话 / Chat
-│   ├── registries/         # Tool / Middleware class_path 加载
-│   ├── factory.py          # YAML 演示组装
-│   ├── tools/
+│   ├── registries/         # Tool（builtin/MCP）/ Middleware 加载
+│   ├── factory.py          # checkpointer 等共享组装工具
+│   ├── tools/              # 内置工具实现
 │   ├── middleware/
 │   └── skills/
 └── workspace/

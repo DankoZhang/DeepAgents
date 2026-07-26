@@ -1,9 +1,8 @@
 """
-Agent 配置 API
-==============
+Agent 配置 API（全局 Agent）
+============================
 
-方法论下的 Agent CRUD，以及 Tool / Middleware 绑定。
-变更默认 bump 方法论版本并写快照。
+CRUD + Tool / Middleware 绑定。变更会 bump 所有勾选了该 Agent 的方法论版本。
 """
 
 from __future__ import annotations
@@ -26,10 +25,12 @@ router = APIRouter(tags=["agents"])
 
 @router.get("/agent/list", response_model=list[AgentOut])
 def list_agents(
-    methodology_id: str = Query(...),
+    methodology_id: str | None = Query(
+        None, description="若指定则只返回该方法论已勾选的 Agent"
+    ),
     db: Session = Depends(get_db),
 ):
-    return agents_svc.list_agents(db, methodology_id)
+    return agents_svc.list_agents(db, methodology_id=methodology_id)
 
 
 @router.get("/agent/{agent_id}", response_model=AgentOut)
@@ -42,11 +43,10 @@ def get_agent(agent_id: str, db: Session = Depends(get_db)):
 
 @router.post("/agent", response_model=AgentOut)
 def create_agent(body: AgentCreate, db: Session = Depends(get_db)):
-    """``config.role`` 取 supervisor / subagent；同方法论内 name 唯一。"""
+    """创建全局 Agent；``config.role`` 取 supervisor / subagent。"""
     try:
         return agents_svc.create_agent(
             db,
-            methodology_id=body.methodology_id,
             name=body.name,
             system_prompt=body.system_prompt,
             model=body.model,
@@ -56,8 +56,6 @@ def create_agent(body: AgentCreate, db: Session = Depends(get_db)):
             tool_ids=body.tool_ids,
             middleware_ids=body.middleware_ids,
         )
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -78,6 +76,8 @@ def update_agent(agent_id: str, body: AgentUpdate, db: Session = Depends(get_db)
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.delete("/agent/{agent_id}")
@@ -91,7 +91,6 @@ def delete_agent(agent_id: str, db: Session = Depends(get_db)):
 
 @router.post("/agent/{agent_id}/tools", response_model=AgentOut)
 def bind_tools(agent_id: str, body: AgentBindTools, db: Session = Depends(get_db)):
-    """``replace=True`` 时先清空再绑定；否则增量追加。"""
     try:
         return agents_svc.bind_agent_tools(
             db, agent_id, body.tool_ids, replace=body.replace

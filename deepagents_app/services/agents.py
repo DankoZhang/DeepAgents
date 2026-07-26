@@ -1,4 +1,4 @@
-"""Agent 配置管理：创建 / 编辑 / 绑定 Tool / Middleware。"""
+"""Agent 配置管理：全局 Agent CRUD + 绑定 Tool / Middleware。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from deepagents_app.db.models import (
     AgentMiddleware,
     AgentTool,
     Methodology,
+    MethodologyAgent,
     MiddlewareDefinition,
     ToolDefinition,
 )
@@ -20,21 +21,24 @@ from deepagents_app.services.agent_factory import invalidate_agent_cache
 from deepagents_app.services.revisions import snapshot_methodology
 
 
-def list_agents(db: Session, methodology_id: str) -> list[AgentDefinition]:
-    return (
-        db.query(AgentDefinition)
-        .options(
-            joinedload(AgentDefinition.tools),
-            joinedload(AgentDefinition.middlewares),
-        )
-        .filter(AgentDefinition.methodology_id == methodology_id)
-        .order_by(AgentDefinition.name)
-        .all()
+def list_agents(
+    db: Session,
+    *,
+    methodology_id: str | None = None,
+) -> list[AgentDefinition]:
+    """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。"""
+    q = db.query(AgentDefinition).options(
+        joinedload(AgentDefinition.tools),
+        joinedload(AgentDefinition.middlewares),
     )
+    if methodology_id:
+        q = q.join(MethodologyAgent).filter(
+            MethodologyAgent.methodology_id == methodology_id
+        )
+    return q.order_by(AgentDefinition.name).all()
 
 
 def get_agent(db: Session, agent_id: str) -> AgentDefinition | None:
-    # 绑定关系后 identity map 可能仍持有旧集合；expire 强制从 DB 重新加载
     db.expire_all()
     return (
         db.query(AgentDefinition)
@@ -50,7 +54,6 @@ def get_agent(db: Session, agent_id: str) -> AgentDefinition | None:
 def create_agent(
     db: Session,
     *,
-    methodology_id: str,
     name: str,
     system_prompt: str = "",
     model: str | None = None,
@@ -59,37 +62,23 @@ def create_agent(
     agent_id: str | None = None,
     tool_ids: list[str] | None = None,
     middleware_ids: list[str] | None = None,
-    bump_version: bool = True,
+    bump_related: bool = True,
 ) -> AgentDefinition:
-    """
-    在方法论下创建 Agent。
-
-    ``config.role`` 默认为 ``subagent``；Supervisor 需显式传 ``role=supervisor``。
-    ``bump_version=False`` 用于批量种子写入，由调用方统一快照。
-    """
-    methodology = db.get(Methodology, methodology_id)
-    if methodology is None:
-        raise LookupError(f"方法论不存在：{methodology_id}")
-
+    """创建全局 Agent（不隶属单一方法论）。"""
     existing = (
         db.query(AgentDefinition)
-        .filter(
-            AgentDefinition.methodology_id == methodology_id,
-            AgentDefinition.name == name,
-        )
+        .filter(AgentDefinition.name == name)
         .one_or_none()
     )
     if existing is not None:
-        raise ValueError(f"方法论内已存在同名 Agent：{name}")
+        raise ValueError(f"已存在同名 Agent：{name}")
 
-    # role / enabled 等扩展字段存在 JSON config，ORM 列只保留核心属性
     cfg = dict(config or {})
     cfg.setdefault("role", "subagent")
     cfg.setdefault("enabled", True)
 
     row = AgentDefinition(
         id=agent_id or f"agent_{uuid.uuid4().hex[:12]}",
-        methodology_id=methodology_id,
         name=name,
         system_prompt=system_prompt,
         model=model,
@@ -104,8 +93,8 @@ def create_agent(
     if middleware_ids:
         _bind_middlewares(db, row.id, middleware_ids, replace=True)
 
-    if bump_version:
-        _bump_and_snapshot(db, methodology)
+    if bump_related:
+        _bump_methodologies_using_agent(db, row.id)
     return get_agent(db, row.id)  # type: ignore[return-value]
 
 
@@ -120,13 +109,20 @@ def update_agent(
     config: dict[str, Any] | None = None,
     tool_ids: list[str] | None = None,
     middleware_ids: list[str] | None = None,
-    bump_version: bool = True,
+    bump_related: bool = True,
 ) -> AgentDefinition:
     row = get_agent(db, agent_id)
     if row is None:
         raise LookupError(f"Agent 不存在：{agent_id}")
 
-    if name is not None:
+    if name is not None and name != row.name:
+        clash = (
+            db.query(AgentDefinition)
+            .filter(AgentDefinition.name == name, AgentDefinition.id != agent_id)
+            .one_or_none()
+        )
+        if clash is not None:
+            raise ValueError(f"已存在同名 Agent：{name}")
         row.name = name
     if system_prompt is not None:
         row.system_prompt = system_prompt
@@ -144,24 +140,28 @@ def update_agent(
         _bind_middlewares(db, row.id, middleware_ids, replace=True)
 
     db.flush()
-    if bump_version:
-        methodology = db.get(Methodology, row.methodology_id)
-        if methodology:
-            _bump_and_snapshot(db, methodology)
+    if bump_related:
+        _bump_methodologies_using_agent(db, agent_id)
     return get_agent(db, agent_id)  # type: ignore[return-value]
 
 
-def delete_agent(db: Session, agent_id: str, *, bump_version: bool = True) -> None:
+def delete_agent(db: Session, agent_id: str, *, bump_related: bool = True) -> None:
     row = db.get(AgentDefinition, agent_id)
     if row is None:
         raise LookupError(f"Agent 不存在：{agent_id}")
-    methodology_id = row.methodology_id
+    methodology_ids = [
+        r.methodology_id
+        for r in db.query(MethodologyAgent)
+        .filter(MethodologyAgent.agent_id == agent_id)
+        .all()
+    ]
     db.delete(row)
     db.flush()
-    if bump_version:
-        methodology = db.get(Methodology, methodology_id)
-        if methodology:
-            _bump_and_snapshot(db, methodology)
+    if bump_related:
+        for mid in methodology_ids:
+            methodology = db.get(Methodology, mid)
+            if methodology:
+                _bump_and_snapshot(db, methodology)
 
 
 def bind_agent_tools(
@@ -170,17 +170,15 @@ def bind_agent_tools(
     tool_ids: list[str],
     *,
     replace: bool = True,
-    bump_version: bool = True,
+    bump_related: bool = True,
 ) -> AgentDefinition:
     row = get_agent(db, agent_id)
     if row is None:
         raise LookupError(f"Agent 不存在：{agent_id}")
     _bind_tools(db, agent_id, tool_ids, replace=replace)
     db.flush()
-    if bump_version:
-        methodology = db.get(Methodology, row.methodology_id)
-        if methodology:
-            _bump_and_snapshot(db, methodology)
+    if bump_related:
+        _bump_methodologies_using_agent(db, agent_id)
     return get_agent(db, agent_id)  # type: ignore[return-value]
 
 
@@ -190,17 +188,15 @@ def bind_agent_middlewares(
     middleware_ids: list[str],
     *,
     replace: bool = True,
-    bump_version: bool = True,
+    bump_related: bool = True,
 ) -> AgentDefinition:
     row = get_agent(db, agent_id)
     if row is None:
         raise LookupError(f"Agent 不存在：{agent_id}")
     _bind_middlewares(db, agent_id, middleware_ids, replace=replace)
     db.flush()
-    if bump_version:
-        methodology = db.get(Methodology, row.methodology_id)
-        if methodology:
-            _bump_and_snapshot(db, methodology)
+    if bump_related:
+        _bump_methodologies_using_agent(db, agent_id)
     return get_agent(db, agent_id)  # type: ignore[return-value]
 
 
@@ -251,12 +247,19 @@ def _bind_middlewares(
             db.add(AgentMiddleware(agent_id=agent_id, middleware_id=mid))
 
 
-def _bump_and_snapshot(db: Session, methodology: Methodology) -> None:
-    """
-    配置变更后的统一收尾：version+1 → 失效缓存 → 写版本快照。
+def _bump_methodologies_using_agent(db: Session, agent_id: str) -> None:
+    links = (
+        db.query(MethodologyAgent)
+        .filter(MethodologyAgent.agent_id == agent_id)
+        .all()
+    )
+    for link in links:
+        methodology = db.get(Methodology, link.methodology_id)
+        if methodology:
+            _bump_and_snapshot(db, methodology)
 
-    旧会话仍按 Conversation.methodology_version 从快照重建，不受 live 表影响。
-    """
+
+def _bump_and_snapshot(db: Session, methodology: Methodology) -> None:
     methodology.version += 1
     methodology.updated_time = datetime.now(timezone.utc)
     invalidate_agent_cache(methodology.id)

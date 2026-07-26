@@ -1,29 +1,23 @@
 """
-DeepAgents 演示框架
+DeepAgents 方法论平台
 ====================
 
-基于 LangChain ``deepagents`` 构建的完整多智能体示例：
+基于 LangChain ``deepagents`` 的可配置多 Agent 后端。
 
-- **主 Agent（Supervisor）**：负责任务理解、拆解与调度
-- **document-writer**：文档撰写子 Agent
-- **computer-operator**：计算机操作子 Agent
-- **qa-expert**：智能问答子 Agent
+快速开始（需数据库与种子方法论）::
 
-并演示自定义 Middleware、Filesystem Backend、Memory、Skills、
-Human-in-the-loop、Checkpointer 等 deepagents 核心能力。
+    from deepagents_app.db.seed import seed_defaults
+    from deepagents_app.db.session import get_session_factory, init_db
+    from deepagents_app.services.agent_factory import build_agent_from_methodology
 
-快速开始::
-
-    from deepagents_app.factory import build_deep_agent
-
-    agent = build_deep_agent()
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": "写一份项目 README"}]},
-        config={"configurable": {"thread_id": "demo-1"}},
-    )
+    init_db()
+    db = get_session_factory()()
+    seed_defaults(db)
+    db.commit()
+    agent = build_agent_from_methodology(db, "demo_deepagents")
 """
 
-from deepagents_app.factory import build_deep_agent
+from deepagents_app.services.agent_factory import build_agent_from_methodology
 
-__all__ = ["build_deep_agent"]
-__version__ = "0.1.0"
+__all__ = ["build_agent_from_methodology"]
+__version__ = "0.2.0"

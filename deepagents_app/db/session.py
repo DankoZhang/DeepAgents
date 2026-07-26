@@ -15,82 +15,124 @@ from sqlalchemy.orm import Session, sessionmaker
 from deepagents_app.config import get_settings
 from deepagents_app.db.base import Base
 
+# 进程内引擎单例缓存；None 表示尚未 create_engine
 _engine = None
+# 与引擎绑定的 sessionmaker 缓存；由 get_engine 一并初始化
 _SessionLocal: sessionmaker[Session] | None = None
 
 
 def reset_engine() -> None:
-    """测试用：关闭并清空进程内引擎缓存。"""
+    """测试用：关闭并清空进程内引擎缓存（换 DATABASE_URL 后必须调用）。"""
+    # 声明要改的是模块级变量，而非函数内局部变量
     global _engine, _SessionLocal
+    # 若引擎已创建，先释放连接池中的物理连接
     if _engine is not None:
         _engine.dispose()
+    # 清空缓存，下次 get_engine() 会按新配置重新建引擎
     _engine = None
     _SessionLocal = None
 
 
 def get_engine():
-    """懒初始化引擎（进程内单例）。"""
+    """懒初始化引擎（进程内单例）；lifespan / init_db / get_db 最终都会走到这里。"""
+    # 需要写入模块级单例
     global _engine, _SessionLocal
+    # 已初始化则直接复用，避免重复建连接池
     if _engine is None:
+        # 读取 DATABASE_URL 等配置（与 app.lifespan 共用同一份 settings）
         settings = get_settings()
+        # 驱动级额外参数；Postgres 通常为空，SQLite 测试环境会填入
         connect_args = {}
-        # SQLite 默认禁止跨线程共用连接；FastAPI 多线程下需关闭该检查
+        # SQLite 默认禁止跨线程共用同一连接；FastAPI / TestClient 多线程下需关闭检查
         if settings.database_url.startswith("sqlite"):
+            # 允许不同线程使用同一连接对象（测试与部分部署场景需要）
             connect_args["check_same_thread"] = False
+        # 创建 SQLAlchemy 引擎（连接池 + 方言），后续 Session 都挂在此引擎上
         _engine = create_engine(
+            # 例如 postgresql+psycopg://... 或测试用的 sqlite+pysqlite:///...
             settings.database_url,
-            pool_pre_ping=True,  # 取连接前探测，避免拿到已断开的连接
+            # 从池中取连接前先 ping，避免拿到已被服务端掐掉的死连接
+            pool_pre_ping=True,
+            # 启用 SQLAlchemy 2.0 风格 API
             future=True,
+            # 把上面拼好的驱动参数传给底层 DBAPI（非 SQLite 时为空 dict）
             connect_args=connect_args,
         )
+        # 仅 SQLite：每次真正建立物理连接时执行 PRAGMA
         if settings.database_url.startswith("sqlite"):
-            # SQLite 默认不强制 FK；与 PostgreSQL 行为对齐
+            # 注册 connect 事件：新建连接时回调 _set_sqlite_pragma
             @event.listens_for(_engine, "connect")
             def _set_sqlite_pragma(dbapi_connection, _connection_record):  # noqa: ANN001
+                # 拿到底层 DBAPI 游标以执行原生 SQL
                 cursor = dbapi_connection.cursor()
+                # SQLite 默认不强制外键；打开后与 PostgreSQL 行为对齐
                 cursor.execute("PRAGMA foreign_keys=ON")
+                # 用完关闭游标（连接本身由引擎管理）
                 cursor.close()
 
+        # 工厂：调用 factory() 即可得到绑定到上述引擎的 Session 实例
         _SessionLocal = sessionmaker(
+            # Session 使用的引擎 / 连接来源
             bind=_engine,
+            # 禁止「访问属性时自动 flush」，改由显式 flush/commit 控制写入时机
             autoflush=False,
+            # 禁止隐式自动提交；事务边界由 commit() / rollback() 明确控制
             autocommit=False,
-            # 提交后仍可访问属性，避免路由层序列化时触发 DetachedInstanceError
+            # 提交后不把 ORM 对象属性标为过期，避免路由序列化时再查库触发 DetachedInstanceError
             expire_on_commit=False,
         )
+    # 返回已缓存（或刚创建）的引擎实例
     return _engine
 
 
 def get_session_factory() -> sessionmaker[Session]:
-    """返回已绑定引擎的 sessionmaker（副作用：触发引擎初始化）。"""
+    """返回已绑定引擎的 sessionmaker（副作用：触发引擎初始化）。
+
+    被 app.lifespan 用于启动时 seed；也被 get_db 用于每个请求。
+    """
+    # 确保 _engine / _SessionLocal 已就绪（首次调用会真正 create_engine）
     get_engine()
+    # 类型/逻辑断言：get_engine 成功后 _SessionLocal 必不为 None
     assert _SessionLocal is not None
+    # 把工厂交给调用方，由其自行 factory() 开 Session
     return _SessionLocal
 
 
 def init_db() -> None:
-    """创建全部表（MVP 用 create_all；后续可换 Alembic）。"""
-    # 确保模型已注册到 Base.metadata（仅 import 副作用）
+    """创建全部表（MVP 用 create_all；后续可换 Alembic，用于支持表结构等数据的变更）。
+
+    由 app.lifespan 在启动最早阶段调用。
+    """
+    # 导入 models 模块，让各 ORM 类把表定义注册进 Base.metadata（仅副作用）
     import deepagents_app.db.models  # noqa: F401
 
+    # 取得（或创建）进程内引擎单例
     engine = get_engine()
+    # 按 metadata 中已注册的表定义建表；已存在的表会跳过（不会迁移改列）
     Base.metadata.create_all(bind=engine)
 
 
 def get_db() -> Generator[Session, None, None]:
     """
-    FastAPI Depends 用的会话生成器。
+    FastAPI Depends 用的会话生成器（与 lifespan 里手动开 Session 模式一致）。
 
     请求成功结束自动 commit；异常则 rollback。
     路由内一般不必手动 commit。
     """
+    # 拿到与引擎绑定的 sessionmaker（必要时懒初始化引擎）
     factory = get_session_factory()
+    # 为当前请求创建独立 Session
     db = factory()
     try:
+        # 把 Session 交给路由；此处暂停，等请求处理完再继续
         yield db
+        # 请求无异常：提交本请求内的全部变更
         db.commit()
     except Exception:
+        # 请求抛错：回滚，避免脏数据落库
         db.rollback()
+        # 继续向上抛，让 FastAPI 走异常处理
         raise
     finally:
+        # 请求结束必关 Session，归还连接给连接池
         db.close()

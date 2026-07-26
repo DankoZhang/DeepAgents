@@ -1,14 +1,14 @@
 """
-ORM 模型（对应设计文档 §5 / §6）
-================================
+ORM 模型
+========
 
 表：
-- methodology
-- agent_definition
-- tool_definition
-- middleware_definition
-- agent_tool / agent_middleware（关系表）
-- conversation
+- methodology / methodology_agent（方法论勾选全局 Agent）
+- agent_definition（全局 Agent）
+- tool_definition（builtin 内置 / mcp 前端新增）
+- middleware_definition（仅种子内置，无对外写接口）
+- agent_tool / agent_middleware
+- methodology_revision / conversation
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from sqlalchemy.types import JSON
 
 from deepagents_app.db.base import Base
 
-# SQLite 测试兼容：PostgreSQL 用 JSONB，其他方言用 JSON
 JsonType = JSON().with_variant(JSONB(), "postgresql")
 
 
@@ -40,7 +39,7 @@ def _utcnow() -> datetime:
 
 
 class Methodology(Base):
-    """方法论：一组 Supervisor + SubAgent 的版本化配置包。"""
+    """方法论：勾选一组全局 Agent 组成的版本化配置包。"""
 
     __tablename__ = "methodology"
 
@@ -48,7 +47,6 @@ class Methodology(Base):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    # draft | published | archived
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
     created_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
@@ -57,32 +55,31 @@ class Methodology(Base):
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
 
+    # 多对多：方法论勾选的全局 Agent（删方法论只删关联，不删 Agent）
     agents: Mapped[list[AgentDefinition]] = relationship(
-        back_populates="methodology",
-        cascade="all, delete-orphan",
+        secondary="methodology_agent",
+        back_populates="methodologies",
+        order_by="AgentDefinition.name",
     )
 
 
 class AgentDefinition(Base):
-    """Agent 定义：Supervisor 或 SubAgent。"""
+    """全局 Agent：Supervisor 或 SubAgent，可被多个方法论勾选。"""
 
     __tablename__ = "agent_definition"
-    __table_args__ = (
-        UniqueConstraint("methodology_id", "name", name="uq_agent_methodology_name"),
-    )
+    __table_args__ = (UniqueConstraint("name", name="uq_agent_name"),)
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    methodology_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("methodology.id", ondelete="CASCADE"), nullable=False
-    )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     system_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # role / description / skills / interrupt_on / enabled 等扩展字段
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
 
-    methodology: Mapped[Methodology] = relationship(back_populates="agents")
+    methodologies: Mapped[list[Methodology]] = relationship(
+        secondary="methodology_agent",
+        back_populates="agents",
+    )
     tools: Mapped[list[ToolDefinition]] = relationship(
         secondary="agent_tool",
         back_populates="agents",
@@ -94,20 +91,26 @@ class AgentDefinition(Base):
 
 
 class ToolDefinition(Base):
-    """工具元信息（不存 Python 代码，仅 class_path）。"""
+    """
+    工具元信息。
+
+    - builtin：种子内置，class_path 指向 Python 对象；前端只可勾选不可新建
+    - mcp：前端新增的 MCP Server 连接；运行时展开为该 Server 下的工具列表
+    """
 
     __tablename__ = "tool_definition"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    # 例：deepagents_app.tools.document_tools:create_document
-    class_path: Mapped[str] = mapped_column(String(512), nullable=False)
-    # 设计文档 §4.3：可选 JSON Schema，供前端/校验展示（运行时仍以 Python 工具签名为准）
+    # builtin | mcp
+    tool_type: Mapped[str] = mapped_column(String(32), default="builtin", nullable=False)
+    # builtin 必填；mcp 可为空
+    class_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     input_schema: Mapped[dict[str, Any] | None] = mapped_column(JsonType, nullable=True)
     output_schema: Mapped[dict[str, Any] | None] = mapped_column(JsonType, nullable=True)
+    # mcp 时存连接：transport / command / args / url / env / headers / include_tools
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
-    # active | disabled
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
 
     agents: Mapped[list[AgentDefinition]] = relationship(
@@ -117,19 +120,31 @@ class ToolDefinition(Base):
 
 
 class MiddlewareDefinition(Base):
-    """Middleware 元信息。"""
+    """内置 Middleware 元信息（仅种子写入，无对外新建/编辑 API）。"""
 
     __tablename__ = "middleware_definition"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
-    # 例：deepagents_app.middleware.logging_middleware:LoggingMiddleware
     class_path: Mapped[str] = mapped_column(String(512), nullable=False)
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
 
     agents: Mapped[list[AgentDefinition]] = relationship(
         secondary="agent_middleware",
         back_populates="middlewares",
+    )
+
+
+class MethodologyAgent(Base):
+    """方法论 ↔ 全局 Agent 多对多。"""
+
+    __tablename__ = "methodology_agent"
+
+    methodology_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("methodology.id", ondelete="CASCADE"), primary_key=True
+    )
+    agent_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("agent_definition.id", ondelete="CASCADE"), primary_key=True
     )
 
 
@@ -162,7 +177,7 @@ class AgentMiddleware(Base):
 
 
 class MethodologyRevision(Base):
-    """方法论版本快照：旧会话按创建时版本重建 Agent。"""
+    """方法论版本快照。"""
 
     __tablename__ = "methodology_revision"
     __table_args__ = (
@@ -181,7 +196,7 @@ class MethodologyRevision(Base):
 
 
 class Conversation(Base):
-    """会话：绑定方法论版本，thread_id 隔离多轮状态。"""
+    """会话：绑定方法论版本。"""
 
     __tablename__ = "conversation"
 

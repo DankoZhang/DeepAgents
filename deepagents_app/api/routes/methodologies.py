@@ -2,7 +2,7 @@
 方法论 API
 ==========
 
-CRUD + 发布 + 版本列表。配置变更会 bump version 并写快照。
+CRUD + 发布 + 勾选全局 Agent + 版本列表。
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from deepagents_app.api.schemas import (
+    MethodologyBindAgents,
     MethodologyCreate,
     MethodologyDetailOut,
     MethodologyOut,
@@ -22,18 +23,21 @@ from deepagents_app.services import methodology as methodology_svc
 router = APIRouter(tags=["methodology"])
 
 
-@router.post("/methodology", response_model=MethodologyOut)
+@router.post("/methodology", response_model=MethodologyDetailOut)
 def create_methodology(body: MethodologyCreate, db: Session = Depends(get_db)):
-    """创建草稿方法论（初始 version=1）。"""
+    """创建草稿方法论，可选 ``agent_ids`` 立即勾选全局 Agent。"""
     try:
         return methodology_svc.create_methodology(
             db,
             name=body.name,
             description=body.description,
             methodology_id=body.id,
+            agent_ids=body.agent_ids or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/methodology/list", response_model=list[MethodologyOut])
@@ -46,7 +50,6 @@ def list_methodologies(
 
 @router.get("/methodology/{methodology_id}", response_model=MethodologyDetailOut)
 def get_methodology(methodology_id: str, db: Session = Depends(get_db)):
-    """详情含 agents 及其绑定的 tools / middlewares。"""
     row = methodology_svc.get_methodology(db, methodology_id)
     if row is None:
         raise HTTPException(status_code=404, detail="方法论不存在")
@@ -80,9 +83,29 @@ def delete_methodology(methodology_id: str, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+@router.post(
+    "/methodology/{methodology_id}/agents",
+    response_model=MethodologyDetailOut,
+)
+def bind_agents(
+    methodology_id: str,
+    body: MethodologyBindAgents,
+    db: Session = Depends(get_db),
+):
+    """勾选全局 Agent；``replace=True`` 时先清空再绑定。"""
+    try:
+        return methodology_svc.bind_methodology_agents(
+            db,
+            methodology_id,
+            body.agent_ids,
+            replace=body.replace,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/methodology/{methodology_id}/publish", response_model=MethodologyOut)
 def publish_methodology(methodology_id: str, db: Session = Depends(get_db)):
-    """发布前校验至少存在一个 Supervisor；发布后才可创建会话。"""
     try:
         return methodology_svc.publish_methodology(db, methodology_id)
     except LookupError as exc:
@@ -93,7 +116,6 @@ def publish_methodology(methodology_id: str, db: Session = Depends(get_db)):
 
 @router.get("/methodology/{methodology_id}/versions")
 def list_versions(methodology_id: str, db: Session = Depends(get_db)):
-    """列出历史快照版本（供排查旧会话用）。"""
     try:
         return methodology_svc.get_methodology_versions(db, methodology_id)
     except LookupError as exc:

@@ -3,19 +3,14 @@
 DeepAgents CLI
 ==============
 
-默认走 YAML 演示工厂；也可按方法论从数据库动态组装（对齐设计文档）。
+按数据库方法论动态组装 Agent（需 PostgreSQL；启动时会幂等 seed）。
 
 用法::
 
-    # 安装依赖后
     cp .env.example .env   # 填入 API Key
     docker compose up -d   # PostgreSQL + Redis
-    python main.py
-
-    # 使用数据库中的方法论（需先 python server.py 种子数据，或手动 seed）
+    python main.py                              # 默认 demo_deepagents
     python main.py --methodology demo_deepagents
-
-    # 单次提问
     python main.py -q "什么是 Deep Agents 的 Middleware？"
 
 交互命令：
@@ -31,13 +26,12 @@ import argparse
 import logging
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -46,6 +40,8 @@ if str(ROOT) not in sys.path:
 from deepagents_app.config import get_settings  # noqa: E402
 
 console = Console()
+
+DEFAULT_METHODOLOGY_ID = "demo_deepagents"
 
 
 def _setup_logging(level: str) -> None:
@@ -175,12 +171,6 @@ def interactive_loop(agent: Any, thread_id: str, *, title: str) -> None:
             logging.exception("run_once failed")
 
 
-def _build_agent_yaml(settings: Any) -> Any:
-    from deepagents_app.factory import build_deep_agent
-
-    return build_deep_agent(settings)
-
-
 def _build_agent_methodology(settings: Any, methodology_id: str) -> Any:
     from deepagents_app.db.seed import seed_defaults
     from deepagents_app.db.session import get_session_factory, init_db
@@ -192,8 +182,7 @@ def _build_agent_methodology(settings: Any, methodology_id: str) -> Any:
     try:
         seed_defaults(db)
         db.commit()
-        agent = build_agent_from_methodology(db, methodology_id, settings=settings)
-        return agent
+        return build_agent_from_methodology(db, methodology_id, settings=settings)
     except Exception:
         db.rollback()
         raise
@@ -211,8 +200,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--methodology",
-        default=None,
-        help="按方法论 ID 从数据库动态组装 Agent（例：demo_deepagents）",
+        default=DEFAULT_METHODOLOGY_ID,
+        help=f"方法论 ID（默认 {DEFAULT_METHODOLOGY_ID}）",
     )
     parser.add_argument(
         "--hitl",
@@ -231,22 +220,9 @@ def main() -> int:
     _setup_logging(settings.log_level)
 
     try:
-        if args.methodology:
-            console.print(
-                f"[dim]正在按方法论组装 Agent：{args.methodology}…[/dim]"
-            )
-            agent = _build_agent_methodology(settings, args.methodology)
-            title = f"方法论驱动：`{args.methodology}`"
-        else:
-            console.print(
-                "[dim]正在组装 Deep Agent（YAML / 模型 / Middleware / Backend）…[/dim]"
-            )
-            agent = _build_agent_yaml(settings)
-            title = (
-                "YAML 演示模式。子 Agent：`document-writer` / "
-                "`computer-operator` / `qa-expert`\n"
-                "提示：可用 `--methodology demo_deepagents` 切换数据库驱动模式。"
-            )
+        console.print(f"[dim]正在按方法论组装 Agent：{args.methodology}…[/dim]")
+        agent = _build_agent_methodology(settings, args.methodology)
+        title = f"方法论驱动：`{args.methodology}`"
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]组装失败：{exc}[/red]")
         console.print(

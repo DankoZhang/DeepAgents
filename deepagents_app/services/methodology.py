@@ -1,4 +1,4 @@
-"""方法论 CRUD 与发布 / 版本管理。"""
+"""方法论 CRUD、发布、勾选全局 Agent。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session, joinedload
 
-from deepagents_app.db.models import AgentDefinition, Methodology
+from deepagents_app.db.models import AgentDefinition, Methodology, MethodologyAgent
 from deepagents_app.services.agent_factory import invalidate_agent_cache
 from deepagents_app.services.revisions import list_revisions, snapshot_methodology
 
@@ -41,8 +41,9 @@ def create_methodology(
     name: str,
     description: str = "",
     methodology_id: str | None = None,
+    agent_ids: list[str] | None = None,
 ) -> Methodology:
-    """创建草稿方法论，并写入 v1 初始快照。"""
+    """创建草稿方法论，可选立即勾选全局 Agent，并写入 v1 快照。"""
     mid = methodology_id or _slug_id(name)
     if db.get(Methodology, mid) is not None:
         raise ValueError(f"方法论已存在：{mid}")
@@ -55,8 +56,10 @@ def create_methodology(
     )
     db.add(row)
     db.flush()
+    if agent_ids:
+        bind_methodology_agents(db, mid, agent_ids, replace=True, bump_version=False)
     snapshot_methodology(db, mid)
-    return row
+    return get_methodology(db, mid) or row
 
 
 def update_methodology(
@@ -67,11 +70,6 @@ def update_methodology(
     description: str | None = None,
     bump_version: bool = True,
 ) -> Methodology:
-    """
-    修改方法论元信息。
-
-    默认 bump_version=True：配置变更 → version+1，快照并失效缓存。
-    """
     row = db.get(Methodology, methodology_id)
     if row is None:
         raise LookupError(f"方法论不存在：{methodology_id}")
@@ -98,25 +96,59 @@ def delete_methodology(db: Session, methodology_id: str) -> None:
     db.flush()
 
 
-def publish_methodology(db: Session, methodology_id: str) -> Methodology:
-    """
-    发布方法论：校验存在 Supervisor → status=published → 快照。
+def bind_methodology_agents(
+    db: Session,
+    methodology_id: str,
+    agent_ids: list[str],
+    *,
+    replace: bool = True,
+    bump_version: bool = True,
+) -> Methodology:
+    """方法论勾选 / 替换全局 Agent 列表。"""
+    methodology = db.get(Methodology, methodology_id)
+    if methodology is None:
+        raise LookupError(f"方法论不存在：{methodology_id}")
 
-    只有 published 状态才能创建新会话。
-    """
-    row = db.get(Methodology, methodology_id)
+    if replace:
+        db.query(MethodologyAgent).filter(
+            MethodologyAgent.methodology_id == methodology_id
+        ).delete()
+
+    for aid in agent_ids:
+        agent = db.get(AgentDefinition, aid)
+        if agent is None:
+            raise LookupError(f"Agent 不存在：{aid}")
+        exists = (
+            db.query(MethodologyAgent)
+            .filter(
+                MethodologyAgent.methodology_id == methodology_id,
+                MethodologyAgent.agent_id == aid,
+            )
+            .one_or_none()
+        )
+        if exists is None:
+            db.add(MethodologyAgent(methodology_id=methodology_id, agent_id=aid))
+
+    if bump_version:
+        methodology.version += 1
+        methodology.updated_time = datetime.now(timezone.utc)
+        invalidate_agent_cache(methodology_id)
+    db.flush()
+    if bump_version:
+        snapshot_methodology(db, methodology_id)
+    return get_methodology(db, methodology_id)  # type: ignore[return-value]
+
+
+def publish_methodology(db: Session, methodology_id: str) -> Methodology:
+    """发布：勾选的 Agent 中须至少有一个 Supervisor。"""
+    row = get_methodology(db, methodology_id)
     if row is None:
         raise LookupError(f"方法论不存在：{methodology_id}")
-    agents = (
-        db.query(AgentDefinition)
-        .filter(AgentDefinition.methodology_id == methodology_id)
-        .all()
-    )
     has_supervisor = any(
-        (a.config or {}).get("role") == "supervisor" for a in agents
+        (a.config or {}).get("role") == "supervisor" for a in row.agents
     )
     if not has_supervisor:
-        raise ValueError("发布失败：请先配置至少一个 Supervisor Agent")
+        raise ValueError("发布失败：请先勾选至少一个 Supervisor Agent")
     row.status = "published"
     row.updated_time = datetime.now(timezone.utc)
     invalidate_agent_cache(methodology_id)

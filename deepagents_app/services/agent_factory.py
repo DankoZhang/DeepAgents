@@ -29,7 +29,6 @@ from deepagents_app.db.models import (
     AgentDefinition,
     Methodology,
     MiddlewareDefinition,
-    ToolDefinition,
 )
 from deepagents_app.factory import (
     _build_checkpointer,
@@ -40,7 +39,7 @@ from deepagents_app.factory import (
 )
 from deepagents_app.models import build_chat_model
 from deepagents_app.registries.middleware import load_middleware_object
-from deepagents_app.registries.tools import load_tool_object
+from deepagents_app.registries.tools import expand_tool_definition, load_tools_by_ids
 from deepagents_app.services.revisions import get_revision
 
 logger = logging.getLogger(__name__)
@@ -123,25 +122,6 @@ def _agent_enabled(agent: AgentDefinition | dict[str, Any]) -> bool:
     return bool(cfg.get("enabled", True))
 
 
-def _load_tools_by_ids(db: Session, tool_ids: list[str]) -> list[Any]:
-    if not tool_ids:
-        return []
-    rows = (
-        db.query(ToolDefinition)
-        .filter(ToolDefinition.id.in_(tool_ids), ToolDefinition.status == "active")
-        .all()
-    )
-    by_id = {r.id: r for r in rows}
-    tools: list[Any] = []
-    for tid in tool_ids:
-        row = by_id.get(tid)
-        if row is None:
-            logger.warning("快照引用的工具不存在或未激活，跳过：%s", tid)
-            continue
-        tools.append(load_tool_object(row))
-    return tools
-
-
 def _load_middlewares_by_ids(db: Session, middleware_ids: list[str]) -> list[Any]:
     if not middleware_ids:
         return []
@@ -161,10 +141,17 @@ def _load_middlewares_by_ids(db: Session, middleware_ids: list[str]) -> list[Any
     return result
 
 
+def _expand_agent_tools(agent: AgentDefinition) -> list[Any]:
+    tools: list[Any] = []
+    for t in agent.tools:
+        tools.extend(expand_tool_definition(t))
+    return tools
+
+
 def _build_subagent_spec_from_row(agent: AgentDefinition) -> dict[str, Any]:
     """AgentDefinition → deepagents SubAgent 字典。"""
     cfg = agent.config or {}
-    tools = [load_tool_object(t) for t in agent.tools if t.status == "active"]
+    tools = _expand_agent_tools(agent)
     middleware = [load_middleware_object(m) for m in agent.middlewares]
 
     spec: dict[str, Any] = {
@@ -188,7 +175,7 @@ def _build_subagent_spec_from_snapshot(
     agent: dict[str, Any],
 ) -> dict[str, Any]:
     cfg = agent.get("config") or {}
-    tools = _load_tools_by_ids(db, list(agent.get("tool_ids") or []))
+    tools = load_tools_by_ids(db, list(agent.get("tool_ids") or []))
     middleware = _load_middlewares_by_ids(db, list(agent.get("middleware_ids") or []))
 
     spec: dict[str, Any] = {
@@ -281,9 +268,7 @@ def _build_from_live(
 
     subagents = [_build_subagent_spec_from_row(a) for a in subagents_defs]
     middleware = [load_middleware_object(m) for m in supervisor.middlewares]
-    supervisor_tools = [
-        load_tool_object(t) for t in supervisor.tools if t.status == "active"
-    ]
+    supervisor_tools = _expand_agent_tools(supervisor)
 
     logger.info(
         "动态组装 Agent（live）：methodology=%s v%s supervisor=%s subagents=%s",
@@ -334,7 +319,7 @@ def _build_from_snapshot(
     middleware = _load_middlewares_by_ids(
         db, list(supervisor.get("middleware_ids") or [])
     )
-    supervisor_tools = _load_tools_by_ids(db, list(supervisor.get("tool_ids") or []))
+    supervisor_tools = load_tools_by_ids(db, list(supervisor.get("tool_ids") or []))
 
     logger.info(
         "动态组装 Agent（snapshot）：methodology=%s v%s supervisor=%s subagents=%s",

@@ -6,6 +6,7 @@ from deepagents_app.registries.middleware import (
     load_middlewares_for_agent,
 )
 from deepagents_app.registries.tools import (
+    expand_tool_definition,
     load_tool_object,
     load_tools_by_ids,
     load_tools_for_agent,
@@ -14,6 +15,7 @@ from deepagents_app.registries.tools import (
 
 __all__ = [
     "resolve_class_path",
+    "expand_tool_definition",
     "load_tool_object",
     "load_tools_by_ids",
     "load_tools_for_agent",

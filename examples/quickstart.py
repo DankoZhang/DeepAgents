@@ -1,7 +1,7 @@
 """
-最小可运行示例：不启动 REPL，直接 invoke 一次。
+最小可运行示例：按种子方法论组装 Agent 并 invoke 一次。
 
-运行前请配置 .env 中的 API Key::
+运行前请配置 .env，并启动 docker compose（PostgreSQL + Redis）::
 
     python examples/quickstart.py
 """
@@ -14,11 +14,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from deepagents_app.factory import build_deep_agent
+from deepagents_app.db.seed import seed_defaults
+from deepagents_app.db.session import get_session_factory, init_db
+from deepagents_app.services.agent_factory import build_agent_from_methodology
 
 
 def main() -> None:
-    agent = build_deep_agent()
+    init_db()
+    db = get_session_factory()()
+    try:
+        seed_defaults(db)
+        db.commit()
+        agent = build_agent_from_methodology(db, "demo_deepagents")
+    finally:
+        db.close()
+
     result = agent.invoke(
         {
             "messages": [

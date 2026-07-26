@@ -72,31 +72,66 @@ def test_seeded_demo_methodology(client):
 def test_tool_and_middleware_registry(client):
     tools = client.get("/api/tool/list").json()
     assert len(tools) >= 11
+    assert all(t["tool_type"] == "builtin" for t in tools)
     mws = client.get("/api/middleware/list").json()
     assert {m["name"] for m in mws} >= {
         "LoggingMiddleware",
         "TimingMiddleware",
         "AuditMiddleware",
     }
+    # 中间件写接口已下线
+    assert client.post("/api/middleware", json={"name": "x", "class_path": "a:b"}).status_code in {
+        404,
+        405,
+    }
 
 
-def test_methodology_crud_and_publish(client):
+def test_create_mcp_tool_only(client):
+    bad = client.post(
+        "/api/tool",
+        json={
+            "name": "legacy",
+            "class_path": "deepagents_app.tools.qa_tools:save_qa_note",
+        },
+    )
+    assert bad.status_code == 422
+
+    ok = client.post(
+        "/api/tool",
+        json={
+            "name": "demo-mcp",
+            "description": "MCP demo",
+            "mcp": {
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "dummy-mcp"],
+            },
+        },
+    )
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["tool_type"] == "mcp"
+    assert body["config"]["command"] == "npx"
+
+    # 内置不可删
+    bad_del = client.delete("/api/tool/tool_create_document")
+    assert bad_del.status_code == 400
+
+
+def test_global_agent_and_methodology_bind(client):
     created = client.post(
         "/api/methodology",
         json={"name": "SysML方法论", "description": "系统工程", "id": "sysml_methodology"},
     )
     assert created.status_code == 200
-    assert created.json()["id"] == "sysml_methodology"
     assert created.json()["status"] == "draft"
 
-    # 无 supervisor 不能发布
     bad = client.post("/api/methodology/sysml_methodology/publish")
     assert bad.status_code == 400
 
     agent = client.post(
         "/api/agent",
         json={
-            "methodology_id": "sysml_methodology",
             "name": "sysml-supervisor",
             "system_prompt": "你是 SysML Supervisor",
             "config": {"role": "supervisor"},
@@ -105,6 +140,14 @@ def test_methodology_crud_and_publish(client):
     )
     assert agent.status_code == 200
     assert agent.json()["config"]["role"] == "supervisor"
+    agent_id = agent.json()["id"]
+
+    bound = client.post(
+        "/api/methodology/sysml_methodology/agents",
+        json={"agent_ids": [agent_id], "replace": True},
+    )
+    assert bound.status_code == 200
+    assert {a["id"] for a in bound.json()["agents"]} == {agent_id}
 
     published = client.post("/api/methodology/sysml_methodology/publish")
     assert published.status_code == 200
@@ -130,7 +173,6 @@ def test_conversation_binds_version(client):
     assert got.status_code == 200
     assert got.json()["thread_id"] == body["thread_id"]
 
-    # 新会话尚无 checkpoint 历史时，messages 为空列表
     msgs = client.get(f"/api/conversation/{body['thread_id']}/messages")
     assert msgs.status_code == 200
     payload = msgs.json()
@@ -140,15 +182,9 @@ def test_conversation_binds_version(client):
 
 
 def test_agent_bind_tools(client):
-    # 新建方法论 + subagent，绑定工具
-    client.post(
-        "/api/methodology",
-        json={"name": "绑定测试", "id": "bind_test"},
-    )
     agent = client.post(
         "/api/agent",
         json={
-            "methodology_id": "bind_test",
             "name": "writer",
             "system_prompt": "写文档",
             "config": {"role": "subagent"},
@@ -164,20 +200,22 @@ def test_agent_bind_tools(client):
 
 
 def test_old_conversation_keeps_methodology_version(client):
-    """§10 / §14.10：旧会话锁定创建时版本，新会话用最新版。"""
-    # 准备可发布方法论
+    """旧会话锁定创建时版本；改全局 Agent 会 bump 勾选它的方法论。"""
     client.post(
         "/api/methodology",
         json={"name": "版本锁定", "id": "version_lock"},
     )
-    client.post(
+    agent = client.post(
         "/api/agent",
         json={
-            "methodology_id": "version_lock",
-            "name": "supervisor",
+            "name": "vl-supervisor",
             "system_prompt": "v1 supervisor",
             "config": {"role": "supervisor"},
         },
+    ).json()
+    client.post(
+        "/api/methodology/version_lock/agents",
+        json={"agent_ids": [agent["id"]], "replace": True},
     )
     published = client.post("/api/methodology/version_lock/publish")
     assert published.status_code == 200
@@ -189,11 +227,8 @@ def test_old_conversation_keeps_methodology_version(client):
     ).json()
     assert conv_old["methodology_version"] == v_at_create
 
-    # 修改 Agent → 方法论 version+1
-    agents = client.get("/api/agent/list", params={"methodology_id": "version_lock"}).json()
-    supervisor_id = agents[0]["id"]
     updated = client.patch(
-        f"/api/agent/{supervisor_id}",
+        f"/api/agent/{agent['id']}",
         json={"system_prompt": "v2 supervisor"},
     )
     assert updated.status_code == 200
@@ -201,7 +236,6 @@ def test_old_conversation_keeps_methodology_version(client):
     meta = client.get("/api/methodology/version_lock").json()
     assert meta["version"] == v_at_create + 1
 
-    # 旧会话仍绑定旧版本；新会话用新版本
     got_old = client.get(f"/api/conversation/{conv_old['thread_id']}").json()
     assert got_old["methodology_version"] == v_at_create
 
