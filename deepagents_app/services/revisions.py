@@ -1,10 +1,13 @@
 """方法论版本快照：旧会话可按创建时版本重建 Agent。"""
 
+# 推迟注解求值
 from __future__ import annotations
 
+# 快照写入时间
 from datetime import datetime, timezone
 from typing import Any
 
+# 预加载 agents → tools / middlewares
 from sqlalchemy.orm import Session, joinedload
 
 from deepagents_app.db.models import AgentDefinition, Methodology, MethodologyRevision
@@ -15,6 +18,7 @@ def serialize_methodology(db: Session, methodology_id: str) -> dict[str, Any]:
     methodology = (
         db.query(Methodology)
         .options(
+            # 快照需记下每个 Agent 绑定的 tool/middleware id
             joinedload(Methodology.agents).joinedload(AgentDefinition.tools),
             joinedload(Methodology.agents).joinedload(AgentDefinition.middlewares),
         )
@@ -26,6 +30,7 @@ def serialize_methodology(db: Session, methodology_id: str) -> dict[str, Any]:
 
     agents_payload: list[dict[str, Any]] = []
     for agent in methodology.agents:
+        # 存可序列化字段；关系只存 id 列表，重建时再 load
         agents_payload.append(
             {
                 "id": agent.id,
@@ -54,7 +59,8 @@ def snapshot_methodology(db: Session, methodology_id: str) -> MethodologyRevisio
     if methodology is None:
         raise LookupError(f"方法论不存在：{methodology_id}")
 
-    payload = serialize_methodology(db, methodology_id)
+    payload = serialize_methodology(db, methodology_id)  # 生成 JSON
+    # 同 methodology + version 已有则覆盖（幂等）
     existing = (
         db.query(MethodologyRevision)
         .filter(
@@ -64,13 +70,14 @@ def snapshot_methodology(db: Session, methodology_id: str) -> MethodologyRevisio
         .one_or_none()
     )
     if existing is not None:
-        existing.snapshot = payload
+        existing.snapshot = payload  # 覆盖内容
         existing.created_time = datetime.now(timezone.utc)
         db.flush()
         return existing
 
+    # 新建 revision 行
     row = MethodologyRevision(
-        id=f"{methodology_id}_v{methodology.version}",
+        id=f"{methodology_id}_v{methodology.version}",  # 可读主键
         methodology_id=methodology_id,
         version=methodology.version,
         snapshot=payload,
@@ -85,6 +92,7 @@ def get_revision(
     methodology_id: str,
     version: int,
 ) -> MethodologyRevision | None:
+    # Factory 在会话锁定旧 version 时按此取快照
     return (
         db.query(MethodologyRevision)
         .filter(
@@ -96,6 +104,7 @@ def get_revision(
 
 
 def list_revisions(db: Session, methodology_id: str) -> list[MethodologyRevision]:
+    # 版本列表 API：新版本在前
     return (
         db.query(MethodologyRevision)
         .filter(MethodologyRevision.methodology_id == methodology_id)
