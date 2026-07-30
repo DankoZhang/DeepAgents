@@ -21,6 +21,7 @@ import subprocess
 from pathlib import Path
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 from deepagents_app.config import get_settings
 
@@ -105,13 +106,45 @@ def _validate_command(command: str) -> str | None:
     return None
 
 
-@tool
-def list_workspace(relative_dir: str = ".") -> str:
-    """列出 workspace 下某目录的文件与子目录。
+class ListWorkspaceArgs(BaseModel):
+    relative_dir: str = Field(
+        default=".",
+        description="相对 workspace 的目录，默认 .（根目录）",
+    )
 
-    Args:
-        relative_dir: 相对 workspace 的目录，默认 ``.``（根目录）。
-    """
+
+class ReadWorkspaceFileArgs(BaseModel):
+    relative_path: str = Field(description="相对 workspace 的文件路径")
+    max_chars: int = Field(
+        default=8000,
+        ge=1,
+        le=100_000,
+        description="最多返回的字符数，防止撑爆上下文",
+    )
+
+
+class WriteWorkspaceFileArgs(BaseModel):
+    relative_path: str = Field(description="相对 workspace 的目标路径")
+    content: str = Field(description="文件内容")
+    overwrite: bool = Field(
+        default=False,
+        description="若文件已存在，是否允许覆盖；默认 False",
+    )
+
+
+class RunShellCommandArgs(BaseModel):
+    command: str = Field(description="要执行的命令字符串（须在白名单内）")
+    timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+        description="超时秒数，默认 30",
+    )
+
+
+@tool(args_schema=ListWorkspaceArgs)
+def list_workspace(relative_dir: str = ".") -> str:
+    """列出 workspace 下某目录的文件与子目录。"""
     path = _safe_path(relative_dir)
     if not path.exists():
         return f"目录不存在：{path}"
@@ -130,14 +163,9 @@ def list_workspace(relative_dir: str = ".") -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(args_schema=ReadWorkspaceFileArgs)
 def read_workspace_file(relative_path: str, max_chars: int = 8000) -> str:
-    """读取 workspace 内文本文件内容（带长度截断）。
-
-    Args:
-        relative_path: 相对 workspace 的文件路径。
-        max_chars: 最多返回的字符数，防止撑爆上下文。
-    """
+    """读取 workspace 内文本文件内容（带长度截断）。"""
     path = _safe_path(relative_path)
     if not path.exists():
         return f"文件不存在：{path}"
@@ -150,15 +178,9 @@ def read_workspace_file(relative_path: str, max_chars: int = 8000) -> str:
     return text
 
 
-@tool
+@tool(args_schema=WriteWorkspaceFileArgs)
 def write_workspace_file(relative_path: str, content: str, overwrite: bool = False) -> str:
-    """向 workspace 写入文本文件。
-
-    Args:
-        relative_path: 相对 workspace 的目标路径。
-        content: 文件内容。
-        overwrite: 若文件已存在，是否允许覆盖。默认 False。
-    """
+    """向 workspace 写入文本文件。"""
     path = _safe_path(relative_path)
     if path.exists() and not overwrite:
         return f"文件已存在且 overwrite=False，拒绝写入：{path}"
@@ -167,17 +189,9 @@ def write_workspace_file(relative_path: str, content: str, overwrite: bool = Fal
     return f"已写入 {path}（{len(content)} 字符）"
 
 
-@tool
+@tool(args_schema=RunShellCommandArgs)
 def run_shell_command(command: str, timeout_seconds: int = 30) -> str:
-    """在 workspace 目录下执行白名单内的 shell 命令。
-
-    Args:
-        command: 要执行的命令字符串。
-        timeout_seconds: 超时秒数，默认 30。
-
-    Returns:
-        stdout / stderr 合并摘要。
-    """
+    """在 workspace 目录下执行白名单内的 shell 命令，返回 stdout/stderr 摘要。"""
     err = _validate_command(command)
     if err:
         return f"[拒绝执行] {err}"

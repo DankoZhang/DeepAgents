@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 from deepagents_app.config import get_settings
 
@@ -85,17 +86,20 @@ def _notes_dir() -> Path:
     return get_settings().workspace_dir / "notes"
 
 
-@tool
+class SearchKnowledgeArgs(BaseModel):
+    query: str = Field(description="查询字符串（支持空格分词）")
+    top_k: int = Field(default=3, ge=1, le=20, description="返回条数上限，默认 3")
+
+
+class SaveQaNoteArgs(BaseModel):
+    question: str = Field(description="用户问题")
+    answer: str = Field(description="最终答案")
+    tags: str = Field(default="", description="可选标签，逗号分隔")
+
+
+@tool(args_schema=SearchKnowledgeArgs)
 def search_knowledge(query: str, top_k: int = 3) -> str:
-    """在本地知识库中按关键词检索相关条目。
-
-    Args:
-        query: 查询字符串（支持空格分词）。
-        top_k: 返回条数上限，默认 3。
-
-    Returns:
-        匹配条目的标题与正文摘要。
-    """
+    """在本地知识库中按关键词检索相关条目，返回匹配标题与正文摘要。"""
     tokens = [t.lower() for t in query.split() if t.strip()]
     if not tokens:
         return "查询为空，请提供关键词。"
@@ -133,15 +137,9 @@ def list_knowledge_topics() -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(args_schema=SaveQaNoteArgs)
 def save_qa_note(question: str, answer: str, tags: str = "") -> str:
-    """将一对高质量问答沉淀为笔记，便于后续复用。
-
-    Args:
-        question: 用户问题。
-        answer: 最终答案。
-        tags: 可选标签，逗号分隔。
-    """
+    """将一对高质量问答沉淀为笔记，便于后续复用。"""
     notes = _notes_dir()
     notes.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

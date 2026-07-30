@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 from deepagents_app.config import get_settings
 
@@ -42,18 +43,27 @@ def _safe_doc_path(filename: str) -> Path:
     return target
 
 
-@tool
+class CreateDocumentArgs(BaseModel):
+    filename: str = Field(
+        description="文件名，建议以 .md 结尾，例如 project-readme.md"
+    )
+    title: str = Field(description="文档标题（写入一级标题）")
+    content: str = Field(description="文档正文（Markdown）")
+
+
+class AppendDocumentSectionArgs(BaseModel):
+    filename: str = Field(description="已有文档文件名")
+    section_title: str = Field(description="章节标题")
+    section_content: str = Field(description="章节正文")
+
+
+class ReadDocumentArgs(BaseModel):
+    filename: str = Field(description="文档文件名")
+
+
+@tool(args_schema=CreateDocumentArgs)
 def create_document(filename: str, title: str, content: str) -> str:
-    """创建一份 Markdown 文档并写入工作区。
-
-    Args:
-        filename: 文件名，建议以 .md 结尾，例如 ``project-readme.md``。
-        title: 文档标题（写入一级标题）。
-        content: 文档正文（Markdown）。
-
-    Returns:
-        创建结果摘要，包含绝对路径与字数。
-    """
+    """创建一份 Markdown 文档并写入工作区，返回路径与字数摘要。"""
     path = _safe_doc_path(filename if filename.endswith(".md") else f"{filename}.md")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     body = (
@@ -70,18 +80,9 @@ def create_document(filename: str, title: str, content: str) -> str:
     )
 
 
-@tool
+@tool(args_schema=AppendDocumentSectionArgs)
 def append_document_section(filename: str, section_title: str, section_content: str) -> str:
-    """向已有 Markdown 文档追加一个二级章节。
-
-    Args:
-        filename: 已有文档文件名。
-        section_title: 章节标题。
-        section_content: 章节正文。
-
-    Returns:
-        追加结果摘要。
-    """
+    """向已有 Markdown 文档追加一个二级章节。"""
     path = _safe_doc_path(filename if filename.endswith(".md") else f"{filename}.md")
     if not path.exists():
         return f"文档不存在：{path}。请先调用 create_document。"
@@ -105,13 +106,9 @@ def list_documents() -> str:
     return "\n".join(lines)
 
 
-@tool
+@tool(args_schema=ReadDocumentArgs)
 def read_document(filename: str) -> str:
-    """读取指定文档的完整内容。
-
-    Args:
-        filename: 文档文件名。
-    """
+    """读取指定文档的完整内容。"""
     path = _safe_doc_path(filename if filename.endswith(".md") else f"{filename}.md")
     if not path.exists():
         return f"文档不存在：{path}"

@@ -93,7 +93,7 @@ def create_mcp_tool(
         raise ValueError(f"工具名已存在：{name}")
     # MCP 行：无 class_path，执行体在 config 描述的远程 Server
     row = ToolDefinition(
-        id=tool_id or f"tool_{uuid.uuid4().hex[:12]}",
+        id=tool_id or f"tool_{uuid.uuid4().hex[:12]}", # .hex: 剔除 - 符号
         name=name,
         description=description,
         tool_type="mcp",  # 运行时走 MultiServerMCPClient 展开

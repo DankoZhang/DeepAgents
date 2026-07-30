@@ -135,7 +135,7 @@ def _read_prompt(name: str) -> str:
 
 
 def seed_tools_and_middlewares(db: Session) -> None:
-    """幂等写入内置 Tool / Middleware。"""
+    """幂等（幂等性保证：如果工具或中间件已经存在，则不进行创建）写入内置 Tool / Middleware。"""
     for item in DEFAULT_TOOLS:
         if db.get(ToolDefinition, item["id"]) is None:
             create_builtin_tool(
@@ -158,7 +158,7 @@ def seed_tools_and_middlewares(db: Session) -> None:
 
 
 def seed_demo_agents(db: Session) -> None:
-    """幂等写入全局 demo Agents（已存在则跳过）。"""
+    """幂等（幂等性保证：如果 Agent 已经存在，则不进行创建）写入全局 demo Agents。"""
     from deepagents_app.db.models import AgentDefinition
 
     doc_tools = [
@@ -250,7 +250,7 @@ def seed_demo_agents(db: Session) -> None:
 
 
 def seed_demo_methodology(db: Session) -> None:
-    """写入演示方法论并勾选全局 demo Agents。"""
+    """幂等（幂等性保证：如果方法论已经存在，则不进行创建）写入演示方法论并勾选全局 demo Agents。"""
     if db.get(Methodology, DEMO_METHODOLOGY_ID) is not None:
         return
 
