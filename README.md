@@ -29,8 +29,18 @@ cp .env.example .env
 # 启动 PostgreSQL + Redis
 docker compose up -d
 
-# 启动 FastAPI（默认 http://0.0.0.0:8000）
+# 迁移 schema（部署步骤；API 启动不会自动执行）
+python -m deepagents_app.db.migrate
+
+# 启动 FastAPI（默认 http://0.0.0.0:8000；启动时仅写入幂等种子数据）
 python server.py
+```
+
+Schema 变更请用 Alembic（见 `alembic/README`）：
+
+```bash
+alembic revision --autogenerate -m "your change"
+python -m deepagents_app.db.migrate
 ```
 
 另开终端启动前端：
@@ -103,15 +113,20 @@ OPENAI_API_KEY=sk-...
 DeepAgents/
 ├── main.py                 # CLI 入口（方法论组装）
 ├── server.py               # FastAPI 入口
+├── alembic.ini             # Alembic 配置
+├── alembic/                # Schema 迁移脚本
 ├── docker-compose.yml      # PostgreSQL + Redis Stack
 ├── deepagents_app/
 │   ├── api/                # FastAPI 路由与 schemas
-│   ├── db/                 # ORM / session / seed
+│   ├── db/                 # ORM / session / seed / 预加载选项
 │   ├── services/           # 方法论 / Agent Factory / 会话 / Chat
 │   ├── registries/         # Tool（builtin/MCP）/ Middleware 加载
+│   ├── llm.py              # Chat Model 工厂
 │   ├── factory.py          # checkpointer 等共享组装工具
+│   ├── utils/              # 路径安全 / 文本归一化
 │   ├── tools/              # 内置工具实现
 │   ├── middleware/
+│   ├── prompts/            # 种子子 Agent 系统提示
 │   └── skills/
 └── workspace/
 ```

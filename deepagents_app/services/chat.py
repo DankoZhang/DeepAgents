@@ -15,24 +15,14 @@ from sqlalchemy.orm import Session  # SQLAlchemy 数据库会话类型
 
 from deepagents_app.services.agent_factory import build_agent_from_methodology  # 按方法论构建 agent
 from deepagents_app.services.conversation import get_conversation_by_thread  # 按 thread_id 查会话
+from deepagents_app.utils.text import normalize_message_content
 
 logger = logging.getLogger(__name__)  # 本模块专用 logger
 
 
 def _normalize_content(content: Any) -> str:
     """统一把 str / multimodal block 列表转为纯文本。"""
-    if content is None:  # 空内容视为空字符串
-        return ""
-    if isinstance(content, str):  # 已是纯文本则直接返回
-        return content
-    if isinstance(content, list):  # multimodal：block 列表
-        texts = [
-            # dict block 取 text 字段；否则转成字符串
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in content  # 遍历每个内容块
-        ]
-        return "\n".join(t for t in texts if t)  # 过滤空段后用换行拼接
-    return str(content)  # 其它类型统一转成字符串
+    return normalize_message_content(content)
 
 
 def _msg_role(msg: Any) -> str:

@@ -24,6 +24,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from deepagents_app.config import get_settings
+from deepagents_app.utils.paths import resolve_under_root
 
 # 允许执行的命令前缀（演示白名单）
 _ALLOWED_PREFIXES = (
@@ -69,13 +70,10 @@ def _workspace() -> Path:
 
 def _safe_path(relative_path: str) -> Path:
     """解析相对 workspace 的路径，拦截 ``..`` 穿越。"""
-    root = _workspace()
-    # 允许传入绝对路径，但必须仍落在 workspace 内
-    candidate = Path(relative_path)
-    target = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
-    if not str(target).startswith(str(root)):
-        raise ValueError(f"路径越界，仅允许访问 workspace：{relative_path}")
-    return target
+    try:
+        return resolve_under_root(_workspace(), relative_path)
+    except ValueError as exc:
+        raise ValueError(f"路径越界，仅允许访问 workspace：{relative_path}") from exc
 
 
 def _validate_command(command: str) -> str | None:
@@ -226,11 +224,3 @@ def run_shell_command(command: str, timeout_seconds: int = 30) -> str:
     if not stdout and not stderr:
         parts.append("(无输出)")
     return "\n".join(parts)
-
-
-COMPUTER_TOOLS = [
-    list_workspace,
-    read_workspace_file,
-    write_workspace_file,
-    run_shell_command,
-]

@@ -10,8 +10,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from deepagents_app.config import Settings, get_settings
-from deepagents_app.db.models import AgentDefinition, ModelDefinition, MethodologyAgent
-from deepagents_app.models import build_chat_model, model_spec_from_row
+from deepagents_app.db.models import AgentDefinition, ModelDefinition
+from deepagents_app.llm import build_chat_model, model_spec_from_row
+from deepagents_app.utils.text import normalize_message_content
 
 logger = logging.getLogger(__name__)
 
@@ -198,13 +199,7 @@ def test_model_connectivity(
         )
         result = chat.invoke("ping")
         content = getattr(result, "content", None)
-        if isinstance(content, list):
-            text = "".join(
-                block.get("text", "") if isinstance(block, dict) else str(block)
-                for block in content
-            )
-        else:
-            text = "" if content is None else str(content)
+        text = normalize_message_content(content)
         return {
             "ok": True,
             "message": "连通性测试成功",
@@ -268,14 +263,12 @@ def resolve_model_spec_for_agent(
     db: Session,
     *,
     model_id: str | None,
-    legacy_model: str | None = None,
-    legacy_temperature: float | None = None,
     snapshot_llm: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """
     组装 Agent 时解析最终模型 spec。
 
-    优先级：快照 llm（补全 api_key）> model_id 目录 > 遗留 model/temperature 字段。
+    优先级：快照 llm（补全 api_key）> model_id 目录；皆无则返回 None（回退 Settings）。
     """
     if snapshot_llm:
         spec = dict(snapshot_llm)
@@ -296,11 +289,6 @@ def resolve_model_spec_for_agent(
             raise ValueError(f"模型已禁用：{row.name} ({model_id})")
         return model_spec_from_row(row)
 
-    if legacy_model:
-        return {
-            "model_name": legacy_model,
-            "temperature": legacy_temperature,
-        }
     return None
 
 
@@ -342,31 +330,6 @@ def _validate_provider(provider: str, *, base_url: str | None) -> None:
 
 def _bump_methodologies_using_model(db: Session, model_id: str) -> None:
     """模型超参数变更：bump 所有引用该模型的 Agent 所在方法论。"""
-    # 延迟导入，避免与 agent_factory / revisions 循环依赖
-    from deepagents_app.db.models import Methodology
-    from deepagents_app.services.agent_factory import invalidate_agent_cache
-    from deepagents_app.services.revisions import snapshot_methodology
+    from deepagents_app.services.revisions import bump_methodologies_using_model
 
-    agent_ids = [
-        a.id
-        for a in db.query(AgentDefinition).filter(AgentDefinition.model_id == model_id).all()
-    ]
-    if not agent_ids:
-        invalidate_agent_cache()
-        return
-
-    meth_ids = {
-        link.methodology_id
-        for link in db.query(MethodologyAgent)
-        .filter(MethodologyAgent.agent_id.in_(agent_ids))
-        .all()
-    }
-    for mid in meth_ids:
-        methodology = db.get(Methodology, mid)
-        if methodology is None:
-            continue
-        methodology.version += 1
-        methodology.updated_time = datetime.now(timezone.utc)
-        invalidate_agent_cache(methodology.id)
-        db.flush()
-        snapshot_methodology(db, methodology.id)
+    bump_methodologies_using_model(db, model_id)

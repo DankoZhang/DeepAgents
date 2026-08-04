@@ -127,14 +127,6 @@ def expand_tool_definition(tool_def: ToolDefinition) -> list[Any]:
     return [load_builtin_tool(tool_def)]
 
 
-def load_tool_object(tool_def: ToolDefinition) -> Any:
-    """兼容旧调用：builtin 返回单对象；mcp 返回 list（调用方应优先用 expand）。"""
-    tools = expand_tool_definition(tool_def)
-    if (tool_def.tool_type or "builtin") == "mcp":
-        return tools
-    return tools[0] if tools else None
-
-
 def load_tools_by_ids(db: Session, tool_ids: list[str]) -> list[Any]:
     """按 id 列表加载并展开工具，保持顺序、去重。"""
     if not tool_ids:
@@ -156,17 +148,4 @@ def load_tools_by_ids(db: Session, tool_ids: list[str]) -> list[Any]:
             logger.warning("工具不存在或未激活，跳过：%s", tid)
             continue
         tools.extend(expand_tool_definition(row))
-    return tools
-
-
-def load_tools_for_agent(db: Session, agent_id: str) -> list[Any]:
-    """加载 Agent 绑定的全部工具（已展开）。"""
-    from deepagents_app.db.models import AgentDefinition
-
-    agent = db.get(AgentDefinition, agent_id)
-    if agent is None:
-        return []
-    tools: list[Any] = []
-    for t in agent.tools:
-        tools.extend(expand_tool_definition(t))
     return tools

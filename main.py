@@ -56,23 +56,9 @@ def _setup_logging(level: str) -> None:
 
 
 def _extract_final_text(result: dict[str, Any]) -> str:
-    messages = result.get("messages") or []
-    for msg in reversed(messages):
-        role = getattr(msg, "type", None) or (
-            msg.get("role") if isinstance(msg, dict) else None
-        )
-        content = getattr(msg, "content", None) or (
-            msg.get("content") if isinstance(msg, dict) else None
-        )
-        if role in {"ai", "assistant"} and content:
-            if isinstance(content, list):
-                texts = [
-                    block.get("text", "") if isinstance(block, dict) else str(block)
-                    for block in content
-                ]
-                return "\n".join(t for t in texts if t)
-            return str(content)
-    return "(未获得模型文本回复，请查看日志)"
+    from deepagents_app.services.chat import extract_final_text
+
+    return extract_final_text(result) or "(未获得模型文本回复，请查看日志)"
 
 
 def _handle_interrupt(
@@ -173,10 +159,10 @@ def interactive_loop(agent: Any, thread_id: str, *, title: str) -> None:
 
 def _build_agent_methodology(settings: Any, methodology_id: str) -> Any:
     from deepagents_app.db.seed import seed_defaults
-    from deepagents_app.db.session import get_session_factory, init_db
+    from deepagents_app.db.session import get_session_factory, migrate_db
     from deepagents_app.services.agent_factory import build_agent_from_methodology
 
-    init_db()
+    migrate_db()
     factory = get_session_factory()
     db = factory()
     try:

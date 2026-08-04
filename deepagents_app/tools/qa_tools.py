@@ -153,10 +153,3 @@ def save_qa_note(question: str, answer: str, tags: str = "") -> str:
     )
     path.write_text(body, encoding="utf-8")
     return f"问答笔记已保存：{path}"
-
-
-QA_TOOLS = [
-    search_knowledge,
-    list_knowledge_topics,
-    save_qa_note,
-]

@@ -158,11 +158,8 @@ class AgentCreate(BaseModel):
 
     name: str  # 全局唯一名称
     system_prompt: str = ""  # 系统提示词
-    model_id: str | None = None  # 方案 B：绑定模型目录
-    model: str | None = None  # 兼容：无 model_id 时的兜底模型名
-    temperature: float | None = None  # 兼容：无目录时的温度
+    model_id: str | None = None  # 绑定模型目录；缺省用 model_default
     # 扩展字段：role(supervisor|subagent) / description / enabled 等
-    # （skills 改走 skill_ids / agent_skill，不再写 config.skills 路径）
     config: dict[str, Any] = Field(default_factory=dict)
     tool_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的工具 id
     middleware_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的中间件 id
@@ -175,10 +172,7 @@ class AgentUpdate(BaseModel):
 
     name: str | None = None
     system_prompt: str | None = None
-    model_id: str | None = None
-    clear_model_id: bool = False  # True 时解绑目录模型
-    model: str | None = None
-    temperature: float | None = None
+    model_id: str | None = None  # 传空串则回落 model_default
     config: dict[str, Any] | None = None  # 与现有 config 做 merge，非整表替换语义由 service 定
     tool_ids: list[str] | None = None  # 传入则整表替换绑定
     middleware_ids: list[str] | None = None
@@ -213,8 +207,6 @@ class AgentOut(BaseModel):
     name: str
     system_prompt: str
     model_id: str | None = None
-    model: str | None
-    temperature: float | None
     config: dict[str, Any]
     llm_model: ModelBrief | None = None
     tools: list[ToolBrief] = Field(default_factory=list)  # 已绑定工具摘要

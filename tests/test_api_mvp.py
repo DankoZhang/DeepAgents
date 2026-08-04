@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     from deepagents_app import config
-    from deepagents_app.db.session import reset_engine
+    from deepagents_app.db.session import migrate_db, reset_engine
     from deepagents_app.services.agent_factory import invalidate_agent_cache
 
     db_path = tmp_path / "test.db"
@@ -31,6 +31,9 @@ def client(tmp_path, monkeypatch):
     config.get_settings.cache_clear()
     reset_engine()
     invalidate_agent_cache()
+
+    # 与生产一致：先 migrate，再启动应用（应用 lifespan 不再自动升级 schema）
+    migrate_db()
 
     from fastapi.testclient import TestClient
     from deepagents_app.api.app import create_app

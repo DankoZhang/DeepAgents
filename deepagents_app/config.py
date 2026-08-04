@@ -44,8 +44,6 @@ class Settings(BaseSettings):
     workspace_dir: Path = Field(default=PROJECT_ROOT / "workspace")
     # Memory 文件（AGENTS.md）——启动时注入主 Agent
     memory_file: Path = Field(default=PROJECT_ROOT / "AGENTS.md")
-    # Skills 根目录——渐进披露的领域知识包
-    skills_dir: Path = Field(default=PROJECT_ROOT / "deepagents_app" / "skills")
     # Redis checkpointer 连接串（多轮对话持久化）
     # 需要 Redis 8+ 或 Redis Stack（含 RedisJSON + RediSearch）
     redis_url: str = "redis://localhost:6379"
@@ -64,15 +62,12 @@ class Settings(BaseSettings):
     # ── 功能开关 ──────────────────────────────────────────────────────
     # 是否在危险工具（shell / 写文件）前暂停等待人工批准
     enable_hitl: bool = False
-    # 是否挂载自定义审计 / 日志 middleware
-    enable_custom_middleware: bool = True
     # 日志级别
     log_level: str = "INFO"
 
     @field_validator(
         "workspace_dir",
         "memory_file",
-        "skills_dir",
         mode="before",
     )
     @classmethod

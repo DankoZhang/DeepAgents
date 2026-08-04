@@ -3,22 +3,30 @@
 ================
 
 同步 SQLAlchemy 2.0（MVP 足够；后续可换 async）。
+Schema 变更由 Alembic 管理：部署/本地用 ``migrate_db``（或
+``python -m deepagents_app.db.migrate``），**不在** API 启动时自动执行。
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from deepagents_app.config import get_settings
-from deepagents_app.db.base import Base
+from deepagents_app.config import PROJECT_ROOT, get_settings
+
+logger = logging.getLogger(__name__)
 
 # 进程内引擎单例缓存；None 表示尚未 create_engine
 _engine = None
 # 与引擎绑定的 sessionmaker 缓存；由 get_engine 一并初始化
 _SessionLocal: sessionmaker[Session] | None = None
+
+_ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 
 
 def reset_engine() -> None:
@@ -34,7 +42,7 @@ def reset_engine() -> None:
 
 
 def get_engine():
-    """懒初始化引擎（进程内单例）；lifespan / init_db / get_db 最终都会走到这里。"""
+    """懒初始化引擎（进程内单例）；lifespan / migrate_db / get_db 最终都会走到这里。"""
     # 需要写入模块级单例
     global _engine, _SessionLocal
     # 已初始化则直接复用，避免重复建连接池
@@ -98,18 +106,31 @@ def get_session_factory() -> sessionmaker[Session]:
     return _SessionLocal
 
 
-def init_db() -> None:
-    """创建全部表（MVP 用 create_all；后续可换 Alembic，用于支持表结构等数据的变更）。
+def _alembic_config(database_url: str | None = None) -> Config:
+    """构造指向项目根 alembic.ini 的 Config，并写入当前 DATABASE_URL。"""
+    if not _ALEMBIC_INI.is_file():
+        raise FileNotFoundError(f"找不到 Alembic 配置：{_ALEMBIC_INI}")
+    cfg = Config(str(_ALEMBIC_INI))
+    # 脚本目录相对 ini 已配置；再显式写入 URL，避免 ini 里占位符
+    url = database_url or get_settings().database_url
+    cfg.set_main_option("sqlalchemy.url", url)
+    return cfg
 
-    由 app.lifespan 在启动最早阶段调用。
+
+def migrate_db(database_url: str | None = None) -> None:
+    """执行 ``alembic upgrade head``（部署步骤 / CLI；API 启动不会调用）。
+
+    - 空库：新建全部表
+    - 已是最新：不变
+    - 有未应用迁移：更新表
     """
-    # 导入 models 模块，让各 ORM 类把表定义注册进 Base.metadata（仅副作用）
+    # 导入 models，保证 metadata 完整（env.py 也会再 import 一次）
     import deepagents_app.db.models  # noqa: F401
 
-    # 取得（或创建）进程内引擎单例
-    engine = get_engine()
-    # 按 metadata 中已注册的表定义建表；已存在的表会跳过（不会迁移改列）
-    Base.metadata.create_all(bind=engine)
+    get_engine()
+    cfg = _alembic_config(database_url)
+    logger.info("执行 alembic upgrade head")
+    command.upgrade(cfg, "head")
 
 
 def get_db() -> Generator[Session, None, None]:

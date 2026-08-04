@@ -15,12 +15,10 @@ from sqlalchemy.orm import Session
 from deepagents_app.config import Settings
 from deepagents_app.db.models import (
     AgentSkill,
-    Methodology,
-    MethodologyAgent,
     SkillDefinition,
 )
 from deepagents_app.services.agent_factory import invalidate_agent_cache
-from deepagents_app.services.revisions import snapshot_methodology
+from deepagents_app.services.revisions import bump_methodologies_using_agent
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +145,7 @@ def delete_skill(db: Session, skill_id: str, *, bump_related: bool = True) -> No
     db.flush()
     if bump_related:
         for agent_id in agent_ids:
-            _bump_methodologies_using_agent(db, agent_id)
+            bump_methodologies_using_agent(db, agent_id)
     else:
         invalidate_agent_cache()
 
@@ -179,15 +177,19 @@ def materialize_agent_skills(
     settings: Settings,
     agent_id: str,
     skills: list[SkillDefinition],
+    *,
+    scope: str,
 ) -> str | None:
     """
-    把 Agent 已绑 Skills 物化到 ``workspace/skills/<agent_id>/<name>/SKILL.md``。
+    把 Agent 已绑 Skills 物化到 ``workspace/skills/<scope>/<agent_id>/<name>/SKILL.md``。
+
+    ``scope`` 一般为 ``{methodology_id}/v{version}``，避免并发组装互删。
 
     Returns:
-        供 ``skills=`` 使用的源目录虚拟路径（如 ``/skills/<agent_id>/``）；无可用 skill 返回 None。
+        供 ``skills=`` 使用的源目录虚拟路径；无可用 skill 返回 None。
     """
     active = [s for s in skills if (s.status or "active") == "active"]
-    root = settings.workspace_dir / "skills" / agent_id
+    root = settings.workspace_dir / "skills" / scope / agent_id
     if root.exists():
         shutil.rmtree(root)
     if not active:
@@ -198,12 +200,12 @@ def materialize_agent_skills(
         skill_dir = root / skill.name
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(skill.content or "", encoding="utf-8")
-    return f"/skills/{agent_id}/"
+    return f"/skills/{scope}/{agent_id}/"
 
 
-def clear_materialized_skills(settings: Settings) -> None:
-    """清空 workspace/skills 下由 DB 物化的内容（组装前调用，避免残留）。"""
-    dst = settings.workspace_dir / "skills"
+def clear_materialized_skills(settings: Settings, *, scope: str) -> None:
+    """清空指定 scope 下的物化 Skills（组装前调用，避免该方法论版本残留）。"""
+    dst = settings.workspace_dir / "skills" / scope
     if dst.exists():
         shutil.rmtree(dst)
     dst.mkdir(parents=True, exist_ok=True)
@@ -309,19 +311,4 @@ def _bump_methodologies_using_skill(db: Session, skill_id: str) -> None:
         if link.agent_id in seen:
             continue
         seen.add(link.agent_id)
-        _bump_methodologies_using_agent(db, link.agent_id)
-
-
-def _bump_methodologies_using_agent(db: Session, agent_id: str) -> None:
-    links = (
-        db.query(MethodologyAgent).filter(MethodologyAgent.agent_id == agent_id).all()
-    )
-    for link in links:
-        methodology = db.get(Methodology, link.methodology_id)
-        if methodology is None:
-            continue
-        methodology.version += 1
-        methodology.updated_time = datetime.now(timezone.utc)
-        invalidate_agent_cache(methodology.id)
-        db.flush()
-        snapshot_methodology(db, methodology.id)
+        bump_methodologies_using_agent(db, link.agent_id)

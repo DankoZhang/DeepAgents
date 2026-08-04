@@ -11,7 +11,7 @@ from deepagents_app.db.models import (
     MiddlewareDefinition,
     ToolDefinition,
 )
-from deepagents_app.db.session import get_db, init_db
+from deepagents_app.db.session import get_db, migrate_db
 
 __all__ = [
     "Base",
@@ -24,5 +24,5 @@ __all__ = [
     "AgentMiddleware",
     "Conversation",
     "get_db",
-    "init_db",
+    "migrate_db",
 ]

@@ -3,7 +3,7 @@ FastAPI 应用工厂
 ================
 
 职责：
-- 应用启动时初始化日志、建表、写入幂等种子数据
+- 应用启动时初始化日志、写入幂等种子数据（schema 须已由 migrate 准备好）
 - 挂载 CORS 与各业务路由（方法论 / Agent / Tool / 会话 / 聊天）
 """
 
@@ -27,7 +27,7 @@ from deepagents_app.api.routes import (
 )
 from deepagents_app.config import get_settings
 from deepagents_app.db.seed import seed_defaults
-from deepagents_app.db.session import get_session_factory, init_db
+from deepagents_app.db.session import get_session_factory
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +39,8 @@ async def lifespan(_app: FastAPI):
 
     启动阶段（yield 之前）：
     1. 按配置初始化根日志
-    2. ``create_all`` 建表（MVP；生产可换 Alembic）
-    3. 幂等写入内置 Tool / Middleware / demo 方法论
+    2. 幂等写入内置 Tool / Middleware / demo 方法论
+       （表结构请先执行 ``python -m deepagents_app.db.migrate``）
     关闭阶段（yield 之后）：当前无额外清理逻辑
     """
     # 读取进程配置（.env / 环境变量），含 database_url、log_level 等
@@ -54,10 +54,6 @@ async def lifespan(_app: FastAPI):
         # 时间只显示到秒，省略毫秒与日期
         datefmt="%H:%M:%S",
     )
-
-    # 建表：内部会 import models → get_engine() → Base.metadata.create_all
-    # 详见 deepagents_app.db.session.init_db
-    init_db()
 
     # 取 sessionmaker（副作用：若引擎尚未创建则先 get_engine 懒初始化）
     # 详见 deepagents_app.db.session.get_session_factory / get_engine
@@ -73,7 +69,10 @@ async def lifespan(_app: FastAPI):
         # 任一步失败：回滚未提交变更，避免半写入状态
         db.rollback()
         # 打出完整堆栈，便于排查启动失败原因
-        logger.exception("种子数据写入失败")
+        logger.exception(
+            "种子数据写入失败（若提示表/列不存在，请先执行: "
+            "python -m deepagents_app.db.migrate）"
+        )
         # 重新抛出：阻止 FastAPI 进入「已就绪」状态
         raise
     finally:

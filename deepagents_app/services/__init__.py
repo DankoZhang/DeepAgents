@@ -3,22 +3,32 @@
 ================
 
 对外再导出常用符号；路由一般直接 ``from deepagents_app.services import xxx as svc``。
+延迟导入，避免 ``import deepagents_app.services`` 立刻拉齐 SQLAlchemy / deepagents。
 """
 
-# 方法论驱动组装 Compiled Agent
-from deepagents_app.services.agent_factory import (
-    build_agent_from_methodology,
-    invalidate_agent_cache,
-)
-# 一轮对话（别名避免与路由函数名冲突）
-from deepagents_app.services.chat import chat as run_chat
-# 创建会话登记
-from deepagents_app.services.conversation import create_conversation
+from __future__ import annotations
 
-# 明确公开 API，避免 from services import * 拉进过多符号
+from typing import Any
+
 __all__ = [
     "build_agent_from_methodology",
     "invalidate_agent_cache",
     "create_conversation",
     "run_chat",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"build_agent_from_methodology", "invalidate_agent_cache"}:
+        from deepagents_app.services import agent_factory as _af
+
+        return getattr(_af, name)
+    if name == "create_conversation":
+        from deepagents_app.services.conversation import create_conversation
+
+        return create_conversation
+    if name == "run_chat":
+        from deepagents_app.services.chat import chat as run_chat
+
+        return run_chat
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

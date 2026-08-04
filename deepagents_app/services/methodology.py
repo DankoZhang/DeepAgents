@@ -9,14 +9,14 @@ import uuid
 from datetime import datetime, timezone
 
 # Session + 预加载关系
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 # Methodology / 勾选关系 / Agent（详情预加载）
+from deepagents_app.db.loading import methodology_with_agents_options
 from deepagents_app.db.models import AgentDefinition, Methodology, MethodologyAgent
 # 配置变更后清 Compiled Agent 缓存
 from deepagents_app.services.agent_factory import invalidate_agent_cache
-# 版本列表与写快照
-from deepagents_app.services.revisions import list_revisions, snapshot_methodology
+from deepagents_app.services.revisions import bump_methodology, list_revisions, snapshot_methodology
 
 
 def list_methodologies(
@@ -35,12 +35,7 @@ def get_methodology(db: Session, methodology_id: str) -> Methodology | None:
     # 详情需带出已勾选 Agent 及其 tools / middlewares / skills
     return (
         db.query(Methodology)
-        .options(
-            joinedload(Methodology.agents).joinedload(AgentDefinition.tools),
-            joinedload(Methodology.agents).joinedload(AgentDefinition.middlewares),
-            joinedload(Methodology.agents).joinedload(AgentDefinition.skills),
-            joinedload(Methodology.agents).joinedload(AgentDefinition.llm_model),
-        )
+        .options(*methodology_with_agents_options())
         .filter(Methodology.id == methodology_id)
         .one_or_none()
     )
@@ -90,12 +85,10 @@ def update_methodology(
     if description is not None:
         row.description = description
     if bump_version:
-        row.version += 1  # 旧会话仍用旧 version
-        invalidate_agent_cache(methodology_id)
-    row.updated_time = datetime.now(timezone.utc)
-    db.flush()
-    if bump_version:
-        snapshot_methodology(db, methodology_id)  # 按新 version 存快照
+        bump_methodology(db, row)
+    else:
+        row.updated_time = datetime.now(timezone.utc)
+        db.flush()
     return row
 
 
@@ -143,12 +136,9 @@ def bind_methodology_agents(
             db.add(MethodologyAgent(methodology_id=methodology_id, agent_id=aid))
 
     if bump_version:
-        methodology.version += 1
-        methodology.updated_time = datetime.now(timezone.utc)
-        invalidate_agent_cache(methodology_id)
-    db.flush()
-    if bump_version:
-        snapshot_methodology(db, methodology_id)
+        bump_methodology(db, methodology)
+    else:
+        db.flush()
     return get_methodology(db, methodology_id)  # type: ignore[return-value]
 
 

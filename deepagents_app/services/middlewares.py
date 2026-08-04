@@ -2,7 +2,7 @@
 Middleware 注册管理
 ==================
 
-对外 API 只读；create/update/delete 供种子与内部使用。
+对外 API 只读；``create_middleware`` 供种子与内部使用。
 """
 
 # 推迟注解求值
@@ -15,8 +15,6 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from deepagents_app.db.models import MiddlewareDefinition
-# 变更后清 Agent 缓存（内部写接口仍可能调用）
-from deepagents_app.services.agent_factory import invalidate_agent_cache
 
 
 def list_middlewares(db: Session) -> list[MiddlewareDefinition]:
@@ -53,36 +51,3 @@ def create_middleware(
     db.add(row)
     db.flush()
     return row
-
-
-def update_middleware(
-    db: Session,
-    middleware_id: str,
-    *,
-    name: str | None = None,
-    class_path: str | None = None,
-    config: dict[str, Any] | None = None,
-) -> MiddlewareDefinition:
-    # 内部用；对外写 API 已下线
-    row = db.get(MiddlewareDefinition, middleware_id)
-    if row is None:
-        raise LookupError(f"中间件不存在：{middleware_id}")
-    if name is not None:
-        row.name = name
-    if class_path is not None:
-        row.class_path = class_path
-    if config is not None:
-        row.config = config
-    invalidate_agent_cache()  # 已编译图可能挂着旧实例
-    db.flush()
-    return row
-
-
-def delete_middleware(db: Session, middleware_id: str) -> None:
-    # 内部用；对外不可删内置中间件的产品策略由路由层体现
-    row = db.get(MiddlewareDefinition, middleware_id)
-    if row is None:
-        raise LookupError(f"中间件不存在：{middleware_id}")
-    invalidate_agent_cache()
-    db.delete(row)
-    db.flush()

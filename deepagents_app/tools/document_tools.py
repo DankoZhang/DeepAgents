@@ -19,6 +19,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from deepagents_app.config import get_settings
+from deepagents_app.utils.paths import resolve_under_root
 
 
 def _docs_root() -> Path:
@@ -32,15 +33,7 @@ def _safe_doc_path(filename: str) -> Path:
 
     例如 ``../../etc/passwd`` 会被拒绝。
     """
-    root = _docs_root().resolve()
-    # 只取文件名部分，禁止子目录穿越
-    name = Path(filename).name
-    if not name:
-        raise ValueError("文件名不能为空")
-    target = (root / name).resolve()
-    if not str(target).startswith(str(root)):
-        raise ValueError(f"非法路径：{filename}")
-    return target
+    return resolve_under_root(_docs_root(), filename, basename_only=True)
 
 
 class CreateDocumentArgs(BaseModel):
@@ -113,12 +106,3 @@ def read_document(filename: str) -> str:
     if not path.exists():
         return f"文档不存在：{path}"
     return path.read_text(encoding="utf-8")
-
-
-# 子 Agent 注册用的工具列表
-DOCUMENT_TOOLS = [
-    create_document,
-    append_document_section,
-    list_documents,
-    read_document,
-]

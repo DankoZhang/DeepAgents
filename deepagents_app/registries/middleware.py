@@ -30,7 +30,7 @@ def load_middleware_object(mw_def: MiddlewareDefinition) -> Any:
 
 
 def load_middlewares_by_ids(db: Session, middleware_ids: list[str]) -> list[Any]:
-    """按 id 列表加载中间件。"""
+    """按 id 列表加载中间件（保持传入顺序；缺失则跳过并告警）。"""
     if not middleware_ids:
         return []
     rows = (
@@ -47,13 +47,3 @@ def load_middlewares_by_ids(db: Session, middleware_ids: list[str]) -> list[Any]
             continue
         result.append(load_middleware_object(row))
     return result
-
-
-def load_middlewares_for_agent(db: Session, agent_id: str) -> list[Any]:
-    """加载 Agent 绑定的全部中间件。"""
-    from deepagents_app.db.models import AgentDefinition
-
-    agent = db.get(AgentDefinition, agent_id)
-    if agent is None:
-        return []
-    return [load_middleware_object(m) for m in agent.middlewares]

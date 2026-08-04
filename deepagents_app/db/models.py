@@ -135,10 +135,6 @@ class AgentDefinition(Base):
         nullable=True,
         index=True,
     )
-    # 兼容旧字段 / 无目录时的兜底模型名与温度
-    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # 采样温度，可为空（走默认温度）
-    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     # 额外配置 JSON（扩展字段），默认空字典
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
 

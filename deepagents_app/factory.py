@@ -11,6 +11,8 @@ checkpointer / HITL / permissions / HarnessProfile / workspace 同步。
 from __future__ import annotations  # 允许类型注解使用未定义的前向引用（如字符串形式）
 
 import logging  # 标准库日志，用于输出 checkpointer / profile 注册结果
+import threading
+from typing import Any
 
 # 从 deepagents 引入：文件系统权限、通用子 Agent 配置、Harness 配置与注册函数
 from deepagents import (
@@ -25,6 +27,11 @@ from deepagents_app.config import Settings  # 应用配置（HITL、Redis、模�
 
 logger = logging.getLogger(__name__)  # 本模块专用 logger，名称随包路径变化
 
+# 进程内单例：避免每次 create_deep_agent 都新建 RedisSaver / setup 索引
+_checkpointer: Any | None = None
+_checkpointer_key: tuple[str, bool] | None = None
+_checkpointer_lock = threading.Lock()
+
 # 对外公开的符号列表（from deepagents_app.factory import * 时只导出这些）
 __all__ = [
     "build_permissions",  # 构建 FilesystemBackend 路径权限规则
@@ -32,7 +39,6 @@ __all__ = [
     "build_checkpointer",  # 构建 LangGraph 会话状态持久化组件
     "configure_general_purpose_profile",  # 注册 general-purpose 子 Agent 的 HarnessProfile
     "sync_memory_into_workspace",  # 把 AGENTS.md 同步进 workspace
-    "sync_memory_and_skills_into_workspace",  # 兼容旧名：仅同步 memory（Skills 改由 DB 物化）
 ]
 
 
@@ -73,7 +79,10 @@ def build_interrupt_on(settings: Settings) -> dict[str, bool] | None:
 
 def build_checkpointer(settings: Settings):
     """
-    构建 checkpointer，用于多轮对话的 thread 级状态持久化。
+    构建（或复用）checkpointer，用于多轮对话的 thread 级状态持久化。
+
+    同一进程内对相同 ``redis_url`` / ``require_redis_checkpointer`` 复用单例，
+    避免每次组装 Agent 都新建连接并重复 ``setup()``。
 
     优先 ``langgraph-checkpoint-redis``（跨进程 / 跨服务）。
     ``require_redis_checkpointer=True`` 时 Redis 不可用则抛错；
@@ -81,24 +90,34 @@ def build_checkpointer(settings: Settings):
 
     注意：RedisSaver 需要 Redis 8+（自带 RedisJSON/RediSearch）或 Redis Stack。
     """
-    try:  # 优先尝试 Redis 持久化（多 worker / 重启后仍可恢复 thread 状态）
-        from langgraph.checkpoint.redis import RedisSaver  # 延迟导入，避免未安装时拖垮整个模块
+    global _checkpointer, _checkpointer_key
 
-        saver = RedisSaver(redis_url=settings.redis_url)  # 用配置中的 Redis URL 创建 saver
-        saver.setup()  # 初始化 Redis 侧索引/结构（首次或结构变更时需要）
-        logger.info("Checkpointer: RedisSaver -> %s", settings.redis_url)  # 记录成功使用 Redis
-        return saver  # 返回可用的 Redis checkpointer
-    except Exception as exc:  # noqa: BLE001  # 捕获连接失败、缺依赖、缺少 RedisJSON 等一切失败
-        if settings.require_redis_checkpointer:  # 生产强制 Redis：不可回退内存
-            raise RuntimeError(  # 转为明确错误，阻止应用在无持久化状态下继续
-                f"Redis checkpointer 不可用（REQUIRE_REDIS_CHECKPOINTER=true）：{exc}"
-            ) from exc  # 保留原始异常链，便于排查根因
-        logger.warning(  # 开发/演示模式：告警后降级，不中断启动
-            "使用 InMemorySaver（Redis 不可用：%s）。"
-            "多 worker / 重启后对话状态会丢失；生产请设 REQUIRE_REDIS_CHECKPOINTER=true",
-            exc,  # 把失败原因写进日志
-        )
-        return InMemorySaver()  # 进程内内存 checkpointer：同进程多轮有效，重启即丢
+    key = (settings.redis_url, bool(settings.require_redis_checkpointer))
+    with _checkpointer_lock:
+        if _checkpointer is not None and _checkpointer_key == key:
+            return _checkpointer
+
+        try:  # 优先尝试 Redis 持久化（多 worker / 重启后仍可恢复 thread 状态）
+            from langgraph.checkpoint.redis import RedisSaver  # 延迟导入，避免未安装时拖垮整个模块
+
+            saver = RedisSaver(redis_url=settings.redis_url)  # 用配置中的 Redis URL 创建 saver
+            saver.setup()  # 初始化 Redis 侧索引/结构（首次或结构变更时需要）
+            logger.info("Checkpointer: RedisSaver -> %s", settings.redis_url)  # 记录成功使用 Redis
+        except Exception as exc:  # noqa: BLE001  # 捕获连接失败、缺依赖、缺少 RedisJSON 等一切失败
+            if settings.require_redis_checkpointer:  # 生产强制 Redis：不可回退内存
+                raise RuntimeError(  # 转为明确错误，阻止应用在无持久化状态下继续
+                    f"Redis checkpointer 不可用（REQUIRE_REDIS_CHECKPOINTER=true）：{exc}"
+                ) from exc  # 保留原始异常链，便于排查根因
+            logger.warning(  # 开发/演示模式：告警后降级，不中断启动
+                "使用 InMemorySaver（Redis 不可用：%s）。"
+                "多 worker / 重启后对话状态会丢失；生产请设 REQUIRE_REDIS_CHECKPOINTER=true",
+                exc,  # 把失败原因写进日志
+            )
+            saver = InMemorySaver()  # 进程内内存 checkpointer：同进程多轮有效，重启即丢
+
+        _checkpointer = saver
+        _checkpointer_key = key
+        return saver
 
 
 def configure_general_purpose_profile(settings: Settings) -> None:
@@ -143,7 +162,8 @@ def sync_memory_into_workspace(settings: Settings) -> None:
     把项目级 AGENTS.md 同步到 workspace，供 FilesystemBackend 读取。
 
     Skills 已改为数据库存储，由 ``services.skills.materialize_agent_skills``
-    按 Agent 绑定物化到 ``workspace/skills/<agent_id>/``，不再整树拷贝项目 skills/。
+    按方法论版本隔离物化到 ``workspace/skills/<methodology_id>/v<version>/<agent_id>/``，
+    不再整树拷贝项目 skills/。
     """
     import shutil  # 延迟导入：仅本函数需要文件复制
 
@@ -152,7 +172,3 @@ def sync_memory_into_workspace(settings: Settings) -> None:
     if src_memory.exists():  # 源文件存在才复制，避免无文件时报错
         shutil.copy2(src_memory, dst_memory)  # copy2 保留元数据；覆盖 workspace 旧版 AGENTS.md
 
-
-def sync_memory_and_skills_into_workspace(settings: Settings) -> None:
-    """兼容旧调用名：等同 ``sync_memory_into_workspace``。"""
-    sync_memory_into_workspace(settings)

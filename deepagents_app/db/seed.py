@@ -17,24 +17,23 @@ import logging
 from sqlalchemy.orm import Session
 
 from deepagents_app.config import PROJECT_ROOT, get_settings
+from deepagents_app.constants import DEFAULT_MODEL_ID
 from deepagents_app.db.models import AgentDefinition, Methodology, MiddlewareDefinition, ToolDefinition
-from deepagents_app.services.agents import bind_agent_skills, create_agent
+from deepagents_app.services.agents import create_agent
 from deepagents_app.services.llm_models import ensure_default_model_from_settings
 from deepagents_app.services.methodology import (
     create_methodology,
     publish_methodology,
 )
 from deepagents_app.services.middlewares import create_middleware
-from deepagents_app.services.revisions import snapshot_methodology
 from deepagents_app.services.skills import import_skill_from_file
 from deepagents_app.services.tools import create_builtin_tool
 from deepagents_app.supervisor.prompts import SUPERVISOR_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
-PROMPTS_DIR = PROJECT_ROOT / "deepagents_app" / "config" / "prompts"
+PROMPTS_DIR = PROJECT_ROOT / "deepagents_app" / "prompts"
 SKILLS_DIR = PROJECT_ROOT / "deepagents_app" / "skills"
-DEFAULT_MODEL_ID = "model_default"
 
 DEFAULT_TOOLS: list[dict] = [
     {
@@ -187,7 +186,7 @@ def seed_skills(db: Session) -> None:
 
 
 def seed_demo_agents(db: Session) -> None:
-    """幂等写入全局 demo Agents（已存在则跳过创建；可回填默认 model_id / skills）。"""
+    """幂等写入全局 demo Agents（已存在则跳过）。"""
     doc_tools = [
         "tool_create_document",
         "tool_append_document_section",
@@ -262,27 +261,7 @@ def seed_demo_agents(db: Session) -> None:
     ]
 
     for spec in specs:
-        existing = db.get(AgentDefinition, spec["agent_id"])
-        if existing is not None:
-            # 旧库升级：补绑默认模型，不 bump（避免启动时无谓升版）
-            if existing.model_id is None:
-                existing.model_id = DEFAULT_MODEL_ID
-                logger.info("回填 Agent 默认模型：%s", existing.name)
-            # 清掉遗留 config.skills 路径，改走 agent_skill
-            cfg = dict(existing.config or {})
-            if "skills" in cfg:
-                cfg.pop("skills", None)
-                existing.config = cfg
-                logger.info("清除 Agent 遗留 config.skills：%s", existing.name)
-            if spec["skill_ids"] and not existing.skills:
-                bind_agent_skills(
-                    db,
-                    existing.id,
-                    spec["skill_ids"],
-                    replace=True,
-                    bump_related=False,
-                )
-                logger.info("回填 Agent Skills：%s -> %s", existing.name, spec["skill_ids"])
+        if db.get(AgentDefinition, spec["agent_id"]) is not None:
             continue
         create_agent(
             db,
@@ -311,8 +290,8 @@ def seed_demo_methodology(db: Session) -> None:
         methodology_id=DEMO_METHODOLOGY_ID,
         agent_ids=DEMO_AGENT_IDS,
     )
+    # create 已写 v1 快照；publish 会再写发布点快照
     publish_methodology(db, DEMO_METHODOLOGY_ID)
-    snapshot_methodology(db, DEMO_METHODOLOGY_ID)
     logger.info("已种子化演示方法论：%s", DEMO_METHODOLOGY_ID)
 
 
