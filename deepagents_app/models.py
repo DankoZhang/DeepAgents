@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any, Mapping
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -26,48 +27,134 @@ def build_chat_model(
     *,
     model_name: str | None = None,
     temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+    provider: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    timeout: float | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> BaseChatModel:
-    """按 ``settings.model_provider`` 实例化聊天模型。"""
-    provider = settings.model_provider
+    """
+    按 provider 实例化聊天模型。
+
+    参数优先使用显式传入值，缺省回退 ``settings`` / 约定默认值。
+    ``extra`` 会合并进构造参数（勿覆盖已显式设置的键）。
+    """
+    resolved_provider = provider or settings.model_provider
     name = model_name or settings.model_name
     temp = 0.2 if temperature is None else temperature
 
-    if provider == "openai":
+    kwargs: dict[str, Any] = {"model": name, "temperature": temp}
+    if top_p is not None:
+        kwargs["top_p"] = top_p
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    if extra:
+        for key, value in extra.items():
+            kwargs.setdefault(key, value)
+
+    if resolved_provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        kwargs: dict = {"model": name, "temperature": temp}
-        if settings.openai_api_key:
-            kwargs["api_key"] = settings.openai_api_key
-        if settings.openai_base_url:
-            kwargs["base_url"] = settings.openai_base_url
-        logger.info("使用 OpenAI 模型：%s (temp=%s)", name, temp)
+        key = api_key if api_key is not None else settings.openai_api_key
+        url = base_url if base_url is not None else settings.openai_base_url
+        if key:
+            kwargs["api_key"] = key
+        if url:
+            kwargs["base_url"] = url
+        logger.info(
+            "使用 OpenAI 模型：%s (temp=%s top_p=%s max_tokens=%s)",
+            name,
+            temp,
+            top_p,
+            max_tokens,
+        )
         return ChatOpenAI(**kwargs)
 
-    if provider == "openai_compatible":
+    if resolved_provider == "openai_compatible":
         from langchain_openai import ChatOpenAI
 
-        if not settings.openai_base_url:
-            raise ValueError("openai_compatible 模式必须设置 OPENAI_BASE_URL")
+        url = base_url if base_url is not None else settings.openai_base_url
+        if not url:
+            raise ValueError("openai_compatible 模式必须设置 base_url / OPENAI_BASE_URL")
+        key = api_key if api_key is not None else settings.openai_api_key
         logger.info(
-            "使用兼容 OpenAI API 的模型：%s @ %s (temp=%s)",
+            "使用兼容 OpenAI API 的模型：%s @ %s (temp=%s top_p=%s max_tokens=%s)",
             name,
-            settings.openai_base_url,
+            url,
             temp,
+            top_p,
+            max_tokens,
         )
         return ChatOpenAI(
-            model=name,
-            api_key=settings.openai_api_key or "EMPTY",
-            base_url=settings.openai_base_url,
-            temperature=temp,
+            api_key=key or "EMPTY",
+            base_url=url,
+            **kwargs,
         )
 
-    if provider == "anthropic":
+    if resolved_provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        kwargs = {"model": name, "temperature": temp}
-        if settings.anthropic_api_key:
-            kwargs["api_key"] = settings.anthropic_api_key
-        logger.info("使用 Anthropic 模型：%s (temp=%s)", name, temp)
+        key = api_key if api_key is not None else settings.anthropic_api_key
+        if key:
+            kwargs["api_key"] = key
+        # Anthropic 使用 model 关键字；ChatAnthropic 也接受 model
+        logger.info(
+            "使用 Anthropic 模型：%s (temp=%s top_p=%s max_tokens=%s)",
+            name,
+            temp,
+            top_p,
+            max_tokens,
+        )
         return ChatAnthropic(**kwargs)
 
-    raise ValueError(f"不支持的 model_provider：{provider}")
+    raise ValueError(f"不支持的 model_provider：{resolved_provider}")
+
+
+def model_spec_from_row(row: Any) -> dict[str, Any]:
+    """ORM ModelDefinition → build_chat_model 可用的参数字典（含密钥，仅服务端用）。"""
+    return {
+        "provider": row.provider,
+        "model_name": row.model_name,
+        "api_key": row.api_key,
+        "base_url": row.base_url,
+        "temperature": row.temperature,
+        "top_p": row.top_p,
+        "max_tokens": row.max_tokens,
+        "timeout": row.timeout,
+        "extra": dict(row.config or {}),
+        # 元数据（不传给 build_chat_model）
+        "context_length": row.context_length,
+        "model_id": row.id,
+        "display_name": row.name,
+    }
+
+
+def build_chat_model_from_spec(
+    settings: Settings,
+    spec: Mapping[str, Any] | None,
+    *,
+    fallback_model_name: str | None = None,
+    fallback_temperature: float | None = None,
+) -> BaseChatModel:
+    """从快照 / 目录序列化的 spec 构建模型；spec 为空则用 Settings + 可选兜底字段。"""
+    spec = dict(spec or {})
+    return build_chat_model(
+        settings,
+        provider=spec.get("provider"),
+        model_name=spec.get("model_name") or fallback_model_name,
+        api_key=spec.get("api_key"),
+        base_url=spec.get("base_url"),
+        temperature=(
+            spec["temperature"]
+            if "temperature" in spec and spec["temperature"] is not None
+            else fallback_temperature
+        ),
+        top_p=spec.get("top_p"),
+        max_tokens=spec.get("max_tokens"),
+        timeout=spec.get("timeout"),
+        extra=spec.get("extra") if isinstance(spec.get("extra"), Mapping) else None,
+    )

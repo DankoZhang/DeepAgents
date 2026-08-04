@@ -31,7 +31,8 @@ __all__ = [
     "build_interrupt_on",  # 构建危险工具人工审批（HITL）映射
     "build_checkpointer",  # 构建 LangGraph 会话状态持久化组件
     "configure_general_purpose_profile",  # 注册 general-purpose 子 Agent 的 HarnessProfile
-    "sync_memory_and_skills_into_workspace",  # 把 AGENTS.md / skills 同步进 workspace
+    "sync_memory_into_workspace",  # 把 AGENTS.md 同步进 workspace
+    "sync_memory_and_skills_into_workspace",  # 兼容旧名：仅同步 memory（Skills 改由 DB 物化）
 ]
 
 
@@ -137,23 +138,21 @@ def configure_general_purpose_profile(settings: Settings) -> None:
         logger.warning("HarnessProfile 注册失败（可忽略）：%s", exc)  # 打警告后继续用默认行为
 
 
-def sync_memory_and_skills_into_workspace(settings: Settings) -> None:
+def sync_memory_into_workspace(settings: Settings) -> None:
     """
-    把项目级 AGENTS.md 与 skills/ 同步到 workspace，供 FilesystemBackend 读取。
+    把项目级 AGENTS.md 同步到 workspace，供 FilesystemBackend 读取。
 
-    原因：FilesystemBackend 的虚拟根是 workspace；memory/skills 路径若写
-    ``/AGENTS.md``，实际会读 ``workspace/AGENTS.md``。
+    Skills 已改为数据库存储，由 ``services.skills.materialize_agent_skills``
+    按 Agent 绑定物化到 ``workspace/skills/<agent_id>/``，不再整树拷贝项目 skills/。
     """
-    import shutil  # 延迟导入：仅本函数需要文件复制/目录树操作
+    import shutil  # 延迟导入：仅本函数需要文件复制
 
     src_memory = settings.memory_file  # 项目侧记忆文件源路径（通常为 AGENTS.md）
     dst_memory = settings.workspace_dir / "AGENTS.md"  # workspace 内目标路径（虚拟根可见）
     if src_memory.exists():  # 源文件存在才复制，避免无文件时报错
         shutil.copy2(src_memory, dst_memory)  # copy2 保留元数据；覆盖 workspace 旧版 AGENTS.md
 
-    src_skills = settings.skills_dir  # 项目侧 skills 目录源路径
-    dst_skills = settings.workspace_dir / "skills"  # workspace 内 skills 目标目录
-    if src_skills.exists():  # 源目录存在才同步
-        if dst_skills.exists():  # 目标已存在则先清空，保证与源目录一致（避免残留旧 skill）
-            shutil.rmtree(dst_skills)  # 递归删除旧 skills 树
-        shutil.copytree(src_skills, dst_skills)  # 整树复制到 workspace/skills
+
+def sync_memory_and_skills_into_workspace(settings: Settings) -> None:
+    """兼容旧调用名：等同 ``sync_memory_into_workspace``。"""
+    sync_memory_into_workspace(settings)

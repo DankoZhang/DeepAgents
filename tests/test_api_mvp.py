@@ -67,6 +67,68 @@ def test_seeded_demo_methodology(client):
         "computer-operator",
         "qa-expert",
     }
+    # 方案 B：种子 Agent 绑定默认模型目录
+    assert all(a.get("model_id") == "model_default" for a in body["agents"])
+    assert all(a.get("llm_model") and a["llm_model"]["id"] == "model_default" for a in body["agents"])
+
+
+def test_model_catalog_crud(client):
+    listed = client.get("/api/model/list")
+    assert listed.status_code == 200
+    assert any(m["id"] == "model_default" for m in listed.json())
+
+    created = client.post(
+        "/api/model",
+        json={
+            "name": "测试 DeepSeek",
+            "provider": "openai_compatible",
+            "model_name": "deepseek-chat",
+            "base_url": "https://api.deepseek.com/v1",
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "max_tokens": 2048,
+            "context_length": 128000,
+            "api_key": "sk-test",
+        },
+    )
+    assert created.status_code == 200
+    body = created.json()
+    assert body["has_api_key"] is True
+    assert "api_key" not in body
+    assert body["top_p"] == 0.9
+    assert body["context_length"] == 128000
+    model_id = body["id"]
+
+    patched = client.patch(
+        f"/api/model/{model_id}",
+        json={"temperature": 0.5, "clear_api_key": True},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["temperature"] == 0.5
+    assert patched.json()["has_api_key"] is False
+
+    agent = client.post(
+        "/api/agent",
+        json={
+            "name": "model-bound-agent",
+            "system_prompt": "hi",
+            "config": {"role": "subagent"},
+            "model_id": model_id,
+        },
+    )
+    assert agent.status_code == 200
+    assert agent.json()["model_id"] == model_id
+    assert agent.json()["llm_model"]["model_name"] == "deepseek-chat"
+
+    # 仍被引用时不可删
+    bad_del = client.delete(f"/api/model/{model_id}")
+    assert bad_del.status_code == 400
+
+    # 连通性测试接口可调用（可能因假 key 失败，但应返回结构化结果）
+    test_r = client.post("/api/model/test", json={"model_id": model_id})
+    assert test_r.status_code == 200
+    assert "ok" in test_r.json()
+    assert "message" in test_r.json()
 
 
 def test_tool_and_middleware_registry(client):

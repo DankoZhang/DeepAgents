@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy.orm import Session, joinedload
 
 from deepagents_app.db.models import AgentDefinition, Methodology, MethodologyRevision
+from deepagents_app.services.llm_models import serialize_model_for_snapshot
 
 
 def serialize_methodology(db: Session, methodology_id: str) -> dict[str, Any]:
@@ -18,9 +19,11 @@ def serialize_methodology(db: Session, methodology_id: str) -> dict[str, Any]:
     methodology = (
         db.query(Methodology)
         .options(
-            # 快照需记下每个 Agent 绑定的 tool/middleware id
+            # 快照需记下每个 Agent 绑定的 tool/middleware/skill id
             joinedload(Methodology.agents).joinedload(AgentDefinition.tools),
             joinedload(Methodology.agents).joinedload(AgentDefinition.middlewares),
+            joinedload(Methodology.agents).joinedload(AgentDefinition.skills),
+            joinedload(Methodology.agents).joinedload(AgentDefinition.llm_model),
         )
         .filter(Methodology.id == methodology_id)
         .one_or_none()
@@ -36,11 +39,15 @@ def serialize_methodology(db: Session, methodology_id: str) -> dict[str, Any]:
                 "id": agent.id,
                 "name": agent.name,
                 "system_prompt": agent.system_prompt,
+                "model_id": agent.model_id,
                 "model": agent.model,
                 "temperature": agent.temperature,
+                # 钉死当时超参数，旧会话不随目录后续修改漂移
+                "llm": serialize_model_for_snapshot(agent.llm_model),
                 "config": dict(agent.config or {}),
                 "tool_ids": [t.id for t in agent.tools],
                 "middleware_ids": [m.id for m in agent.middlewares],
+                "skill_ids": [s.id for s in agent.skills],
             }
         )
     return {

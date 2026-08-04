@@ -44,16 +44,18 @@ from deepagents_app.factory import (
     build_interrupt_on,  # 全局 HITL 中断配置
     build_permissions,  # 文件系统等权限策略
     configure_general_purpose_profile,  # 配置 general-purpose 子 Agent 画像
-    sync_memory_and_skills_into_workspace,  # 把 AGENTS.md / skills 同步进 workspace
+    sync_memory_into_workspace,  # 把 AGENTS.md 同步进 workspace
 )
 # 按 Settings + 可选覆盖构造聊天模型
-from deepagents_app.models import build_chat_model
+from deepagents_app.models import build_chat_model_from_spec
 # 将 MiddlewareDefinition ORM 行实例化为中间件对象
 from deepagents_app.registries.middleware import load_middleware_object
 # 展开 ToolDefinition；快照路径按 tool_ids 批量加载工具
 from deepagents_app.registries.tools import expand_tool_definition, load_tools_by_ids
 # 按方法论 id + version 取历史快照行
 from deepagents_app.services.revisions import get_revision
+# 解析 Agent 绑定的模型目录 / 快照 llm
+from deepagents_app.services.llm_models import resolve_model_spec_for_agent
 
 # 本模块日志器
 logger = logging.getLogger(__name__)
@@ -112,6 +114,10 @@ def get_methodology_config(
             joinedload(Methodology.agents).joinedload(AgentDefinition.tools),
             # 同理预加载每个 Agent 的 middlewares
             joinedload(Methodology.agents).joinedload(AgentDefinition.middlewares),
+            # 预加载已绑 Skills（组装时物化到 workspace）
+            joinedload(Methodology.agents).joinedload(AgentDefinition.skills),
+            # 方案 B：预加载目录模型
+            joinedload(Methodology.agents).joinedload(AgentDefinition.llm_model),
         )
         .filter(Methodology.id == methodology_id)  # WHERE id = :methodology_id
         .one_or_none()  # 0 行 None；1 行对象；>1 抛错
@@ -178,9 +184,69 @@ def _expand_agent_tools(agent: AgentDefinition) -> list[Any]:
     return tools
 
 
-def _build_subagent_spec_from_row(agent: AgentDefinition) -> dict[str, Any]:
+def _chat_model_for_agent(
+    db: Session,
+    settings: Settings,
+    agent: AgentDefinition | dict[str, Any],
+) -> Any:
+    """Supervisor / SubAgent 共用：按目录或快照构建 BaseChatModel。"""
+    if isinstance(agent, dict):
+        spec = resolve_model_spec_for_agent(
+            db,
+            model_id=agent.get("model_id"),
+            legacy_model=agent.get("model"),
+            legacy_temperature=agent.get("temperature"),
+            snapshot_llm=agent.get("llm"),
+        )
+        return build_chat_model_from_spec(
+            settings,
+            spec,
+            fallback_model_name=agent.get("model"),
+            fallback_temperature=agent.get("temperature"),
+        )
+
+    spec = resolve_model_spec_for_agent(
+        db,
+        model_id=agent.model_id,
+        legacy_model=agent.model,
+        legacy_temperature=agent.temperature,
+    )
+    return build_chat_model_from_spec(
+        settings,
+        spec,
+        fallback_model_name=agent.model,
+        fallback_temperature=agent.temperature,
+    )
+
+
+def _legacy_sync_project_skills(settings: Settings) -> None:
+    """旧快照仍用 config.skills 路径时，把项目 skills/ 整树拷到 workspace（兼容）。"""
+    import shutil
+
+    src = settings.skills_dir
+    dst = settings.workspace_dir / "skills"
+    if not src.exists():
+        return
+    # 不删整个 dst：避免清掉已按 agent_id 物化的新结构；只补齐旧包目录
+    for child in src.iterdir():
+        if not child.is_dir():
+            continue
+        target = dst / child.name
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(child, target)
+
+
+def _build_subagent_spec_from_row(
+    db: Session,
+    settings: Settings,
+    agent: AgentDefinition,
+) -> dict[str, Any]:
     """AgentDefinition → deepagents SubAgent 字典。"""
-    cfg = agent.config or {}  # 扩展 JSON：description / skills 等
+    # 延迟导入，避免与 services.skills → invalidate_agent_cache 形成环
+    from deepagents_app.services.skills import materialize_agent_skills
+
+    cfg = agent.config or {}  # 扩展 JSON：description 等
     tools = _expand_agent_tools(agent)  # live：从关系表展开工具
     # live：从关系表加载并实例化中间件
     middleware = [load_middleware_object(m) for m in agent.middlewares]
@@ -191,41 +257,53 @@ def _build_subagent_spec_from_row(agent: AgentDefinition) -> dict[str, Any]:
         "description": str(cfg.get("description") or agent.name),  # 缺省用名称
         "system_prompt": agent.system_prompt,  # 系统提示词
         "tools": tools,  # 已展开工具列表
+        # 与 Supervisor 一致：传入 BaseChatModel 实例
+        "model": _chat_model_for_agent(db, settings, agent),
     }
-    skills = cfg.get("skills")
-    if skills:
-        spec["skills"] = list(skills)  # 可选 skills 路径列表
+    # DB 绑定的 Skills → 物化到 workspace/skills/<agent_id>/ → 传源目录路径
+    skills_path = materialize_agent_skills(settings, agent.id, list(agent.skills or []))
+    if skills_path:
+        spec["skills"] = [skills_path]
+    elif cfg.get("skills"):
+        _legacy_sync_project_skills(settings)
+        spec["skills"] = list(cfg["skills"])
     if middleware:
         spec["middleware"] = middleware  # 有则挂上中间件链
-    if agent.model:
-        spec["model"] = agent.model  # 可选覆盖模型名
     return spec
 
 
 def _build_subagent_spec_from_snapshot(
-    db: Session,  # 仍需查 Tool / Middleware 定义表
+    db: Session,  # 仍需查 Tool / Middleware / Skill 定义表
+    settings: Settings,
     agent: dict[str, Any],  # 快照里的 Agent JSON
 ) -> dict[str, Any]:
-    """快照 Agent dict → deepagents SubAgent 字典（按 id 再查工具/中间件）。"""
+    """快照 Agent dict → deepagents SubAgent 字典（按 id 再查工具/中间件/Skill）。"""
+    from deepagents_app.services.skills import load_skills_by_ids, materialize_agent_skills
+
     cfg = agent.get("config") or {}  # 快照内嵌 config
     # 快照只存 tool_ids，运行时再解析为工具实例
     tools = load_tools_by_ids(db, list(agent.get("tool_ids") or []))
     # 同理按 middleware_ids 加载
     middleware = _load_middlewares_by_ids(db, list(agent.get("middleware_ids") or []))
 
+    agent_id = str(agent.get("id") or agent["name"])
     spec: dict[str, Any] = {
         "name": agent["name"],  # 快照必有 name
         "description": str(cfg.get("description") or agent["name"]),  # 缺省用名称
         "system_prompt": agent.get("system_prompt") or "",  # 缺省空串
         "tools": tools,
+        "model": _chat_model_for_agent(db, settings, agent),
     }
-    skills = cfg.get("skills")
-    if skills:
-        spec["skills"] = list(skills)
+    skills = load_skills_by_ids(db, list(agent.get("skill_ids") or []))
+    skills_path = materialize_agent_skills(settings, agent_id, skills)
+    if skills_path:
+        spec["skills"] = [skills_path]
+    elif cfg.get("skills"):
+        # 旧快照无 skill_ids：回退项目目录 + config.skills 路径
+        _legacy_sync_project_skills(settings)
+        spec["skills"] = list(cfg["skills"])
     if middleware:
         spec["middleware"] = middleware
-    if agent.get("model"):
-        spec["model"] = agent["model"]  # 可选模型覆盖
     return spec
 
 
@@ -234,12 +312,12 @@ def _assemble_create_kwargs(
     settings: Settings,  # 全局运行时配置
     supervisor_prompt: str,  # Supervisor 系统提示词
     supervisor_name: str,  # Supervisor 显示名（亦作图 name）
-    supervisor_model: str | None,  # 可选模型覆盖；None 用默认
-    supervisor_temperature: float | None,  # 可选温度
+    supervisor_model: Any,  # 已 build_chat_model 的实例
     supervisor_tools: list[Any],  # Supervisor 工具列表（可空）
     supervisor_middleware: list[Any],  # Supervisor 中间件实例列表
     supervisor_config: dict[str, Any],  # 含 interrupt_on 等扩展
     subagents: list[dict[str, Any]],  # 已组装好的 SubAgent 规格列表
+    supervisor_skills: list[str] | None = None,  # 可选：Supervisor 的 skills 源路径
 ) -> dict[str, Any]:
     """
     live / snapshot 两条路径共用的 ``create_deep_agent`` 参数组装。
@@ -255,27 +333,20 @@ def _assemble_create_kwargs(
         # 有覆盖：仅当全局 enable_hitl 开启时生效，否则强制关闭
         interrupt_on = interrupt_cfg if settings.enable_hitl else None
 
-    # 构造 Supervisor 所用聊天模型（可被 methodology Agent 字段覆盖）
-    model = build_chat_model(
-        settings,
-        model_name=supervisor_model,  # None → Settings 默认模型
-        temperature=supervisor_temperature,  # None → Settings 默认温度
-    )
-
     backend = build_filesystem_backend(settings)  # workspace 文件系统后端
     checkpointer = build_checkpointer(settings)  # 会话 checkpoint 存储
     permissions = build_permissions()  # 工具/文件权限策略
     configure_general_purpose_profile(settings)  # 配置内置 general-purpose 画像
-    # FilesystemBackend 根 = workspace，需先同步 AGENTS.md / skills
-    sync_memory_and_skills_into_workspace(settings)
+    # FilesystemBackend 根 = workspace；仅同步 AGENTS.md（Skills 已按 Agent 物化）
+    sync_memory_into_workspace(settings)
     # 仅当 workspace 下存在 AGENTS.md 时才传 memory 路径
     memory_paths = ["/AGENTS.md"] if (settings.workspace_dir / "AGENTS.md").exists() else None
 
     # create_deep_agent 公共参数
     create_kwargs: dict[str, Any] = {
-        "model": model,  # Supervisor LLM
+        "model": supervisor_model,  # Supervisor LLM（实例）
         "system_prompt": supervisor_prompt,  # Supervisor 系统提示
-        "subagents": subagents,  # 子 Agent 规格列表
+        "subagents": subagents,  # 子 Agent 规格列表（含各自 model 实例）
         "backend": backend,  # 文件系统后端
         "middleware": supervisor_middleware,  # Supervisor 中间件
         "memory": memory_paths,  # 可选记忆文件路径
@@ -287,7 +358,27 @@ def _assemble_create_kwargs(
     if supervisor_tools:
         # 有工具才传入，避免空列表覆盖框架默认行为
         create_kwargs["tools"] = supervisor_tools
+    if supervisor_skills:
+        create_kwargs["skills"] = list(supervisor_skills)
     return create_kwargs
+
+
+def _supervisor_skills_paths(
+    db: Session,
+    settings: Settings,
+    supervisor: AgentDefinition | dict[str, Any],
+) -> list[str] | None:
+    """物化 Supervisor 已绑 Skills，返回源路径列表（无则 None）。"""
+    from deepagents_app.services.skills import load_skills_by_ids, materialize_agent_skills
+
+    if isinstance(supervisor, dict):
+        agent_id = str(supervisor.get("id") or supervisor.get("name") or "supervisor")
+        skills = load_skills_by_ids(db, list(supervisor.get("skill_ids") or []))
+    else:
+        agent_id = supervisor.id
+        skills = list(supervisor.skills or [])
+    path = materialize_agent_skills(settings, agent_id, skills)
+    return [path] if path else None
 
 
 def _build_from_live(
@@ -297,6 +388,10 @@ def _build_from_live(
 ) -> Any:
     """从当前 live 表组装 Agent（会话版本 == 方法论当前 version）。"""
     from deepagents import create_deep_agent  # 延迟导入，避免模块加载时拉起重依赖
+    from deepagents_app.services.skills import clear_materialized_skills
+
+    # 组装前清空旧物化目录，避免残留已解绑 skill
+    clear_materialized_skills(settings)
 
     # 过滤掉 enabled=false 的 Agent
     agents = [a for a in methodology.agents if _agent_enabled(a)]
@@ -312,12 +407,16 @@ def _build_from_live(
         logger.warning("方法论 %s 有多个 Supervisor，使用第一个", methodology.id)
     supervisor = supervisors[0]
 
-    # live ORM → SubAgent 规格
-    subagents = [_build_subagent_spec_from_row(a) for a in subagents_defs]
+    # live ORM → SubAgent 规格（每个 SubAgent 独立 build_chat_model）
+    subagents = [
+        _build_subagent_spec_from_row(db, settings, a) for a in subagents_defs
+    ]
     # Supervisor 中间件：关系表 → 实例
     middleware = [load_middleware_object(m) for m in supervisor.middlewares]
     # Supervisor 工具：关系表展开
     supervisor_tools = _expand_agent_tools(supervisor)
+    supervisor_model = _chat_model_for_agent(db, settings, supervisor)
+    supervisor_skills = _supervisor_skills_paths(db, settings, supervisor)
 
     logger.info(
         "动态组装 Agent（live）：methodology=%s v%s supervisor=%s subagents=%s",
@@ -332,12 +431,12 @@ def _build_from_live(
         settings=settings,
         supervisor_prompt=supervisor.system_prompt,  # ORM 系统提示词
         supervisor_name=supervisor.name,  # ORM 名称
-        supervisor_model=supervisor.model,  # 可为 None
-        supervisor_temperature=supervisor.temperature,  # 可为 None
+        supervisor_model=supervisor_model,
         supervisor_tools=supervisor_tools,
         supervisor_middleware=middleware,
         supervisor_config=dict(supervisor.config or {}),  # 拷贝，避免副作用
         subagents=subagents,
+        supervisor_skills=supervisor_skills,
     )
     return create_deep_agent(**kwargs)  # 返回 Compiled Agent
 
@@ -350,6 +449,9 @@ def _build_from_snapshot(
 ) -> Any:
     """从 MethodologyRevision 快照组装 Agent（旧会话锁定历史版本）。"""
     from deepagents import create_deep_agent  # 延迟导入
+    from deepagents_app.services.skills import clear_materialized_skills
+
+    clear_materialized_skills(settings)
 
     # 取指定版本的修订快照行
     revision = get_revision(db, methodology_id, version)
@@ -367,14 +469,18 @@ def _build_from_snapshot(
         raise ValueError(f"快照 {methodology_id} v{version} 缺少 Supervisor Agent")
     supervisor = supervisors[0]  # 快照路径不额外告警多 Supervisor
 
-    # 快照 dict → SubAgent 规格（内部再查 tool/middleware）
-    subagents = [_build_subagent_spec_from_snapshot(db, a) for a in subagents_defs]
+    # 快照 dict → SubAgent 规格（内部再查 tool/middleware + build_chat_model）
+    subagents = [
+        _build_subagent_spec_from_snapshot(db, settings, a) for a in subagents_defs
+    ]
     # Supervisor 中间件：快照只存 ids
     middleware = _load_middlewares_by_ids(
         db, list(supervisor.get("middleware_ids") or [])
     )
     # Supervisor 工具：按 tool_ids 加载
     supervisor_tools = load_tools_by_ids(db, list(supervisor.get("tool_ids") or []))
+    supervisor_model = _chat_model_for_agent(db, settings, supervisor)
+    supervisor_skills = _supervisor_skills_paths(db, settings, supervisor)
 
     logger.info(
         "动态组装 Agent（snapshot）：methodology=%s v%s supervisor=%s subagents=%s",
@@ -388,12 +494,12 @@ def _build_from_snapshot(
         settings=settings,
         supervisor_prompt=supervisor.get("system_prompt") or "",  # 缺省空串
         supervisor_name=str(supervisor.get("name") or "supervisor"),  # 缺省占位名
-        supervisor_model=supervisor.get("model"),
-        supervisor_temperature=supervisor.get("temperature"),
+        supervisor_model=supervisor_model,
         supervisor_tools=supervisor_tools,
         supervisor_middleware=middleware,
         supervisor_config=dict(supervisor.get("config") or {}),  # 拷贝 config
         subagents=subagents,
+        supervisor_skills=supervisor_skills,
     )
     return create_deep_agent(**kwargs)
 

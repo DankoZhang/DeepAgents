@@ -19,8 +19,10 @@ from deepagents_app.api.routes import (
     agents,
     chat,
     conversations,
+    llm_models,
     methodologies,
     middlewares,
+    skills,
     tools,
 )
 from deepagents_app.config import get_settings
@@ -104,8 +106,10 @@ def create_app() -> FastAPI:
     )
 
     # 业务 API 统一挂在 /api 下；/health 单独暴露给探活
+    app.include_router(llm_models.router, prefix="/api")
     app.include_router(methodologies.router, prefix="/api")
     app.include_router(agents.router, prefix="/api")
+    app.include_router(skills.router, prefix="/api")
     app.include_router(tools.router, prefix="/api")
     app.include_router(middlewares.router, prefix="/api")
     app.include_router(conversations.router, prefix="/api")

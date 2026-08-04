@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 # 请求/响应 Pydantic 模型
 from deepagents_app.api.schemas import (
     AgentBindMiddlewares,  # POST .../middlewares 的 body
+    AgentBindSkills,  # POST .../skills 的 body
     AgentBindTools,  # POST .../tools 的 body
     AgentCreate,  # POST /agent 的 body
     AgentOut,  # 统一响应形状
@@ -62,16 +63,20 @@ def create_agent(body: AgentCreate, db: Session = Depends(get_db)):
             db,
             name=body.name,  # 全局唯一名
             system_prompt=body.system_prompt,  # 系统提示词
-            model=body.model,  # 可选模型
+            model_id=body.model_id,  # 方案 B：目录模型
+            model=body.model,  # 可选兜底模型名
             temperature=body.temperature,  # 可选温度
-            config=body.config,  # role / description / skills 等
+            config=body.config,  # role / description / enabled 等
             agent_id=body.id,  # 可选客户端指定主键
             tool_ids=body.tool_ids,  # 创建时一并绑定工具
             middleware_ids=body.middleware_ids,  # 创建时一并绑定中间件
+            skill_ids=body.skill_ids,  # 创建时一并绑定 Skill
         )
     except ValueError as exc:
         # 如重名 → 400
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.patch("/agent/{agent_id}", response_model=AgentOut)  # 部分更新
@@ -82,11 +87,14 @@ def update_agent(agent_id: str, body: AgentUpdate, db: Session = Depends(get_db)
             agent_id,  # 路径上的目标 id
             name=body.name,  # None 表示不改该字段
             system_prompt=body.system_prompt,
+            model_id=body.model_id,
+            clear_model_id=body.clear_model_id,
             model=body.model,
             temperature=body.temperature,
             config=body.config,  # service 内与旧 config merge
             tool_ids=body.tool_ids,  # 传入则整表替换工具绑定
             middleware_ids=body.middleware_ids,  # 传入则整表替换中间件绑定
+            skill_ids=body.skill_ids,
         )
     except LookupError as exc:
         # Agent 不存在 → 404
@@ -130,3 +138,15 @@ def bind_middlewares(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/agent/{agent_id}/skills", response_model=AgentOut)
+def bind_skills(agent_id: str, body: AgentBindSkills, db: Session = Depends(get_db)):
+    try:
+        return agents_svc.bind_agent_skills(
+            db, agent_id, body.skill_ids, replace=body.replace
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

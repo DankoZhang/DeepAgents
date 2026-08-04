@@ -3,11 +3,13 @@ ORM 模型
 ========
 
 表：
+- model_definition（前端可配置的大模型目录）
 - methodology / methodology_agent（方法论勾选全局 Agent）
-- agent_definition（全局 Agent）
+- agent_definition（全局 Agent，经 model_id 绑定目录模型）
 - tool_definition（builtin 内置 / mcp 前端新增）
+- skill_definition（前端可配置的 Skills 目录；运行时物化到 workspace）
 - middleware_definition（仅种子内置，无对外写接口）
-- agent_tool / agent_middleware
+- agent_tool / agent_middleware / agent_skill
 - methodology_revision / conversation
 """
 
@@ -46,6 +48,37 @@ JsonType = JSON().with_variant(JSONB(), "postgresql")
 def _utcnow() -> datetime:
     # 返回当前 UTC 时间，供 created_time / updated_time 的 default 与 onupdate 使用
     return datetime.now(timezone.utc)
+
+
+class ModelDefinition(Base):
+    """平台大模型目录：连接信息 + 超参数，供 Agent 勾选（方案 B）。"""
+
+    __tablename__ = "model_definition"
+    __table_args__ = (UniqueConstraint("name", name="uq_model_name"),)
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # openai | anthropic | openai_compatible
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="openai")
+    model_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    api_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    top_p: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 上下文窗口（元数据，供前端展示；不直接传给 SDK）
+    context_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timeout: Mapped[float | None] = mapped_column(Float, nullable=True)
+    config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    created_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    agents: Mapped[list["AgentDefinition"]] = relationship(back_populates="llm_model")
 
 
 class Methodology(Base):
@@ -95,13 +128,21 @@ class AgentDefinition(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     # 系统提示词，默认空字符串
     system_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    # 使用的模型名，可为空（走默认模型）
+    # 方案 B：绑定模型目录；组装时用目录超参数 build_chat_model
+    model_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("model_definition.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # 兼容旧字段 / 无目录时的兜底模型名与温度
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # 采样温度，可为空（走默认温度）
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     # 额外配置 JSON（扩展字段），默认空字典
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
 
+    llm_model: Mapped[ModelDefinition | None] = relationship(back_populates="agents")
     # 多对多：该 Agent 被哪些方法论勾选
     methodologies: Mapped[list[Methodology]] = relationship(
         secondary="methodology_agent",  # 通过中间表 methodology_agent 关联
@@ -116,6 +157,11 @@ class AgentDefinition(Base):
     middlewares: Mapped[list[MiddlewareDefinition]] = relationship(
         secondary="agent_middleware",  # 通过中间表 agent_middleware 关联
         back_populates="agents",  # 与 MiddlewareDefinition.agents 双向同步
+    )
+    skills: Mapped[list["SkillDefinition"]] = relationship(
+        secondary="agent_skill",
+        back_populates="agents",
+        order_by="SkillDefinition.name",
     )
 
 
@@ -153,6 +199,37 @@ class ToolDefinition(Base):
     agents: Mapped[list[AgentDefinition]] = relationship(
         secondary="agent_tool",  # 通过中间表 agent_tool 关联
         back_populates="tools",  # 与 AgentDefinition.tools 双向同步
+    )
+
+
+class SkillDefinition(Base):
+    """
+    Skill 目录：完整 SKILL.md 存 content，运行时物化到 workspace 供 SkillsMiddleware 读取。
+
+    name 同时作为物化子目录名（须为安全 slug）；description 供列表展示与 frontmatter 对齐。
+    """
+
+    __tablename__ = "skill_definition"
+    __table_args__ = (UniqueConstraint("name", name="uq_skill_name"),)
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # 全局唯一；亦作物化目录名，如 document-writing
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # 完整 SKILL.md 文本（含 YAML frontmatter + 正文）
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    created_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    agents: Mapped[list[AgentDefinition]] = relationship(
+        secondary="agent_skill",
+        back_populates="skills",
     )
 
 
@@ -225,6 +302,19 @@ class AgentMiddleware(Base):
         String(128),
         ForeignKey("middleware_definition.id", ondelete="CASCADE"),
         primary_key=True,
+    )
+
+
+class AgentSkill(Base):
+    """Agent ↔ Skill 多对多。"""
+
+    __tablename__ = "agent_skill"
+
+    agent_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("agent_definition.id", ondelete="CASCADE"), primary_key=True
+    )
+    skill_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("skill_definition.id", ondelete="CASCADE"), primary_key=True
     )
 
 

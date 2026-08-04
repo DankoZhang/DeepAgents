@@ -41,6 +41,115 @@ class MiddlewareBrief(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class SkillBrief(BaseModel):
+    """Agent 已绑定 Skill 的简要信息。"""
+
+    id: str
+    name: str
+    description: str = ""
+    status: str = "active"
+
+    model_config = {"from_attributes": True}
+
+
+# ── Model（大模型目录）──────────────────────────────────────────────────
+
+
+class ModelCreate(BaseModel):
+    """POST /api/model：前端配置一条大模型。"""
+
+    name: str  # 显示名，全局唯一
+    provider: Literal["openai", "anthropic", "openai_compatible"] = "openai"
+    model_name: str  # 提供商侧模型 ID，如 gpt-4o / deepseek-chat
+    api_key: str | None = None
+    base_url: str | None = None  # openai_compatible 常用
+    temperature: float | None = 0.2
+    top_p: float | None = None
+    max_tokens: int | None = None  # 单次生成上限
+    context_length: int | None = None  # 上下文窗口（展示/校验用）
+    timeout: float | None = None
+    config: dict[str, Any] = Field(default_factory=dict)  # 额外 SDK 参数
+    status: str = "active"
+    id: str | None = None
+
+
+class ModelUpdate(BaseModel):
+    """PATCH /api/model/{id}。"""
+
+    name: str | None = None
+    provider: Literal["openai", "anthropic", "openai_compatible"] | None = None
+    model_name: str | None = None
+    api_key: str | None = None
+    clear_api_key: bool = False  # True 时清空已存密钥
+    base_url: str | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    context_length: int | None = None
+    timeout: float | None = None
+    config: dict[str, Any] | None = None
+    status: str | None = None
+
+
+class ModelOut(BaseModel):
+    """模型目录响应（不回传明文 api_key）。"""
+
+    id: str
+    name: str
+    provider: str
+    model_name: str
+    base_url: str | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    context_length: int | None = None
+    timeout: float | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    has_api_key: bool = False
+    created_time: datetime
+    updated_time: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ModelBrief(BaseModel):
+    """嵌在 Agent 响应里的模型摘要。"""
+
+    id: str
+    name: str
+    provider: str
+    model_name: str
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    context_length: int | None = None
+    status: str = "active"
+
+    model_config = {"from_attributes": True}
+
+
+class ModelTestRequest(BaseModel):
+    """POST /api/model/test：按 id 或内联配置试连。"""
+
+    model_id: str | None = None
+    provider: Literal["openai", "anthropic", "openai_compatible"] | None = None
+    model_name: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    temperature: float | None = 0.0
+    top_p: float | None = None
+    max_tokens: int | None = 16
+    timeout: float | None = 30.0
+    config: dict[str, Any] | None = None
+
+
+class ModelTestResult(BaseModel):
+    ok: bool
+    message: str
+    reply_preview: str | None = None
+
+
 # ── Agent（全局）─────────────────────────────────────────────────────────
 
 
@@ -49,12 +158,15 @@ class AgentCreate(BaseModel):
 
     name: str  # 全局唯一名称
     system_prompt: str = ""  # 系统提示词
-    model: str | None = None  # 可选模型名；None 用全局默认
-    temperature: float | None = None  # 可选采样温度
-    # 扩展字段：role(supervisor|subagent) / description / skills / enabled 等
+    model_id: str | None = None  # 方案 B：绑定模型目录
+    model: str | None = None  # 兼容：无 model_id 时的兜底模型名
+    temperature: float | None = None  # 兼容：无目录时的温度
+    # 扩展字段：role(supervisor|subagent) / description / enabled 等
+    # （skills 改走 skill_ids / agent_skill，不再写 config.skills 路径）
     config: dict[str, Any] = Field(default_factory=dict)
     tool_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的工具 id
     middleware_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的中间件 id
+    skill_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的 Skill id
     id: str | None = None  # 可选客户端指定主键；否则服务端生成
 
 
@@ -63,11 +175,14 @@ class AgentUpdate(BaseModel):
 
     name: str | None = None
     system_prompt: str | None = None
+    model_id: str | None = None
+    clear_model_id: bool = False  # True 时解绑目录模型
     model: str | None = None
     temperature: float | None = None
     config: dict[str, Any] | None = None  # 与现有 config 做 merge，非整表替换语义由 service 定
     tool_ids: list[str] | None = None  # 传入则整表替换绑定
     middleware_ids: list[str] | None = None
+    skill_ids: list[str] | None = None
 
 
 class AgentBindTools(BaseModel):
@@ -84,17 +199,27 @@ class AgentBindMiddlewares(BaseModel):
     replace: bool = True
 
 
+class AgentBindSkills(BaseModel):
+    """POST /api/agent/{id}/skills：单独改 Skill 绑定。"""
+
+    skill_ids: list[str]
+    replace: bool = True
+
+
 class AgentOut(BaseModel):
     """Agent 详情/列表响应。"""
 
     id: str
     name: str
     system_prompt: str
+    model_id: str | None = None
     model: str | None
     temperature: float | None
     config: dict[str, Any]
+    llm_model: ModelBrief | None = None
     tools: list[ToolBrief] = Field(default_factory=list)  # 已绑定工具摘要
     middlewares: list[MiddlewareBrief] = Field(default_factory=list)  # 已绑定中间件摘要
+    skills: list[SkillBrief] = Field(default_factory=list)  # 已绑定 Skill 摘要
 
     model_config = {"from_attributes": True}
 
@@ -232,6 +357,45 @@ class MiddlewareOut(BaseModel):
     name: str
     class_path: str  # 本地 Middleware 类导入路径
     config: dict[str, Any]  # 构造参数
+
+    model_config = {"from_attributes": True}
+
+
+# ── Skill ────────────────────────────────────────────────────────────────
+
+
+class SkillCreate(BaseModel):
+    """POST /api/skill：新建 Skill（content 为完整 SKILL.md 或纯正文）。"""
+
+    name: str  # 全局唯一；亦作物化子目录名
+    description: str = ""
+    content: str  # 完整 SKILL.md 或正文（无 frontmatter 时服务端自动包装）
+    config: dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    id: str | None = None
+
+
+class SkillUpdate(BaseModel):
+    """PATCH /api/skill/{id}。"""
+
+    name: str | None = None
+    description: str | None = None
+    content: str | None = None
+    config: dict[str, Any] | None = None
+    status: str | None = None
+
+
+class SkillOut(BaseModel):
+    """Skill 列表/详情响应。"""
+
+    id: str
+    name: str
+    description: str
+    content: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    created_time: datetime
+    updated_time: datetime
 
     model_config = {"from_attributes": True}
 

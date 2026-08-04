@@ -32,12 +32,14 @@ def list_methodologies(
 
 
 def get_methodology(db: Session, methodology_id: str) -> Methodology | None:
-    # 详情需带出已勾选 Agent 及其 tools / middlewares
+    # 详情需带出已勾选 Agent 及其 tools / middlewares / skills
     return (
         db.query(Methodology)
         .options(
             joinedload(Methodology.agents).joinedload(AgentDefinition.tools),
             joinedload(Methodology.agents).joinedload(AgentDefinition.middlewares),
+            joinedload(Methodology.agents).joinedload(AgentDefinition.skills),
+            joinedload(Methodology.agents).joinedload(AgentDefinition.llm_model),
         )
         .filter(Methodology.id == methodology_id)
         .one_or_none()
