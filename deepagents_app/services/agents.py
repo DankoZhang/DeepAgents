@@ -17,10 +17,13 @@ from sqlalchemy.orm import Session, joinedload
 from deepagents_app.db.models import (
     AgentDefinition,  # 全局 Agent 主表
     AgentMiddleware,  # Agent ↔ Middleware 多对多
+    AgentSkill,  # Agent ↔ Skill 多对多
     AgentTool,  # Agent ↔ Tool 多对多
     Methodology,  # 方法论（版本 bump 时用）
     MethodologyAgent,  # 方法论勾选全局 Agent
     MiddlewareDefinition,  # 校验中间件 id 是否存在
+    ModelDefinition,  # 方案 B：模型目录
+    SkillDefinition,  # 校验 Skill id 是否存在
     ToolDefinition,  # 校验工具 id 是否存在
 )
 # Agent 配置变更后清空已编译图缓存，避免继续用旧绑定
@@ -35,10 +38,12 @@ def list_agents(
     methodology_id: str | None = None,  # 若指定则只返回该方法论已勾选的 Agent
 ) -> list[AgentDefinition]:
     """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。"""
-    # 查 Agent，并预加载 tools / middlewares 供序列化为 AgentOut
+    # 查 Agent，并预加载 tools / middlewares / skills / llm_model 供序列化为 AgentOut
     q = db.query(AgentDefinition).options(
         joinedload(AgentDefinition.tools),  # 一次查出已绑工具，避免懒加载 N+1
         joinedload(AgentDefinition.middlewares),  # 一次查出已绑中间件
+        joinedload(AgentDefinition.skills),  # 一次查出已绑 Skill
+        joinedload(AgentDefinition.llm_model),  # 方案 B：目录模型
     )
     # 通过中间表过滤：只保留被该方法论勾选的行
     if methodology_id:
@@ -63,6 +68,8 @@ def get_agent(db: Session, agent_id: str) -> AgentDefinition | None:
         .options(
             joinedload(AgentDefinition.tools),  # JOIN 加载已绑定 ToolDefinition 列表
             joinedload(AgentDefinition.middlewares),  # JOIN 加载已绑定 MiddlewareDefinition 列表
+            joinedload(AgentDefinition.skills),  # JOIN 加载已绑定 SkillDefinition 列表
+            joinedload(AgentDefinition.llm_model),
         )
         .filter(AgentDefinition.id == agent_id)  # WHERE id = :agent_id
         .one_or_none()  # 找到 1 行返回对象；0 行返回 None；>1 行抛错
@@ -74,12 +81,14 @@ def create_agent(
     *,  # 其后必须关键字传参，防止参数错位
     name: str,  # 全局唯一显示名
     system_prompt: str = "",  # 系统提示词
-    model: str | None = None,  # 可选模型；None 用运行时默认
-    temperature: float | None = None,  # 可选温度
-    config: dict[str, Any] | None = None,  # role / description / skills 等扩展
+    model_id: str | None = None,  # 方案 B：绑定模型目录
+    model: str | None = None,  # 兼容：无目录时的模型名兜底
+    temperature: float | None = None,  # 兼容：无目录时的温度
+    config: dict[str, Any] | None = None,  # role / description / enabled 等扩展
     agent_id: str | None = None,  # 可选固定主键（种子用）
     tool_ids: list[str] | None = None,  # 创建时一并绑定的工具
     middleware_ids: list[str] | None = None,  # 创建时一并绑定的中间件
+    skill_ids: list[str] | None = None,  # 创建时一并绑定的 Skill
     bump_related: bool = True,  # False：批量种子时跳过版本 bump
 ) -> AgentDefinition:
     """创建全局 Agent（不隶属单一方法论；由方法论另行勾选）。"""
@@ -92,8 +101,12 @@ def create_agent(
     if existing is not None:
         raise ValueError(f"已存在同名 Agent：{name}")  # 交给路由转 400
 
+    resolved_model_id = _validate_model_id(db, model_id)
+
     # 拷贝 config，避免改到调用方传入的原 dict
     cfg = dict(config or {})
+    # skills 已改走 agent_skill；丢掉遗留路径列表，避免与关系表双源
+    cfg.pop("skills", None)
     # 缺省角色为子 Agent；Supervisor 需显式传 role=supervisor
     cfg.setdefault("role", "subagent")
     # 缺省启用；enabled=false 时 Factory 组装会跳过
@@ -104,6 +117,7 @@ def create_agent(
         id=agent_id or f"agent_{uuid.uuid4().hex[:12]}",  # 无指定则生成 agent_<hex>
         name=name,  # 写入显示名
         system_prompt=system_prompt,  # 写入系统提示词
+        model_id=resolved_model_id,
         model=model,  # 可为 None
         temperature=temperature,  # 可为 None
         config=cfg,  # 写入合并后的扩展 JSON
@@ -117,6 +131,8 @@ def create_agent(
     # 同理绑定中间件
     if middleware_ids:
         _bind_middlewares(db, row.id, middleware_ids, replace=True)
+    if skill_ids:
+        _bind_skills(db, row.id, skill_ids, replace=True)
 
     # 新建时通常还没被方法论勾选；若已有关联则 bump 那些方法论
     if bump_related:
@@ -131,11 +147,14 @@ def update_agent(
     *,
     name: str | None = None,  # None 表示该字段不改
     system_prompt: str | None = None,  # None 不改
+    model_id: str | None = None,  # None 不改；配合 clear_model_id
+    clear_model_id: bool = False,
     model: str | None = None,  # None 不改
     temperature: float | None = None,  # None 不改
     config: dict[str, Any] | None = None,  # 与现有 config 做 merge
     tool_ids: list[str] | None = None,  # 传入则整表替换工具绑定
     middleware_ids: list[str] | None = None,  # 传入则整表替换中间件绑定
+    skill_ids: list[str] | None = None,  # 传入则整表替换 Skill 绑定
     bump_related: bool = True,  # 是否 bump 所有勾选了该 Agent 的方法论
 ) -> AgentDefinition:
     # 加载含关系的当前行（内部会 expire_all）
@@ -156,6 +175,10 @@ def update_agent(
     # 选择性更新各标量字段
     if system_prompt is not None:
         row.system_prompt = system_prompt
+    if clear_model_id:
+        row.model_id = None
+    elif model_id is not None:
+        row.model_id = _validate_model_id(db, model_id)
     if model is not None:
         row.model = model or None  # 空串视为清除，回退默认模型
     if temperature is not None:
@@ -164,11 +187,14 @@ def update_agent(
         # 浅合并：保留未在本次 patch 中出现的旧键
         merged = dict(row.config or {})
         merged.update(config)  # 本次传入的键覆盖同名旧键
+        merged.pop("skills", None)  # 路径式 skills 已废弃
         row.config = merged
     if tool_ids is not None:
         _bind_tools(db, row.id, tool_ids, replace=True)  # 整表替换工具关系
     if middleware_ids is not None:
         _bind_middlewares(db, row.id, middleware_ids, replace=True)  # 整表替换中间件关系
+    if skill_ids is not None:
+        _bind_skills(db, row.id, skill_ids, replace=True)
 
     db.flush()  # 把脏字段与关系变更刷到 DB
     # 全局 Agent 被多个方法论共享：任一变更都要让相关方法论升版并快照
@@ -236,6 +262,24 @@ def bind_agent_middlewares(
     return get_agent(db, agent_id)  # type: ignore[return-value]
 
 
+def bind_agent_skills(
+    db: Session,
+    agent_id: str,
+    skill_ids: list[str],
+    *,
+    replace: bool = True,
+    bump_related: bool = True,
+) -> AgentDefinition:
+    row = get_agent(db, agent_id)
+    if row is None:
+        raise LookupError(f"Agent 不存在：{agent_id}")
+    _bind_skills(db, agent_id, skill_ids, replace=replace)
+    db.flush()
+    if bump_related:
+        _bump_methodologies_using_agent(db, agent_id)
+    return get_agent(db, agent_id)  # type: ignore[return-value]
+
+
 def _bind_tools(
     db: Session,
     agent_id: str,
@@ -285,6 +329,42 @@ def _bind_middlewares(
         )
         if exists is None:
             db.add(AgentMiddleware(agent_id=agent_id, middleware_id=mid))
+
+
+def _bind_skills(
+    db: Session,
+    agent_id: str,
+    skill_ids: list[str],
+    *,
+    replace: bool,
+) -> None:
+    if replace:
+        db.query(AgentSkill).filter(AgentSkill.agent_id == agent_id).delete()
+    for sid in skill_ids:
+        skill = db.get(SkillDefinition, sid)
+        if skill is None:
+            raise LookupError(f"Skill 不存在：{sid}")
+        if skill.status != "active":
+            raise ValueError(f"Skill 已禁用：{skill.name}")
+        exists = (
+            db.query(AgentSkill)
+            .filter(AgentSkill.agent_id == agent_id, AgentSkill.skill_id == sid)
+            .one_or_none()
+        )
+        if exists is None:
+            db.add(AgentSkill(agent_id=agent_id, skill_id=sid))
+
+
+def _validate_model_id(db: Session, model_id: str | None) -> str | None:
+    """校验 model_id 存在且可用；None 表示不绑定目录。"""
+    if not model_id:
+        return None
+    row = db.get(ModelDefinition, model_id)
+    if row is None:
+        raise LookupError(f"模型不存在：{model_id}")
+    if row.status != "active":
+        raise ValueError(f"模型已禁用：{row.name}")
+    return model_id
 
 
 def _bump_methodologies_using_agent(db: Session, agent_id: str) -> None:
