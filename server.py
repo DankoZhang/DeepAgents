@@ -11,7 +11,7 @@ DeepAgents FastAPI 服务入口
     # 启动 API
     python server.py
     # 或
-    uvicorn deepagents_app.api.app:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn deepagents_app.api.app:app --host 0.0.0.0 --port 8001 --reload
 """
 
 from __future__ import annotations
