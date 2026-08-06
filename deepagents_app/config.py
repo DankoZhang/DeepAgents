@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     # 日志级别
     log_level: str = "INFO"
 
+    # ── 运行时资源生命周期 ────────────────────────────────────────────
+    # 进程内 Compiled Agent 缓存上限；淘汰时顺带清构建锁与物化 Skills
+    agent_cache_max_size: int = Field(default=32, ge=1, le=10_000)
+    # 每个方法论最多保留的历史快照数（仍被会话引用的版本不会删）
+    methodology_revision_keep: int = Field(default=20, ge=1, le=10_000)
+    # Fernet 密钥（url-safe base64）或任意口令；用于加密模型 api_key
+    secrets_encryption_key: str | None = None
+
     @field_validator(
         "workspace_dir",
         "memory_file",

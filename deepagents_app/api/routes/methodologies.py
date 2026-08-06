@@ -7,10 +7,15 @@ CRUD + 发布 + 勾选全局 Agent + 版本列表。
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from deepagents_app.api.deps import require_user
+from deepagents_app.api.pagination import (
+    limit_query,
+    offset_query,
+    set_total_count,
+)
 from deepagents_app.api.schemas import (
     MethodologyBindAgents,
     MethodologyCreate,
@@ -43,11 +48,22 @@ def create_methodology(
 
 @router.get("/methodology/list", response_model=list[MethodologyOut])
 def list_methodologies(
+    response: Response,
     status: str | None = Query(None, description="draft | published | archived"),
+    limit: int = Depends(limit_query),
+    offset: int = Depends(offset_query),
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    return methodology_svc.list_methodologies(db, owner_user_id=user_id, status=status)
+    rows, total = methodology_svc.list_methodologies(
+        db,
+        owner_user_id=user_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    set_total_count(response, total)
+    return rows
 
 
 @router.get("/methodology/{methodology_id}", response_model=MethodologyDetailOut)

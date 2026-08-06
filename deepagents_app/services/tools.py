@@ -1,4 +1,11 @@
-"""Tool 注册管理：内置只读；API 仅可新增/编辑 MCP。"""
+"""
+Tool 注册管理
+=============
+
+- 内置工具（builtin）：种子写入，API 侧基本只读（仅可改 status）
+- MCP 工具：前端/API 可创建与编辑连接配置
+- 变更后默认 bump 引用该方法论，保证旧会话快照可重建
+"""
 
 from __future__ import annotations
 
@@ -9,9 +16,10 @@ from sqlalchemy.orm import Session
 
 from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.db.models import AgentTool, ToolDefinition
+from deepagents_app.ownership import validate_resource_id
 from deepagents_app.services.revisions import (
     bump_methodologies_using_tool,
-    schedule_cache_invalidation,
+    schedule_cache_invalidation_for_agent_ids,
 )
 
 
@@ -21,7 +29,12 @@ def list_tools(
     owner_user_id: str,
     status: str | None = None,
     tool_type: str | None = None,
-) -> list[ToolDefinition]:
+    limit: int = 200,
+    offset: int = 0,
+) -> tuple[list[ToolDefinition], int]:
+    """列出当前用户的工具目录；可按 status / tool_type 过滤。返回 (rows, total)。"""
+    from deepagents_app.api.pagination import paginate_query
+
     q = (
         db.query(ToolDefinition)
         .filter(ToolDefinition.owner_user_id == owner_user_id)
@@ -31,12 +44,13 @@ def list_tools(
         q = q.filter(ToolDefinition.status == status)
     if tool_type:
         q = q.filter(ToolDefinition.tool_type == tool_type)
-    return q.all()
+    return paginate_query(q, limit=limit, offset=offset)
 
 
 def get_tool(
     db: Session, tool_id: str, *, owner_user_id: str
 ) -> ToolDefinition | None:
+    """按主键取工具；不属于当前用户则视为不存在。"""
     row = db.get(ToolDefinition, tool_id)
     if row is None or row.owner_user_id != owner_user_id:
         return None
@@ -67,7 +81,7 @@ def create_builtin_tool(
     ):
         raise BusinessError(f"工具名已存在：{name}")
     row = ToolDefinition(
-        id=tool_id or f"tool_{uuid.uuid4().hex[:12]}",
+        id=_resolve_tool_id(tool_id),
         owner_user_id=owner_user_id,
         name=name,
         description=description,
@@ -93,7 +107,7 @@ def create_mcp_tool(
     status: str = "active",
     tool_id: str | None = None,
 ) -> ToolDefinition:
-    """前端/API：仅创建 MCP 工具。"""
+    """前端/API：仅创建 MCP 工具（连接信息放在 config）。"""
     if (
         db.query(ToolDefinition)
         .filter(
@@ -104,7 +118,7 @@ def create_mcp_tool(
     ):
         raise BusinessError(f"工具名已存在：{name}")
     row = ToolDefinition(
-        id=tool_id or f"tool_{uuid.uuid4().hex[:12]}",
+        id=_resolve_tool_id(tool_id),
         owner_user_id=owner_user_id,
         name=name,
         description=description,
@@ -129,9 +143,16 @@ def update_tool(
     status: str | None = None,
     bump_related: bool = True,
 ) -> ToolDefinition:
+    """
+    更新工具。
+
+    内置工具仅允许改 status；MCP 可改名称/描述/连接配置。
+    ``bump_related=True`` 时升版所有引用该方法论。
+    """
     row = get_tool(db, tool_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"工具不存在：{tool_id}")
+    # 内置工具由代码种子管理，禁止改语义字段，避免与 class_path 脱节
     if row.tool_type == "builtin":
         if name is not None or description is not None or mcp_config is not None:
             raise BusinessError(
@@ -163,7 +184,11 @@ def update_tool(
     if bump_related:
         bump_methodologies_using_tool(db, tool_id)
     else:
-        schedule_cache_invalidation(db, all_keys=True)
+        agent_ids = [
+            r.agent_id
+            for r in db.query(AgentTool).filter(AgentTool.tool_id == tool_id).all()
+        ]
+        schedule_cache_invalidation_for_agent_ids(db, agent_ids)
     return row
 
 
@@ -174,20 +199,28 @@ def delete_tool(
     owner_user_id: str,
     bump_related: bool = True,
 ) -> None:
+    """删除 MCP 工具；内置工具禁止删除（应改为 disabled）。"""
     row = get_tool(db, tool_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"工具不存在：{tool_id}")
     if row.tool_type == "builtin":
         raise BusinessError("内置工具不可删除，请改为 disabled")
+    # 先记下引用再删，删除后 AgentTool 行会级联消失
     agent_ids = [
         r.agent_id
         for r in db.query(AgentTool).filter(AgentTool.tool_id == tool_id).all()
     ]
     db.delete(row)
     db.flush()
-    if bump_related and agent_ids:
-        from deepagents_app.services.revisions import bump_methodologies_for_agent_ids
+    if bump_related:
+        if agent_ids:
+            from deepagents_app.services.revisions import bump_methodologies_for_agent_ids
 
-        bump_methodologies_for_agent_ids(db, agent_ids)
-    else:
-        schedule_cache_invalidation(db, all_keys=True)
+            bump_methodologies_for_agent_ids(db, agent_ids)
+    elif agent_ids:
+        schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+
+
+def _resolve_tool_id(tool_id: str | None) -> str:
+    resolved = tool_id or f"tool_{uuid.uuid4().hex[:12]}"
+    return validate_resource_id(resolved, label="tool id")

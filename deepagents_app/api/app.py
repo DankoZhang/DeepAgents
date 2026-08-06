@@ -3,8 +3,11 @@ FastAPI 应用工厂
 ================
 
 职责：
-- 应用启动时初始化日志、HarnessProfile、workspace memory
+- 应用启动时初始化日志、全局 workspace memory（兼容旧路径）
 - 挂载 CORS 与各业务路由
+
+HarnessProfile / general-purpose 子 Agent 在组装时按方法论显式注入，
+不再在 lifespan 全局注册。
 """
 
 from __future__ import annotations
@@ -29,10 +32,7 @@ from deepagents_app.api.routes import (
 )
 from deepagents_app.config import get_settings
 from deepagents_app.db.session import get_session_factory
-from deepagents_app.factory import (
-    configure_general_purpose_profile,
-    sync_memory_into_workspace,
-)
+from deepagents_app.factory import sync_memory_into_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ async def lifespan(_app: FastAPI):
     """
     应用生命周期钩子。
 
-    启动：日志、引擎、HarnessProfile、AGENTS.md 同步；
+    启动：日志、引擎、兼容旧路径的 AGENTS.md 同步；
     AUTH_DISABLED 时为开发用户预引导种子。
     """
     settings = get_settings()
@@ -53,7 +53,6 @@ async def lifespan(_app: FastAPI):
     )
 
     get_session_factory()
-    configure_general_purpose_profile(settings)
     sync_memory_into_workspace(settings)
 
     if settings.auth_disabled and settings.auth_dev_user_id:

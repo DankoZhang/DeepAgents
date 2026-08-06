@@ -20,8 +20,6 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from deepagents_app.config import get_settings
-
 # ---------------------------------------------------------------------------
 # 演示用迷你知识库（生产环境请换成外部数据源）
 # ---------------------------------------------------------------------------
@@ -83,7 +81,9 @@ KNOWLEDGE_BASE: list[dict[str, str]] = [
 
 
 def _notes_dir() -> Path:
-    return get_settings().workspace_dir / "notes"
+    from deepagents_app.workspace import get_workspace_root
+
+    return get_workspace_root() / "notes"
 
 
 class SearchKnowledgeArgs(BaseModel):

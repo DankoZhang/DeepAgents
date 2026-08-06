@@ -23,7 +23,6 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from deepagents_app.config import get_settings
 from deepagents_app.utils.paths import resolve_under_root
 
 # 允许执行的命令名（argv[0]；不以 shell 元字符拼接，故不含 python/pip）
@@ -63,7 +62,9 @@ _DANGEROUS_PATTERNS = (
 
 
 def _workspace() -> Path:
-    return get_settings().workspace_dir.resolve()
+    from deepagents_app.workspace import get_workspace_root
+
+    return get_workspace_root()
 
 
 def _safe_path(relative_path: str) -> Path:

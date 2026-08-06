@@ -116,7 +116,9 @@ class ModelOut(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def has_api_key(self) -> bool:
-        return bool(self.api_key)
+        from deepagents_app.crypto import secret_is_present
+
+        return secret_is_present(self.api_key)
 
 
 class ModelBrief(BaseModel):

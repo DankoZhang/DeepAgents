@@ -9,10 +9,15 @@ Tool 注册 API
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from deepagents_app.api.deps import require_user
+from deepagents_app.api.pagination import (
+    limit_query,
+    offset_query,
+    set_total_count,
+)
 from deepagents_app.api.schemas import ToolCreate, ToolOut, ToolUpdate
 from deepagents_app.db.session import get_db
 from deepagents_app.services import tools as tools_svc
@@ -22,14 +27,24 @@ router = APIRouter(tags=["tools"])
 
 @router.get("/tool/list", response_model=list[ToolOut])
 def list_tools(
+    response: Response,
     status: str | None = Query(None, description="active | disabled"),
     tool_type: str | None = Query(None, description="builtin | mcp"),
+    limit: int = Depends(limit_query),
+    offset: int = Depends(offset_query),
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    return tools_svc.list_tools(
-        db, owner_user_id=user_id, status=status, tool_type=tool_type
+    rows, total = tools_svc.list_tools(
+        db,
+        owner_user_id=user_id,
+        status=status,
+        tool_type=tool_type,
+        limit=limit,
+        offset=offset,
     )
+    set_total_count(response, total)
+    return rows
 
 
 @router.post("/tool", response_model=ToolOut)

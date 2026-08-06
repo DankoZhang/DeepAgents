@@ -8,10 +8,15 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.orm import Session
 
 from deepagents_app.api.deps import require_user
+from deepagents_app.api.pagination import (
+    limit_query,
+    offset_query,
+    set_total_count,
+)
 from deepagents_app.api.schemas import (
     ConversationCreate,
     ConversationMessagesOut,
@@ -41,17 +46,22 @@ def create_conversation(
 
 @router.get("/conversation/list", response_model=list[ConversationOut])
 def list_conversations(
+    response: Response,
     methodology_id: str | None = Query(None),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Depends(limit_query),
+    offset: int = Depends(offset_query),
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    return conversation_svc.list_conversations(
+    rows, total = conversation_svc.list_conversations(
         db,
         user_id=user_id,
         methodology_id=methodology_id,
         limit=limit,
+        offset=offset,
     )
+    set_total_count(response, total)
+    return rows
 
 
 @router.get("/conversation/{thread_id}", response_model=ConversationOut)
@@ -76,7 +86,7 @@ def delete_conversation(
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    """仅删 Conversation 行；checkpointer 中的 thread 状态需另行清理。"""
+    """仅删 Conversation 行，并尽量清理 checkpointer 中的 thread 状态。"""
     conversation_svc.delete_conversation(db, thread_id, user_id=user_id)
     return {"ok": True}
 

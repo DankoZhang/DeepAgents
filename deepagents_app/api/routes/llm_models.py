@@ -8,10 +8,15 @@ Agent 通过 model_id 绑定目录中的模型（方案 B）。
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from deepagents_app.api.deps import require_user
+from deepagents_app.api.pagination import (
+    limit_query,
+    offset_query,
+    set_total_count,
+)
 from deepagents_app.api.schemas import (
     ModelCreate,
     ModelOut,
@@ -27,11 +32,22 @@ router = APIRouter(tags=["models"])
 
 @router.get("/model/list", response_model=list[ModelOut])
 def list_models(
+    response: Response,
     status: str | None = Query(None, description="active | disabled"),
+    limit: int = Depends(limit_query),
+    offset: int = Depends(offset_query),
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    return models_svc.list_models(db, owner_user_id=user_id, status=status)
+    rows, total = models_svc.list_models(
+        db,
+        owner_user_id=user_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    set_total_count(response, total)
+    return rows
 
 
 @router.get("/model/{model_id}", response_model=ModelOut)

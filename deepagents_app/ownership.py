@@ -14,7 +14,25 @@ import re
 from deepagents_app.api.errors import BusinessError
 from deepagents_app.constants import DEFAULT_MODEL_ID, DEMO_METHODOLOGY_ID
 
-_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# 客户端可指定主键 / thread_id / Skill name 共用：禁止路径分隔与穿越字符
+_RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_THREAD_ID_RE = _RESOURCE_ID_RE
+
+
+def validate_resource_id(resource_id: str, *, label: str = "id") -> str:
+    """
+    校验客户端可指定的资源主键。
+
+    允许字母数字开头，其后仅字母数字、下划线、连字符；最长 128。
+    拒绝 ``/``、``..`` 等，避免主键被拼进磁盘路径时逃逸。
+    """
+    value = (resource_id or "").strip()
+    if not _RESOURCE_ID_RE.fullmatch(value):
+        raise BusinessError(
+            f"{label} 仅允许 1–128 位、字母或数字开头，"
+            "其余为字母数字、下划线或连字符"
+        )
+    return value
 
 
 def user_scope_key(owner_user_id: str) -> str:
@@ -45,5 +63,4 @@ def checkpoint_thread_id(user_id: str, thread_id: str) -> str:
 
 
 def validate_thread_id(thread_id: str) -> None:
-    if not _THREAD_ID_RE.fullmatch(thread_id or ""):
-        raise BusinessError("thread_id 仅允许 1–128 位字母数字、下划线或连字符")
+    validate_resource_id(thread_id, label="thread_id")

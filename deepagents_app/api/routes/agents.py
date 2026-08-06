@@ -7,10 +7,15 @@ CRUD + Tool / Middleware / Skill 绑定。变更会 bump 所有勾选了该 Agen
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from deepagents_app.api.deps import require_user
+from deepagents_app.api.pagination import (
+    limit_query,
+    offset_query,
+    set_total_count,
+)
 from deepagents_app.api.schemas import (
     AgentBindMiddlewares,
     AgentBindSkills,
@@ -27,15 +32,24 @@ router = APIRouter(tags=["agents"])
 
 @router.get("/agent/list", response_model=list[AgentOut])
 def list_agents(
+    response: Response,
     methodology_id: str | None = Query(
         None, description="若指定则只返回该方法论已勾选的 Agent"
     ),
+    limit: int = Depends(limit_query),
+    offset: int = Depends(offset_query),
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    return agents_svc.list_agents(
-        db, owner_user_id=user_id, methodology_id=methodology_id
+    rows, total = agents_svc.list_agents(
+        db,
+        owner_user_id=user_id,
+        methodology_id=methodology_id,
+        limit=limit,
+        offset=offset,
     )
+    set_total_count(response, total)
+    return rows
 
 
 @router.get("/agent/{agent_id}", response_model=AgentOut)

@@ -147,6 +147,12 @@ class AgentDefinition(Base):
     )
     # 额外配置 JSON（扩展字段），默认空字典
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
+    created_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
 
     llm_model: Mapped[ModelDefinition | None] = relationship(back_populates="agents")
     # 多对多：该 Agent 被哪些方法论勾选
@@ -204,6 +210,12 @@ class ToolDefinition(Base):
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
     # 工具状态（如 active / disabled），默认 active
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    created_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
 
     # 多对多：引用该工具的 Agent 列表
     agents: Mapped[list[AgentDefinition]] = relationship(
@@ -264,6 +276,12 @@ class MiddlewareDefinition(Base):
     class_path: Mapped[str] = mapped_column(String(512), nullable=False)
     # 中间件初始化配置 JSON，默认空字典
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
+    created_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
 
     # 多对多：引用该中间件的 Agent 列表
     agents: Mapped[list[AgentDefinition]] = relationship(
@@ -275,50 +293,50 @@ class MiddlewareDefinition(Base):
 class MethodologyAgent(Base):
     """方法论 ↔ 全局 Agent 多对多。"""
 
-    # 对应数据库表名（关联表）
     __tablename__ = "methodology_agent"
 
-    # 复合主键之一：方法论 ID；删除方法论时级联删除本行
     methodology_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("methodology.id", ondelete="CASCADE"), primary_key=True
     )
-    # 复合主键之二：Agent ID；删除 Agent 时级联删除本行
+    # bump / 反查「哪些方法论引用了该 Agent」走 agent_id，需独立索引
     agent_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("agent_definition.id", ondelete="CASCADE"), primary_key=True
+        String(128),
+        ForeignKey("agent_definition.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
     )
 
 
 class AgentTool(Base):
     """Agent ↔ Tool 多对多。"""
 
-    # 对应数据库表名（关联表）
     __tablename__ = "agent_tool"
 
-    # 复合主键之一：Agent ID；删除 Agent 时级联删除本行
     agent_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("agent_definition.id", ondelete="CASCADE"), primary_key=True
     )
-    # 复合主键之二：工具 ID；删除工具时级联删除本行
+    # 改工具时按 tool_id 反查 Agent，需独立索引
     tool_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("tool_definition.id", ondelete="CASCADE"), primary_key=True
+        String(128),
+        ForeignKey("tool_definition.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
     )
 
 
 class AgentMiddleware(Base):
     """Agent ↔ Middleware 多对多。"""
 
-    # 对应数据库表名（关联表）
     __tablename__ = "agent_middleware"
 
-    # 复合主键之一：Agent ID；删除 Agent 时级联删除本行
     agent_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("agent_definition.id", ondelete="CASCADE"), primary_key=True
     )
-    # 复合主键之二：中间件 ID；删除中间件时级联删除本行
     middleware_id: Mapped[str] = mapped_column(
         String(128),
         ForeignKey("middleware_definition.id", ondelete="CASCADE"),
         primary_key=True,
+        index=True,
     )
 
 
@@ -330,8 +348,12 @@ class AgentSkill(Base):
     agent_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("agent_definition.id", ondelete="CASCADE"), primary_key=True
     )
+    # 改 Skill 时按 skill_id 反查 Agent
     skill_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("skill_definition.id", ondelete="CASCADE"), primary_key=True
+        String(128),
+        ForeignKey("skill_definition.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
     )
 
 
@@ -373,9 +395,9 @@ class Conversation(Base):
     thread_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     # 会话归属用户（鉴权后强制写入）
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    # 绑定的方法论 ID（外键，非空）
+    # 绑定的方法论 ID（外键，非空）；删方法论前按此计数
     methodology_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("methodology.id"), nullable=False
+        String(128), ForeignKey("methodology.id"), nullable=False, index=True
     )
     # 会话创建时锁定的方法论版本号，保证对话期间配置一致
     methodology_version: Mapped[int] = mapped_column(Integer, nullable=False)

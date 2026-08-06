@@ -27,8 +27,6 @@ from typing import Any, Callable
 from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.prebuilt.tool_node import ToolCallRequest
 
-from deepagents_app.config import get_settings
-
 logger = logging.getLogger("deepagents_app.middleware.audit")
 
 # 需要审计的工具名集合（可按业务扩展）
@@ -45,7 +43,9 @@ SENSITIVE_TOOLS = frozenset(
 
 
 def _audit_log_path() -> Path:
-    path = get_settings().workspace_dir / "audit" / "tool_audit.jsonl"
+    from deepagents_app.workspace import get_workspace_root
+
+    path = get_workspace_root() / "audit" / "tool_audit.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

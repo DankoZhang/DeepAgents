@@ -18,13 +18,14 @@ from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from deepagents_app.config import get_settings
 from deepagents_app.utils.paths import resolve_under_root
 
 
 def _docs_root() -> Path:
     """文档默认落盘目录。"""
-    return get_settings().workspace_dir / "documents"
+    from deepagents_app.workspace import get_workspace_root
+
+    return get_workspace_root() / "documents"
 
 
 def _safe_doc_path(filename: str) -> Path:

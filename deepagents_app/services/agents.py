@@ -1,4 +1,11 @@
-"""Agent 配置管理：全局 Agent CRUD + 绑定 Tool / Middleware / Skill。"""
+"""
+Agent 配置管理
+==============
+
+全局 Agent CRUD，以及绑定 Tool / Middleware / Skill。
+Agent 本身不隶属单一方法论；方法论通过勾选引用。
+变更后默认 ``bump_related``，级联升版所有引用该方法论，保证旧会话可快照重建。
+"""
 
 from __future__ import annotations
 
@@ -19,7 +26,7 @@ from deepagents_app.db.models import (
     SkillDefinition,
     ToolDefinition,
 )
-from deepagents_app.ownership import default_model_id_for_user
+from deepagents_app.ownership import default_model_id_for_user, validate_resource_id
 from deepagents_app.services.revisions import (
     bump_methodologies_using_agent,
     bump_methodology,
@@ -31,8 +38,12 @@ def list_agents(
     *,
     owner_user_id: str,
     methodology_id: str | None = None,
-) -> list[AgentDefinition]:
-    """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。"""
+    limit: int = 200,
+    offset: int = 0,
+) -> tuple[list[AgentDefinition], int]:
+    """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。返回 (rows, total)。"""
+    from deepagents_app.api.pagination import paginate_query
+
     q = (
         db.query(AgentDefinition)
         .options(*agent_detail_options())
@@ -42,7 +53,8 @@ def list_agents(
         q = q.join(MethodologyAgent).filter(
             MethodologyAgent.methodology_id == methodology_id
         )
-    return q.order_by(AgentDefinition.name).all()
+    q = q.order_by(AgentDefinition.name)
+    return paginate_query(q, limit=limit, offset=offset)
 
 
 def get_agent(
@@ -91,12 +103,13 @@ def create_agent(
         db, model_id, owner_user_id=owner_user_id
     )
 
+    # role/enabled 存在 config JSON：默认子 Agent 且启用
     cfg = dict(config or {})
     cfg.setdefault("role", "subagent")
     cfg.setdefault("enabled", True)
 
     row = AgentDefinition(
-        id=agent_id or f"agent_{uuid.uuid4().hex[:12]}",
+        id=_resolve_agent_id(agent_id),
         owner_user_id=owner_user_id,
         name=name,
         system_prompt=system_prompt,
@@ -134,6 +147,7 @@ def update_agent(
     skill_ids: list[str] | None = None,
     bump_related: bool = True,
 ) -> AgentDefinition:
+    """更新全局 Agent；字段为 None 表示不改。改完可级联 bump 引用方法论。"""
     row = get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
@@ -183,9 +197,15 @@ def delete_agent(
     owner_user_id: str,
     bump_related: bool = True,
 ) -> None:
+    """
+    删除全局 Agent。
+
+    删除前先记下引用该方法论；关联行级联消失后，再对那些方法论升版打快照。
+    """
     row = get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
+    # 删除后 MethodologyAgent 会级联没掉，必须先收集
     methodology_ids = [
         r.methodology_id
         for r in db.query(MethodologyAgent)
@@ -210,6 +230,7 @@ def bind_agent_tools(
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
+    """绑定工具：replace=True 全量替换，False 增量追加。"""
     return _bind_and_reload(
         db,
         agent_id,
@@ -231,6 +252,7 @@ def bind_agent_middlewares(
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
+    """绑定中间件：replace=True 全量替换，False 增量追加。"""
     return _bind_and_reload(
         db,
         agent_id,
@@ -252,6 +274,7 @@ def bind_agent_skills(
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
+    """绑定 Skill：仅允许 active；replace=True 全量替换，False 增量追加。"""
     return _bind_and_reload(
         db,
         agent_id,
@@ -262,6 +285,9 @@ def bind_agent_skills(
         setter=_set_agent_skills,
         merger=_merge_agent_skills,
     )
+
+
+# ── 绑定辅助：全量替换 / 增量合并；一律校验资源归属当前用户 ─────────────
 
 
 def _bind_and_reload(
@@ -275,6 +301,7 @@ def _bind_and_reload(
     setter,
     merger,
 ) -> AgentDefinition:
+    """工具 / 中间件 / Skill 绑定的共用收尾：写关联 → 可选 bump → 重新加载详情。"""
     row = get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
@@ -296,6 +323,7 @@ def _load_owned(
     owner_user_id: str,
     missing_label: str,
 ) -> Any:
+    """加载并校验归属：只能绑定当前用户自己的目录资源。"""
     target = db.get(model, target_id)
     if target is None:
         raise NotFoundError(f"{missing_label}不存在：{target_id}")
@@ -429,6 +457,9 @@ def _merge_agent_skills(
         agent.skills.append(skill)
 
 
+# ── 模型绑定：默认模型映射 + 归属/状态校验 ─────────────────────────────
+
+
 def _resolve_model_id_for_user(
     db: Session,
     model_id: str | None,
@@ -455,3 +486,8 @@ def _validate_model_id(
     if row.status != "active":
         raise BusinessError(f"模型已禁用：{row.name}")
     return model_id
+
+
+def _resolve_agent_id(agent_id: str | None) -> str:
+    resolved = agent_id or f"agent_{uuid.uuid4().hex[:12]}"
+    return validate_resource_id(resolved, label="agent id")

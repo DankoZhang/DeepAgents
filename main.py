@@ -86,9 +86,14 @@ def _handle_interrupt(
     try:
         from langgraph.types import Command
 
-        return agent.invoke(
-            Command(resume={"decisions": [{"type": "approve"}]}), config=config
-        )
+        from deepagents_app.workspace import get_workspace_root, workspace_context
+
+        # 复用当前用户 workspace（run_once 已设置 ContextVar）
+        root = get_workspace_root()
+        with workspace_context(root):
+            return agent.invoke(
+                Command(resume={"decisions": [{"type": "approve"}]}), config=config
+            )
     except Exception as exc:  # noqa: BLE001
         console.print(
             f"[yellow]Resume 失败：{exc}。请检查 deepagents/langgraph 版本。[/yellow]"
@@ -98,14 +103,17 @@ def _handle_interrupt(
 
 def run_once(agent: Any, text: str, thread_id: str, *, user_id: str) -> None:
     from deepagents_app.ownership import checkpoint_thread_id
+    from deepagents_app.workspace import user_workspace_dir, workspace_context
 
+    settings = get_settings()
     config = {"configurable": {"thread_id": checkpoint_thread_id(user_id, thread_id)}}
     console.print(f"[dim]thread={thread_id} user={user_id}[/dim]")
     with console.status("[bold cyan]Agent 思考 / 调度中…[/bold cyan]"):
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": text}]},
-            config=config,
-        )
+        with workspace_context(user_workspace_dir(settings, user_id)):
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": text}]},
+                config=config,
+            )
     result = _handle_interrupt(agent, config, result)
     final = _extract_final_text(result)
     console.print(Panel(Markdown(final), title="Supervisor 回复", border_style="green"))

@@ -1,4 +1,11 @@
-"""Skill 目录 CRUD、物化到 workspace、变更后 bump 相关方法论。"""
+"""
+Skill 目录与物化
+================
+
+- 目录 CRUD：用户可维护 SKILL.md 正文（含 YAML frontmatter）
+- 组装时物化到 ``workspace/skills/<scope>/<agent_id>/``，供 deepagents 加载
+- 变更后默认 bump 引用该方法论；旧会话靠快照内嵌 content 重建
+"""
 
 from __future__ import annotations
 
@@ -15,13 +22,16 @@ from sqlalchemy.orm import Session
 from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.config import Settings
 from deepagents_app.db.models import AgentSkill, SkillDefinition
+from deepagents_app.ownership import validate_resource_id
 from deepagents_app.services.revisions import (
     bump_methodologies_using_skill,
-    schedule_cache_invalidation,
 )
+from deepagents_app.utils.paths import resolve_under_root
+from deepagents_app.workspace import get_workspace_root
 
 logger = logging.getLogger(__name__)
 
+# name 同时用作物化目录名，故限制字符集
 _SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
@@ -30,7 +40,12 @@ def list_skills(
     *,
     owner_user_id: str,
     status: str | None = None,
-) -> list[SkillDefinition]:
+    limit: int = 200,
+    offset: int = 0,
+) -> tuple[list[SkillDefinition], int]:
+    """列出当前用户的 Skill 目录；可按 status 过滤。返回 (rows, total)。"""
+    from deepagents_app.api.pagination import paginate_query
+
     q = (
         db.query(SkillDefinition)
         .filter(SkillDefinition.owner_user_id == owner_user_id)
@@ -38,12 +53,13 @@ def list_skills(
     )
     if status:
         q = q.filter(SkillDefinition.status == status)
-    return q.all()
+    return paginate_query(q, limit=limit, offset=offset)
 
 
 def get_skill(
     db: Session, skill_id: str, *, owner_user_id: str
 ) -> SkillDefinition | None:
+    """按主键取 Skill；不属于当前用户则视为不存在。"""
     row = db.get(SkillDefinition, skill_id)
     if row is None or row.owner_user_id != owner_user_id:
         return None
@@ -61,6 +77,11 @@ def create_skill(
     status: str = "active",
     skill_id: str | None = None,
 ) -> SkillDefinition:
+    """
+    创建 Skill。
+
+    若 ``content`` 无 YAML frontmatter，会自动用 name/description 拼一层。
+    """
     name = name.strip()
     _validate_skill_name(name)
     if (
@@ -76,11 +97,12 @@ def create_skill(
     body = (content or "").strip()
     if not body:
         raise BusinessError("Skill content 不能为空")
+    # deepagents 期望 SKILL.md 带 --- frontmatter ---
     if not body.lstrip().startswith("---"):
         body = build_skill_markdown(name=name, description=description, body=body)
 
     row = SkillDefinition(
-        id=skill_id or f"skill_{uuid.uuid4().hex[:12]}",
+        id=_resolve_skill_id(skill_id),
         owner_user_id=owner_user_id,
         name=name,
         description=(description or "").strip(),
@@ -105,6 +127,7 @@ def update_skill(
     status: str | None = None,
     bump_related: bool = True,
 ) -> SkillDefinition:
+    """更新 Skill；``bump_related=True`` 时升版所有引用该方法论。"""
     row = get_skill(db, skill_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Skill 不存在：{skill_id}")
@@ -150,7 +173,15 @@ def update_skill(
     if bump_related:
         bump_methodologies_using_skill(db, skill_id)
     else:
-        schedule_cache_invalidation(db, all_keys=True)
+        from deepagents_app.services.revisions import (
+            schedule_cache_invalidation_for_agent_ids,
+        )
+
+        agent_ids = [
+            r.agent_id
+            for r in db.query(AgentSkill).filter(AgentSkill.skill_id == skill_id).all()
+        ]
+        schedule_cache_invalidation_for_agent_ids(db, agent_ids)
     return row
 
 
@@ -161,22 +192,32 @@ def delete_skill(
     owner_user_id: str,
     bump_related: bool = True,
 ) -> None:
+    """删除 Skill；若仍被 Agent 引用且 bump_related，则级联升版那些方法论。"""
     row = get_skill(db, skill_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Skill 不存在：{skill_id}")
 
+    # 删除前记下引用：AgentSkill 会随 Skill 行级联消失
     agent_ids = [
         r.agent_id
         for r in db.query(AgentSkill).filter(AgentSkill.skill_id == skill_id).all()
     ]
     db.delete(row)
     db.flush()
-    if bump_related and agent_ids:
-        from deepagents_app.services.revisions import bump_methodologies_for_agent_ids
+    if bump_related:
+        if agent_ids:
+            from deepagents_app.services.revisions import bump_methodologies_for_agent_ids
 
-        bump_methodologies_for_agent_ids(db, agent_ids)
-    else:
-        schedule_cache_invalidation(db, all_keys=True)
+            bump_methodologies_for_agent_ids(db, agent_ids)
+    elif agent_ids:
+        from deepagents_app.services.revisions import (
+            schedule_cache_invalidation_for_agent_ids,
+        )
+
+        schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+
+
+# ── 快照还原与磁盘物化（Agent Factory 组装时调用）──────────────────────
 
 
 def skill_definition_from_snapshot(payload: dict[str, Any]) -> SkillDefinition:
@@ -209,15 +250,20 @@ def materialize_agent_skills(
     skills: list[SkillDefinition],
     *,
     scope: str,
+    workspace_root: Path | None = None,
 ) -> str | None:
     """
-    把 Agent 已绑 Skills 物化到 ``workspace/skills/<scope>/<agent_id>/<name>/SKILL.md``。
+    把 Agent 已绑 Skills 物化到
+    ``<workspace_root>/skills/<scope>/<agent_id>/<name>/SKILL.md``。
 
     Returns:
         供 ``skills=`` 使用的源目录虚拟路径；无可用 skill 返回 None。
     """
     active = [s for s in skills if (s.status or "active") == "active"]
-    root = settings.workspace_dir / "skills" / scope / agent_id
+    root = _safe_materialize_root(
+        settings, scope=scope, agent_id=agent_id, workspace_root=workspace_root
+    )
+    # 每次组装前清空，避免残留旧版 SKILL.md
     if root.exists():
         shutil.rmtree(root)
     if not active:
@@ -225,18 +271,80 @@ def materialize_agent_skills(
 
     root.mkdir(parents=True, exist_ok=True)
     for skill in active:
-        skill_dir = root / skill.name
+        try:
+            skill_dir = resolve_under_root(root, skill.name, basename_only=True)
+        except ValueError as exc:
+            raise BusinessError(f"Skill 物化路径非法：{skill.name}") from exc
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(skill.content or "", encoding="utf-8")
     return f"/skills/{scope}/{agent_id}/"
 
 
-def clear_materialized_skills(settings: Settings, *, scope: str) -> None:
+def clear_materialized_skills(
+    settings: Settings,
+    *,
+    scope: str,
+    workspace_root: Path | None = None,
+) -> None:
     """清空指定 scope 下的物化 Skills（组装前调用）。"""
-    dst = settings.workspace_dir / "skills" / scope
+    dst = _safe_materialize_root(
+        settings, scope=scope, workspace_root=workspace_root
+    )
     if dst.exists():
         shutil.rmtree(dst)
     dst.mkdir(parents=True, exist_ok=True)
+
+
+def _skills_workspace_root(
+    settings: Settings, *, workspace_root: Path | None = None
+) -> Path:
+    base = (workspace_root or get_workspace_root(settings)).resolve()
+    root = (base / "skills").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _assert_safe_path_segment(segment: str, *, label: str) -> None:
+    """拒绝 ``.`` / ``..`` / 含分隔符的路径段（防御历史脏主键）。"""
+    value = segment or ""
+    if (
+        not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or value != Path(value).name
+    ):
+        raise BusinessError(f"非法 {label} 路径段：{segment!r}")
+
+
+def _safe_materialize_root(
+    settings: Settings,
+    *,
+    scope: str,
+    agent_id: str | None = None,
+    workspace_root: Path | None = None,
+) -> Path:
+    """
+    解析物化目录，强制落在 ``<workspace_root>/skills`` 内。
+
+    ``scope`` 形如 ``<methodology_id>/v<version>``；任一段含穿越都会被拦截。
+    """
+    scope_parts = Path(scope).parts
+    if not scope_parts:
+        raise BusinessError("Skills scope 不能为空")
+    for part in scope_parts:
+        _assert_safe_path_segment(part, label="skills scope")
+    if agent_id is not None:
+        _assert_safe_path_segment(agent_id, label="agent id")
+
+    relative = f"{scope}/{agent_id}" if agent_id else scope
+    try:
+        return resolve_under_root(
+            _skills_workspace_root(settings, workspace_root=workspace_root),
+            relative,
+        )
+    except ValueError as exc:
+        raise BusinessError(f"Skills 物化路径越界：{relative}") from exc
 
 
 def build_skill_markdown(*, name: str, description: str, body: str) -> str:
@@ -277,6 +385,7 @@ def parse_skill_markdown(content: str) -> tuple[str | None, str | None]:
             continue
         if line.startswith("description:"):
             rest = line[len("description:") :].strip()
+            # 支持 YAML 多行块标量 > / |
             if rest in {">", "|", ""}:
                 parts: list[str] = []
                 i += 1
@@ -335,7 +444,13 @@ def import_skill_from_file(
 
 
 def _validate_skill_name(name: str) -> None:
+    """校验 Skill name：既是展示名，也是物化目录名。"""
     if not _SKILL_NAME_RE.match(name):
         raise BusinessError(
             "Skill name 须为字母/数字开头，仅含字母数字、连字符、下划线（亦作物化目录名）"
         )
+
+
+def _resolve_skill_id(skill_id: str | None) -> str:
+    resolved = skill_id or f"skill_{uuid.uuid4().hex[:12]}"
+    return validate_resource_id(resolved, label="skill id")

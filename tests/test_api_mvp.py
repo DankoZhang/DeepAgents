@@ -331,6 +331,139 @@ def test_methodology_publish_and_version_lock(client):
     assert len(versions) >= 2
 
 
+def test_draft_agent_edit_does_not_bump_version(client):
+    """草稿方法论：被引用 Agent 变更只覆盖快照，不升版。"""
+    client.post(
+        "/api/methodology",
+        json={"name": "草稿累积", "id": "draft_accum"},
+    )
+    agent = client.post(
+        "/api/agent",
+        json={
+            "name": "da-supervisor",
+            "system_prompt": "v1",
+            "config": {"role": "supervisor"},
+        },
+    ).json()
+    client.post(
+        "/api/methodology/draft_accum/agents",
+        json={"agent_ids": [agent["id"]], "replace": True},
+    )
+    before = client.get("/api/methodology/draft_accum").json()
+    assert before["status"] == "draft"
+    v0 = before["version"]
+
+    client.patch(
+        f"/api/agent/{agent['id']}",
+        json={"system_prompt": "v2-draft"},
+    )
+    after = client.get("/api/methodology/draft_accum").json()
+    assert after["version"] == v0
+
+    # 发布后同样变更应升版
+    published = client.post("/api/methodology/draft_accum/publish").json()
+    assert published["status"] == "published"
+    assert published["version"] == v0
+    client.patch(
+        f"/api/agent/{agent['id']}",
+        json={"system_prompt": "v3-published"},
+    )
+    bumped = client.get("/api/methodology/draft_accum").json()
+    assert bumped["version"] > v0
+
+
+def test_agent_cache_lru_evicts_and_drops_build_lock(tmp_path, monkeypatch):
+    """缓存超额时按 LRU 淘汰，并释放对应构建锁。"""
+    from deepagents_app import config
+    from deepagents_app.services import agent_factory as af
+
+    monkeypatch.setenv("AGENT_CACHE_MAX_SIZE", "2")
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspace"))
+    config.get_settings.cache_clear()
+    af.invalidate_agent_cache()
+
+    af._cache_put("m1:v1", "A")
+    af._build_lock_for("m1:v1")
+    af._cache_put("m2:v1", "B")
+    af._build_lock_for("m2:v1")
+    evicted = af._cache_put("m3:v1", "C")
+    assert evicted == ["m1:v1"]
+    for key in evicted:
+        af._cleanup_evicted_key(key)
+    assert "m1:v1" not in af._cache
+    assert "m1:v1" not in af._build_locks
+    assert list(af._cache.keys()) == ["m2:v1", "m3:v1"]
+    af.invalidate_agent_cache()
+    config.get_settings.cache_clear()
+
+
+def test_revision_prune_keeps_referenced_versions(client, monkeypatch):
+    """升版后裁剪历史；会话锁定版本与 live 当前版不会被删。"""
+    from deepagents_app import config
+
+    monkeypatch.setenv("METHODOLOGY_REVISION_KEEP", "1")
+    config.get_settings.cache_clear()
+
+    client.post("/api/methodology", json={"name": "裁剪", "id": "prune_meth"})
+    agent = client.post(
+        "/api/agent",
+        json={
+            "name": "prune-sup",
+            "system_prompt": "s0",
+            "config": {"role": "supervisor"},
+        },
+    ).json()
+    client.post(
+        "/api/methodology/prune_meth/agents",
+        json={"agent_ids": [agent["id"]], "replace": True},
+    )
+    client.post("/api/methodology/prune_meth/publish")
+    v_pub = client.get("/api/methodology/prune_meth").json()["version"]
+    conv = client.post(
+        "/api/conversation",
+        json={"methodology_id": "prune_meth"},
+    ).json()
+    assert conv["methodology_version"] == v_pub
+
+    for i in range(4):
+        client.patch(
+            f"/api/agent/{agent['id']}",
+            json={"system_prompt": f"s{i+1}"},
+        )
+
+    versions = client.get("/api/methodology/prune_meth/versions").json()
+    version_nums = {v["version"] for v in versions}
+    live = client.get("/api/methodology/prune_meth").json()["version"]
+    # 会话锁定版 + live 版必须保留；其余按 keep=1 裁剪
+    assert v_pub in version_nums
+    assert live in version_nums
+    assert len(versions) <= 3  # referenced + live + at most 1 recent extra
+    config.get_settings.cache_clear()
+
+
+def test_delete_conversation_clears_checkpointer(client):
+    """删除会话后元数据清除，同 thread_id 可再次创建。"""
+    from deepagents_app.ownership import demo_methodology_id_for_user
+
+    mid = demo_methodology_id_for_user(TEST_USER)
+    created = client.post(
+        "/api/conversation",
+        json={"methodology_id": mid, "thread_id": "del_cp_thread_1"},
+    ).json()
+    tid = created["thread_id"]
+
+    deleted = client.delete(f"/api/conversation/{tid}")
+    assert deleted.status_code == 200
+    assert client.get(f"/api/conversation/{tid}").status_code == 404
+
+    again = client.post(
+        "/api/conversation",
+        json={"methodology_id": mid, "thread_id": tid},
+    )
+    assert again.status_code == 200
+    assert again.json()["thread_id"] == tid
+
+
 def test_snapshot_locks_skill_and_tool_payloads(client, demo_ids):
     """快照内嵌 Skill/Tool 正文与配置；目录后续修改不影响旧版本重建。"""
     from deepagents_app.db.models import ToolDefinition
@@ -434,3 +567,230 @@ def test_snapshot_locks_skill_and_tool_payloads(client, demo_ids):
         _, _, _, _, tools, _, skill_rows = _resolve_runtime_bindings(resolve_agent)
         assert "skill body v1" in skill_rows[0].content
         assert any(getattr(t, "name", None) == "create_document" for t in tools)
+
+
+def test_reject_path_traversal_ids(client):
+    """客户端自带主键含路径穿越字符时拒绝创建。"""
+    bad = client.post(
+        "/api/methodology",
+        json={"name": "pwn", "id": "../../../../PWNED"},
+    )
+    assert bad.status_code == 400
+
+    bad_agent = client.post(
+        "/api/agent",
+        json={
+            "name": "pwn-sup",
+            "id": "../../PWNAGENT",
+            "system_prompt": "x",
+            "config": {"role": "supervisor"},
+        },
+    )
+    assert bad_agent.status_code == 400
+
+    ok = client.post(
+        "/api/methodology",
+        json={"name": "safe-id", "id": "safe_methodology_1"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["id"] == "safe_methodology_1"
+
+
+def test_skills_materialize_rejects_escaped_scope(tmp_path, monkeypatch):
+    """即便历史脏数据进入物化，也不得 rmtree workspace 之外。"""
+    from deepagents_app import config
+    from deepagents_app.api.errors import BusinessError
+    from deepagents_app.config import Settings
+    from deepagents_app.services.skills import (
+        clear_materialized_skills,
+        materialize_agent_skills,
+    )
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    settings = Settings(workspace_dir=ws)
+    config.get_settings.cache_clear()
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+
+    with pytest.raises(BusinessError):
+        clear_materialized_skills(settings, scope="../../../../outside")
+    with pytest.raises(BusinessError):
+        materialize_agent_skills(
+            settings, "../../PWNAGENT", [], scope="safe_mid/v1"
+        )
+    with pytest.raises(BusinessError):
+        materialize_agent_skills(
+            settings, "agent_ok", [], scope="../../evil/v1"
+        )
+    # 合法路径应只落在 workspace/skills 下
+    from deepagents_app.services.skills import _safe_materialize_root
+
+    root = _safe_materialize_root(
+        settings, scope="safe_mid/v1", agent_id="agent_ok"
+    )
+    assert root.is_relative_to((ws / "skills").resolve())
+    assert not (tmp_path / "outside").exists()
+    assert not (tmp_path / "evil").exists()
+    assert not (ws.parent / "PWNAGENT").exists()
+
+
+def test_create_lonely_agent_does_not_flush_all_cache(client):
+    """新建未被方法论引用的 Agent 不应清空全体编译缓存。"""
+    import deepagents_app.services.agent_factory as af
+
+    af._cache["someone_else:v1"] = "OTHER"
+    af._cache["mine:v3"] = "MINE"
+    created = client.post(
+        "/api/agent",
+        json={
+            "name": "lonely-agent-cache",
+            "system_prompt": "x",
+            "config": {"role": "subagent"},
+        },
+    )
+    assert created.status_code == 200
+    assert af._cache.get("someone_else:v1") == "OTHER"
+    assert af._cache.get("mine:v3") == "MINE"
+
+
+def test_openai_compatible_extra_base_url_no_typeerror():
+    """extra 含 base_url 时不应与显式参数撞车。"""
+    from deepagents_app.config import Settings
+    from deepagents_app.llm import build_chat_model
+
+    settings = Settings(
+        model_provider="openai_compatible",
+        model_name="demo",
+        openai_base_url="http://fallback",
+    )
+    model = build_chat_model(
+        settings,
+        provider="openai_compatible",
+        model_name="x",
+        base_url="http://a",
+        api_key="k",
+        extra={"base_url": "http://b", "api_key": "from-extra"},
+    )
+    # 显式参数优先；不应抛 TypeError
+    assert getattr(model, "openai_api_base", None) in {
+        "http://a",
+        "http://a/",
+    } or str(getattr(model, "openai_api_base", "")).startswith("http://a")
+
+
+def test_model_api_key_encrypted_at_rest(client, tmp_path):
+    """模型 api_key 落库应为 enc:v1: 密文，响应不回传明文。"""
+    from deepagents_app.crypto import decrypt_secret
+    from deepagents_app.db.models import ModelDefinition
+    from deepagents_app.db.session import get_session_factory
+
+    created = client.post(
+        "/api/model",
+        json={
+            "name": "enc-model",
+            "provider": "openai_compatible",
+            "model_name": "demo",
+            "api_key": "sk-plain-secret",
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["has_api_key"] is True
+    assert "api_key" not in created.json()
+
+    factory = get_session_factory()
+    db = factory()
+    try:
+        row = db.get(ModelDefinition, created.json()["id"])
+        assert row is not None
+        assert row.api_key is not None
+        assert row.api_key.startswith("enc:v1:")
+        assert "sk-plain-secret" not in row.api_key
+        assert decrypt_secret(row.api_key) == "sk-plain-secret"
+    finally:
+        db.close()
+
+
+def test_user_workspace_and_skills_materialize_isolation(tmp_path, monkeypatch):
+    """不同用户物化到各自 workspace/users/<scope>/skills 下。"""
+    from deepagents_app import config
+    from deepagents_app.config import Settings
+    from deepagents_app.db.models import SkillDefinition
+    from deepagents_app.ownership import user_scope_key
+    from deepagents_app.services.skills import materialize_agent_skills
+    from deepagents_app.workspace import (
+        interprocess_lock,
+        skills_materialize_lock,
+        user_workspace_dir,
+    )
+
+    ws = tmp_path / "workspace"
+    settings = Settings(workspace_dir=ws)
+    config.get_settings.cache_clear()
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+
+    skill = SkillDefinition(
+        id="sk1",
+        owner_user_id="u1",
+        name="demo-skill",
+        description="d",
+        content="---\nname: demo-skill\ndescription: d\n---\nbody",
+        config={},
+        status="active",
+    )
+    u1 = user_workspace_dir(settings, "user-a")
+    u2 = user_workspace_dir(settings, "user-b")
+    assert u1 != u2
+    assert user_scope_key("user-a") in str(u1)
+
+    scope = "meth_a/v1"
+    lock_path = skills_materialize_lock(u1, scope)
+    with interprocess_lock(lock_path):
+        path = materialize_agent_skills(
+            settings,
+            "agent1",
+            [skill],
+            scope=scope,
+            workspace_root=u1,
+        )
+    assert path == "/skills/meth_a/v1/agent1/"
+    skill_file = u1 / "skills" / "meth_a" / "v1" / "agent1" / "demo-skill" / "SKILL.md"
+    assert skill_file.is_file()
+    assert not (u2 / "skills" / "meth_a").exists()
+    assert lock_path.is_file()
+
+
+def test_general_purpose_subagent_spec_and_no_global_profile():
+    """组装侧提供 general-purpose；factory 不再导出全局注册函数。"""
+    import deepagents_app.factory as factory
+
+    assert not hasattr(factory, "configure_general_purpose_profile")
+    spec = factory.build_general_purpose_subagent(
+        model="sentinel-model",
+        specialist_names=["researcher", "coder"],
+    )
+    assert spec["name"] == "general-purpose"
+    assert spec["model"] == "sentinel-model"
+    assert "researcher" in spec["description"]
+    assert "coder" in spec["description"]
+
+
+def test_cache_key_includes_user_scope():
+    """缓存键带用户 scope，清理路径指向 users/<uhash>。"""
+    from deepagents_app.ownership import user_scope_key
+    from deepagents_app.services import agent_factory as af
+
+    key = af.cache_key("alice", "meth1", 3)
+    assert key == f"{user_scope_key('alice')}:meth1:v3"
+    parsed = af._parse_cache_key(key)
+    assert parsed == (user_scope_key("alice"), "meth1", 3)
+
+
+def test_list_pagination_headers(client):
+    """列表支持 limit/offset，并通过 X-Total-Count 返回总数。"""
+    r = client.get("/api/methodology/list", params={"limit": 1, "offset": 0})
+    assert r.status_code == 200
+    assert "X-Total-Count" in r.headers
+    assert int(r.headers["X-Total-Count"]) >= 1
+    assert len(r.json()) == 1
+
+

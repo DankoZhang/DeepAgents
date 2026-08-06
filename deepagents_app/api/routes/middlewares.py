@@ -7,10 +7,15 @@ Middleware API（只读）
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 
 from deepagents_app.api.deps import require_user
+from deepagents_app.api.pagination import (
+    limit_query,
+    offset_query,
+    set_total_count,
+)
 from deepagents_app.api.schemas import MiddlewareOut
 from deepagents_app.db.session import get_db
 from deepagents_app.services import middlewares as mw_svc
@@ -20,10 +25,17 @@ router = APIRouter(tags=["middlewares"])
 
 @router.get("/middleware/list", response_model=list[MiddlewareOut])
 def list_middlewares(
+    response: Response,
+    limit: int = Depends(limit_query),
+    offset: int = Depends(offset_query),
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    return mw_svc.list_middlewares(db, owner_user_id=user_id)
+    rows, total = mw_svc.list_middlewares(
+        db, owner_user_id=user_id, limit=limit, offset=offset
+    )
+    set_total_count(response, total)
+    return rows
 
 
 @router.get("/middleware/{middleware_id}", response_model=MiddlewareOut)

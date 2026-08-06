@@ -1,4 +1,12 @@
-"""大模型目录 CRUD、连通性测试、变更后 bump 相关方法论。"""
+"""
+大模型目录
+==========
+
+- CRUD：用户维护可用模型（provider / base_url / 超参）
+- 连通性测试：不落库，仅验证配置能否发起调用
+- 变更后 bump 引用该模型的方法论，旧会话靠快照 llm 重建
+- 组装时 ``resolve_model_spec_for_agent``：快照 llm → 目录 → Settings 默认
+"""
 
 from __future__ import annotations
 
@@ -11,9 +19,10 @@ from sqlalchemy.orm import Session
 
 from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.config import Settings, get_settings
+from deepagents_app.crypto import decrypt_secret, encrypt_secret, secret_is_present
 from deepagents_app.db.models import AgentDefinition, ModelDefinition
 from deepagents_app.llm import build_chat_model, model_spec_from_row
-from deepagents_app.ownership import default_model_id_for_user
+from deepagents_app.ownership import default_model_id_for_user, validate_resource_id
 from deepagents_app.utils.text import normalize_message_content
 
 logger = logging.getLogger(__name__)
@@ -26,7 +35,12 @@ def list_models(
     *,
     owner_user_id: str,
     status: str | None = None,
-) -> list[ModelDefinition]:
+    limit: int = 200,
+    offset: int = 0,
+) -> tuple[list[ModelDefinition], int]:
+    """列出当前用户的模型目录；可按 status 过滤。返回 (rows, total)。"""
+    from deepagents_app.api.pagination import paginate_query
+
     q = (
         db.query(ModelDefinition)
         .filter(ModelDefinition.owner_user_id == owner_user_id)
@@ -34,12 +48,13 @@ def list_models(
     )
     if status:
         q = q.filter(ModelDefinition.status == status)
-    return q.all()
+    return paginate_query(q, limit=limit, offset=offset)
 
 
 def get_model(
     db: Session, model_id: str, *, owner_user_id: str
 ) -> ModelDefinition | None:
+    """按主键取模型；不属于当前用户则视为不存在。"""
     row = db.get(ModelDefinition, model_id)
     if row is None or row.owner_user_id != owner_user_id:
         return None
@@ -64,6 +79,7 @@ def create_model(
     status: str = "active",
     model_id: str | None = None,
 ) -> ModelDefinition:
+    """创建模型目录项；同用户下 name 唯一。"""
     _validate_provider(provider, base_url=base_url)
     existing = (
         db.query(ModelDefinition)
@@ -77,12 +93,12 @@ def create_model(
         raise BusinessError(f"已存在同名模型配置：{name}")
 
     row = ModelDefinition(
-        id=model_id or f"model_{uuid.uuid4().hex[:12]}",
+        id=_resolve_model_create_id(model_id),
         owner_user_id=owner_user_id,
         name=name,
         provider=provider,
         model_name=model_name,
-        api_key=api_key,
+        api_key=encrypt_secret(api_key),
         base_url=base_url,
         temperature=temperature,
         top_p=top_p,
@@ -117,6 +133,12 @@ def update_model(
     status: str | None = None,
     bump_related: bool = True,
 ) -> ModelDefinition:
+    """
+    更新模型；字段为 None 表示不改。
+
+    ``clear_api_key=True`` 显式清空密钥（与传空字符串区分）。
+    ``bump_related=True`` 时升版所有引用该模型的方法论。
+    """
     row = get_model(db, model_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"模型不存在：{model_id}")
@@ -142,7 +164,7 @@ def update_model(
     if clear_api_key:
         row.api_key = None
     elif api_key is not None:
-        row.api_key = api_key or None
+        row.api_key = encrypt_secret(api_key or None)
     if base_url is not None:
         row.base_url = base_url or None
     if temperature is not None:
@@ -156,6 +178,7 @@ def update_model(
     if timeout is not None:
         row.timeout = timeout
     if config is not None:
+        # 浅合并：保留未提交的既有键
         merged = dict(row.config or {})
         merged.update(config)
         row.config = merged
@@ -178,8 +201,9 @@ def delete_model(
     model_id: str,
     *,
     owner_user_id: str,
-    bump_related: bool = True,
+    bump_related: bool = True,  # noqa: ARG001 — 保留签名；无引用时无需 bump
 ) -> None:
+    """删除模型；仍被 Agent 引用时拒绝，需先改绑或删 Agent。"""
     row = get_model(db, model_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"模型不存在：{model_id}")
@@ -197,10 +221,7 @@ def delete_model(
         more = "" if len(agents) <= 5 else f" 等 {len(agents)} 个"
         raise BusinessError(f"模型仍被 Agent 引用，无法删除：{names}{more}")
 
-    if bump_related:
-        from deepagents_app.services.revisions import schedule_cache_invalidation
-
-        schedule_cache_invalidation(db, all_keys=True)
+    # 无 Agent 引用：无需 bump / 清缓存
     db.delete(row)
     db.flush()
 
@@ -218,7 +239,7 @@ def test_model_connectivity(
     timeout: float | None = 30.0,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """对给定配置发起一次极简调用，验证连通性。"""
+    """对给定配置发起一次极简调用，验证连通性（不写库）。"""
     settings = settings or get_settings()
     _validate_provider(provider, base_url=base_url)
     try:
@@ -254,6 +275,7 @@ def test_model_connectivity(
 def test_model_by_id(
     db: Session, model_id: str, *, owner_user_id: str
 ) -> dict[str, Any]:
+    """按目录 id 测连通性；disabled 模型直接返回失败说明。"""
     row = get_model(db, model_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"模型不存在：{model_id}")
@@ -266,7 +288,7 @@ def test_model_by_id(
     return test_model_connectivity(
         provider=row.provider,
         model_name=row.model_name,
-        api_key=row.api_key,
+        api_key=decrypt_secret(row.api_key),
         base_url=row.base_url,
         temperature=row.temperature,
         top_p=row.top_p,
@@ -276,12 +298,19 @@ def test_model_by_id(
     )
 
 
+# ── 组装解析：快照/目录 → 可调用的 ChatModel ──────────────────────────
+
+
 def serialize_model_for_snapshot(
     row: ModelDefinition | None,
     *,
     include_secrets: bool = False,
 ) -> dict[str, Any] | None:
-    """写入方法论快照的模型配置（默认不含 api_key，重建时按 model_id 回填）。"""
+    """
+    写入方法论快照的模型配置。
+
+    默认不含 api_key：重建时按 model_id 从 live 目录回填密钥。
+    """
     if row is None:
         return None
     payload = {
@@ -298,7 +327,7 @@ def serialize_model_for_snapshot(
         "extra": dict(row.config or {}),
     }
     if include_secrets:
-        payload["api_key"] = row.api_key
+        payload["api_key"] = decrypt_secret(row.api_key)
     return payload
 
 
@@ -312,17 +341,24 @@ def resolve_model_spec_for_agent(
     """
     组装 Agent 时解析最终模型 spec。
 
-    优先级：快照 llm（补全 api_key）> model_id 目录；皆无则返回 None（回退 Settings）。
+    优先级：快照 llm（缺 api_key 则按 model_id 回填并解密）> model_id 目录；
+    皆无则返回 None（上层回退 Settings/.env）。
     """
     if snapshot_llm:
         spec = dict(snapshot_llm)
         mid = spec.get("model_id")
+        # 快照通常不存密钥，组装时从 live 目录补回
         if mid and not spec.get("api_key"):
             live = get_model(db, str(mid), owner_user_id=owner_user_id)
             if live is not None:
-                spec["api_key"] = live.api_key
+                spec["api_key"] = decrypt_secret(live.api_key)
                 if not spec.get("base_url"):
                     spec["base_url"] = live.base_url
+        elif spec.get("api_key"):
+            try:
+                spec["api_key"] = decrypt_secret(str(spec["api_key"]))
+            except ValueError:
+                pass
         return spec
 
     if model_id:
@@ -343,7 +379,7 @@ def ensure_default_model_from_settings(
     owner_user_id: str,
     model_id: str | None = None,
 ) -> ModelDefinition:
-    """幂等：用 Settings/.env 种子一条默认模型目录项。"""
+    """幂等：用 Settings/.env 种子一条该用户的默认模型目录项。"""
     settings = settings or get_settings()
     resolved_id = (
         model_id if model_id is not None else default_model_id_for_user(owner_user_id)
@@ -368,7 +404,13 @@ def ensure_default_model_from_settings(
 
 
 def _validate_provider(provider: str, *, base_url: str | None) -> None:
+    """校验 provider 枚举；base_url 参数保留供后续扩展校验。"""
     if provider not in ALLOWED_PROVIDERS:
         raise BusinessError(
             f"不支持的 provider：{provider}，可选：{', '.join(sorted(ALLOWED_PROVIDERS))}"
         )
+
+
+def _resolve_model_create_id(model_id: str | None) -> str:
+    resolved = model_id or f"model_{uuid.uuid4().hex[:12]}"
+    return validate_resource_id(resolved, label="model id")

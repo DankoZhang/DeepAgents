@@ -82,6 +82,9 @@ def build_chat_model(
         if not url:
             raise BusinessError("openai_compatible 模式必须设置 base_url / OPENAI_BASE_URL")
         key = api_key if api_key is not None else settings.openai_api_key
+        # 写入 kwargs（覆盖 extra 同名键），避免 ChatOpenAI(api_key=..., **kwargs) 重复传参
+        kwargs["api_key"] = key or "EMPTY"
+        kwargs["base_url"] = url
         logger.info(
             "使用兼容 OpenAI API 的模型：%s @ %s (temp=%s top_p=%s max_tokens=%s)",
             name,
@@ -90,11 +93,7 @@ def build_chat_model(
             top_p,
             max_tokens,
         )
-        return ChatOpenAI(
-            api_key=key or "EMPTY",
-            base_url=url,
-            **kwargs,
-        )
+        return ChatOpenAI(**kwargs)
 
     if resolved_provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
@@ -115,11 +114,13 @@ def build_chat_model(
 
 
 def model_spec_from_row(row: Any) -> dict[str, Any]:
-    """ORM ModelDefinition → build_chat_model 可用的参数字典（含密钥，仅服务端用）。"""
+    """ORM ModelDefinition → build_chat_model 可用的参数字典（含解密后密钥）。"""
+    from deepagents_app.crypto import decrypt_secret
+
     return {
         "provider": row.provider,
         "model_name": row.model_name,
-        "api_key": row.api_key,
+        "api_key": decrypt_secret(row.api_key),
         "base_url": row.base_url,
         "temperature": row.temperature,
         "top_p": row.top_p,
