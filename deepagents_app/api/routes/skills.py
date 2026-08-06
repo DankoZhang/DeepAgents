@@ -36,42 +36,31 @@ def get_skill(skill_id: str, db: Session = Depends(get_db)):
 
 @router.post("/skill", response_model=SkillOut)
 def create_skill(body: SkillCreate, db: Session = Depends(get_db)):
-    try:
-        return skills_svc.create_skill(
-            db,
-            name=body.name,
-            description=body.description,
-            content=body.content,
-            config=body.config,
-            status=body.status,
-            skill_id=body.id,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return skills_svc.create_skill(
+        db,
+        name=body.name,
+        description=body.description,
+        content=body.content,
+        config=body.config,
+        status=body.status,
+        skill_id=body.id,
+    )
 
 
 @router.patch("/skill/{skill_id}", response_model=SkillOut)
 def update_skill(skill_id: str, body: SkillUpdate, db: Session = Depends(get_db)):
-    try:
-        return skills_svc.update_skill(
-            db,
-            skill_id,
-            name=body.name,
-            description=body.description,
-            content=body.content,
-            config=body.config,
-            status=body.status,
-        )
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return skills_svc.update_skill(
+        db,
+        skill_id,
+        name=body.name,
+        description=body.description,
+        content=body.content,
+        config=body.config,
+        status=body.status,
+    )
 
 
 @router.delete("/skill/{skill_id}")
 def delete_skill(skill_id: str, db: Session = Depends(get_db)):
-    try:
-        skills_svc.delete_skill(db, skill_id)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    skills_svc.delete_skill(db, skill_id)
     return {"ok": True}

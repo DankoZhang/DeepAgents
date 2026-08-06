@@ -180,14 +180,14 @@ def bind_agent_tools(
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
-    row = get_agent(db, agent_id)
-    if row is None:
-        raise LookupError(f"Agent 不存在：{agent_id}")
-    _bind_tools(db, agent_id, tool_ids, replace=replace)
-    db.flush()
-    if bump_related:
-        bump_methodologies_using_agent(db, agent_id)
-    return get_agent(db, agent_id)  # type: ignore[return-value]
+    return _bind_and_reload(
+        db,
+        agent_id,
+        tool_ids,
+        replace=replace,
+        bump_related=bump_related,
+        binder=_bind_tools,
+    )
 
 
 def bind_agent_middlewares(
@@ -198,14 +198,14 @@ def bind_agent_middlewares(
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
-    row = get_agent(db, agent_id)
-    if row is None:
-        raise LookupError(f"Agent 不存在：{agent_id}")
-    _bind_middlewares(db, agent_id, middleware_ids, replace=replace)
-    db.flush()
-    if bump_related:
-        bump_methodologies_using_agent(db, agent_id)
-    return get_agent(db, agent_id)  # type: ignore[return-value]
+    return _bind_and_reload(
+        db,
+        agent_id,
+        middleware_ids,
+        replace=replace,
+        bump_related=bump_related,
+        binder=_bind_middlewares,
+    )
 
 
 def bind_agent_skills(
@@ -216,14 +216,63 @@ def bind_agent_skills(
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
+    return _bind_and_reload(
+        db,
+        agent_id,
+        skill_ids,
+        replace=replace,
+        bump_related=bump_related,
+        binder=_bind_skills,
+    )
+
+
+def _bind_and_reload(
+    db: Session,
+    agent_id: str,
+    target_ids: list[str],
+    *,
+    replace: bool,
+    bump_related: bool,
+    binder,
+) -> AgentDefinition:
     row = get_agent(db, agent_id)
     if row is None:
         raise LookupError(f"Agent 不存在：{agent_id}")
-    _bind_skills(db, agent_id, skill_ids, replace=replace)
+    binder(db, agent_id, target_ids, replace=replace)
     db.flush()
     if bump_related:
         bump_methodologies_using_agent(db, agent_id)
     return get_agent(db, agent_id)  # type: ignore[return-value]
+
+
+def _bind_links(
+    db: Session,
+    agent_id: str,
+    target_ids: list[str],
+    *,
+    replace: bool,
+    link_model: type,
+    target_model: type,
+    link_fk: str,
+    missing_label: str,
+    validate_target=None,
+) -> None:
+    """通用 Agent ↔ 目标实体多对多绑定。"""
+    if replace:
+        db.query(link_model).filter(link_model.agent_id == agent_id).delete()
+    for tid in target_ids:
+        target = db.get(target_model, tid)
+        if target is None:
+            raise LookupError(f"{missing_label}不存在：{tid}")
+        if validate_target is not None:
+            validate_target(target)
+        exists = (
+            db.query(link_model)
+            .filter_by(agent_id=agent_id, **{link_fk: tid})
+            .one_or_none()
+        )
+        if exists is None:
+            db.add(link_model(agent_id=agent_id, **{link_fk: tid}))
 
 
 def _bind_tools(
@@ -233,19 +282,16 @@ def _bind_tools(
     *,
     replace: bool,
 ) -> None:
-    if replace:
-        db.query(AgentTool).filter(AgentTool.agent_id == agent_id).delete()
-    for tid in tool_ids:
-        tool = db.get(ToolDefinition, tid)
-        if tool is None:
-            raise LookupError(f"工具不存在：{tid}")
-        exists = (
-            db.query(AgentTool)
-            .filter(AgentTool.agent_id == agent_id, AgentTool.tool_id == tid)
-            .one_or_none()
-        )
-        if exists is None:
-            db.add(AgentTool(agent_id=agent_id, tool_id=tid))
+    _bind_links(
+        db,
+        agent_id,
+        tool_ids,
+        replace=replace,
+        link_model=AgentTool,
+        target_model=ToolDefinition,
+        link_fk="tool_id",
+        missing_label="工具",
+    )
 
 
 def _bind_middlewares(
@@ -255,22 +301,16 @@ def _bind_middlewares(
     *,
     replace: bool,
 ) -> None:
-    if replace:
-        db.query(AgentMiddleware).filter(AgentMiddleware.agent_id == agent_id).delete()
-    for mid in middleware_ids:
-        mw = db.get(MiddlewareDefinition, mid)
-        if mw is None:
-            raise LookupError(f"中间件不存在：{mid}")
-        exists = (
-            db.query(AgentMiddleware)
-            .filter(
-                AgentMiddleware.agent_id == agent_id,
-                AgentMiddleware.middleware_id == mid,
-            )
-            .one_or_none()
-        )
-        if exists is None:
-            db.add(AgentMiddleware(agent_id=agent_id, middleware_id=mid))
+    _bind_links(
+        db,
+        agent_id,
+        middleware_ids,
+        replace=replace,
+        link_model=AgentMiddleware,
+        target_model=MiddlewareDefinition,
+        link_fk="middleware_id",
+        missing_label="中间件",
+    )
 
 
 def _bind_skills(
@@ -280,21 +320,21 @@ def _bind_skills(
     *,
     replace: bool,
 ) -> None:
-    if replace:
-        db.query(AgentSkill).filter(AgentSkill.agent_id == agent_id).delete()
-    for sid in skill_ids:
-        skill = db.get(SkillDefinition, sid)
-        if skill is None:
-            raise LookupError(f"Skill 不存在：{sid}")
+    def _check_active(skill: SkillDefinition) -> None:
         if skill.status != "active":
             raise ValueError(f"Skill 已禁用：{skill.name}")
-        exists = (
-            db.query(AgentSkill)
-            .filter(AgentSkill.agent_id == agent_id, AgentSkill.skill_id == sid)
-            .one_or_none()
-        )
-        if exists is None:
-            db.add(AgentSkill(agent_id=agent_id, skill_id=sid))
+
+    _bind_links(
+        db,
+        agent_id,
+        skill_ids,
+        replace=replace,
+        link_model=AgentSkill,
+        target_model=SkillDefinition,
+        link_fk="skill_id",
+        missing_label="Skill",
+        validate_target=_check_active,
+    )
 
 
 def _validate_model_id(db: Session, model_id: str | None) -> str | None:

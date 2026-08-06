@@ -323,9 +323,7 @@ def _validate_provider(provider: str, *, base_url: str | None) -> None:
         raise ValueError(
             f"不支持的 provider：{provider}，可选：{', '.join(sorted(ALLOWED_PROVIDERS))}"
         )
-    if provider == "openai_compatible" and not base_url:
-        # 允许创建时为空，运行时再回退 Settings；这里仅告警级校验放宽
-        pass
+    # openai_compatible 允许创建时 base_url 为空，运行时回退 Settings.openai_base_url
 
 
 def _bump_methodologies_using_model(db: Session, model_id: str) -> None:

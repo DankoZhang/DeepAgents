@@ -35,11 +35,8 @@ from deepagents_app.factory import (
     sync_memory_into_workspace,
 )
 from deepagents_app.llm import build_chat_model_from_spec
-from deepagents_app.registries.middleware import (
-    load_middleware_object,
-    load_middlewares_by_ids,
-)
-from deepagents_app.registries.tools import expand_tool_definition, load_tools_by_ids
+from deepagents_app.registries.middleware import load_middlewares_by_ids
+from deepagents_app.registries.tools import load_tools_by_ids
 from deepagents_app.services.llm_models import resolve_model_spec_for_agent
 from deepagents_app.services.revisions import get_revision
 
@@ -109,82 +106,79 @@ def get_methodology_config(
     return methodology
 
 
-def _agent_role(agent: AgentDefinition | dict[str, Any]) -> str:
-    """读取 Agent 角色：supervisor / subagent（默认 subagent）。"""
+def _normalize_agent_spec(agent: AgentDefinition | dict[str, Any]) -> dict[str, Any]:
+    """live ORM → 与 snapshot 同形的 dict，下游只保留一条组装路径。"""
     if isinstance(agent, dict):
-        cfg = agent.get("config") or {}
-    else:
-        cfg = agent.config or {}
+        return agent
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "system_prompt": agent.system_prompt,
+        "model_id": agent.model_id,
+        "llm": None,
+        "config": dict(agent.config or {}),
+        "tool_ids": [t.id for t in agent.tools],
+        "middleware_ids": [m.id for m in agent.middlewares],
+        "skill_ids": [s.id for s in agent.skills],
+    }
+
+
+def _agent_role(agent: dict[str, Any]) -> str:
+    """读取 Agent 角色：supervisor / subagent（默认 subagent）。"""
+    cfg = agent.get("config") or {}
     return str(cfg.get("role", "subagent")).lower()
 
 
-def _agent_enabled(agent: AgentDefinition | dict[str, Any]) -> bool:
+def _agent_enabled(agent: dict[str, Any]) -> bool:
     """是否启用：enabled=false 时组装阶段跳过。"""
-    if isinstance(agent, dict):
-        cfg = agent.get("config") or {}
-    else:
-        cfg = agent.config or {}
+    cfg = agent.get("config") or {}
     return bool(cfg.get("enabled", True))
 
 
 def _chat_model_for_agent(
     db: Session,
     settings: Settings,
-    agent: AgentDefinition | dict[str, Any],
+    agent: dict[str, Any],
 ) -> Any:
     """Supervisor / SubAgent 共用：快照 llm → model_id 目录 → Settings 默认。"""
-    if isinstance(agent, dict):
-        spec = resolve_model_spec_for_agent(
-            db,
-            model_id=agent.get("model_id"),
-            snapshot_llm=agent.get("llm"),
-        )
-    else:
-        spec = resolve_model_spec_for_agent(db, model_id=agent.model_id)
+    spec = resolve_model_spec_for_agent(
+        db,
+        model_id=agent.get("model_id"),
+        snapshot_llm=agent.get("llm"),
+    )
     return build_chat_model_from_spec(settings, spec)
 
 
 def _resolve_runtime_bindings(
     db: Session,
-    agent: AgentDefinition | dict[str, Any],
+    agent: dict[str, Any],
 ) -> tuple[str, str, str, dict[str, Any], list[Any], list[Any], list[SkillDefinition]]:
     """
-    把 live ORM 或 snapshot dict 归一为组装所需字段。
+    从归一后的 Agent dict 解析组装字段。
 
     Returns:
         (agent_id, name, system_prompt, config, tools, middleware, skills)
     """
     from deepagents_app.services.skills import load_skills_by_ids
 
-    if isinstance(agent, dict):
-        agent_id = str(agent.get("id") or agent["name"])
-        name = str(agent["name"])
-        system_prompt = agent.get("system_prompt") or ""
-        config = dict(agent.get("config") or {})
-        tools = load_tools_by_ids(db, list(agent.get("tool_ids") or []))
-        middleware = load_middlewares_by_ids(db, list(agent.get("middleware_ids") or []))
-        skills = load_skills_by_ids(db, list(agent.get("skill_ids") or []))
-    else:
-        agent_id = agent.id
-        name = agent.name
-        system_prompt = agent.system_prompt
-        config = dict(agent.config or {})
-        tools = []
-        for t in agent.tools:
-            tools.extend(expand_tool_definition(t))
-        middleware = [load_middleware_object(m) for m in agent.middlewares]
-        skills = list(agent.skills or [])
+    agent_id = str(agent.get("id") or agent["name"])
+    name = str(agent["name"])
+    system_prompt = agent.get("system_prompt") or ""
+    config = dict(agent.get("config") or {})
+    tools = load_tools_by_ids(db, list(agent.get("tool_ids") or []))
+    middleware = load_middlewares_by_ids(db, list(agent.get("middleware_ids") or []))
+    skills = load_skills_by_ids(db, list(agent.get("skill_ids") or []))
     return agent_id, name, system_prompt, config, tools, middleware, skills
 
 
 def _build_subagent_spec(
     db: Session,
     settings: Settings,
-    agent: AgentDefinition | dict[str, Any],
+    agent: dict[str, Any],
     *,
     scope: str,
 ) -> dict[str, Any]:
-    """live / snapshot Agent → deepagents SubAgent 字典。"""
+    """归一后的 Agent dict → deepagents SubAgent 字典。"""
     from deepagents_app.services.skills import materialize_agent_skills
 
     agent_id, name, system_prompt, config, tools, middleware, skills = (
@@ -253,10 +247,10 @@ def _assemble_create_kwargs(
 
 
 def _split_roles(
-    agents: list[AgentDefinition | dict[str, Any]],
+    agents: list[dict[str, Any]],
     *,
     context: str,
-) -> tuple[AgentDefinition | dict[str, Any], list[AgentDefinition | dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """过滤 enabled，拆出 Supervisor 与 SubAgents。"""
     enabled = [a for a in agents if _agent_enabled(a)]
     supervisors = [a for a in enabled if _agent_role(a) == "supervisor"]
@@ -277,18 +271,19 @@ def _compile_from_agents(
     version: int,
     source: str,
 ) -> Any:
-    """统一组装入口：agents 可为 live ORM 或 snapshot dict。"""
+    """统一组装入口：入口处将 live ORM / snapshot dict 归一为 dict。"""
     from deepagents import create_deep_agent
     from deepagents_app.services.skills import (
         clear_materialized_skills,
         materialize_agent_skills,
     )
 
+    specs = [_normalize_agent_spec(a) for a in agents]
     scope = skills_scope(methodology_id, version)
     clear_materialized_skills(settings, scope=scope)
 
     context = f"方法论 {methodology_id}" if source == "live" else f"快照 {methodology_id} v{version}"
-    supervisor, subagents_defs = _split_roles(agents, context=context)
+    supervisor, subagents_defs = _split_roles(specs, context=context)
 
     subagents = [
         _build_subagent_spec(db, settings, a, scope=scope) for a in subagents_defs

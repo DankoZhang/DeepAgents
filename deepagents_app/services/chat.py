@@ -17,66 +17,56 @@ from deepagents_app.services.agent_factory import build_agent_from_methodology  
 from deepagents_app.services.conversation import get_conversation_by_thread  # 按 thread_id 查会话
 from deepagents_app.utils.text import normalize_message_content
 
-logger = logging.getLogger(__name__)  # 本模块专用 logger
-
-
-def _normalize_content(content: Any) -> str:
-    """统一把 str / multimodal block 列表转为纯文本。"""
-    return normalize_message_content(content)
+logger = logging.getLogger(__name__)
 
 
 def _msg_role(msg: Any) -> str:
     """LangChain Message.type / OpenAI role → 前端 role。"""
-    # 优先取 Message.type；dict 则取 role
     raw = getattr(msg, "type", None) or (
         msg.get("role") if isinstance(msg, dict) else None
     )
-    raw = str(raw or "unknown")  # 缺失时记为 unknown
+    raw = str(raw or "unknown")
     mapping = {
-        "human": "user",  # LangChain human → 前端 user
-        "ai": "assistant",  # LangChain ai → 前端 assistant
-        "assistant": "assistant",  # 已是 assistant 保持不变
-        "user": "user",  # 已是 user 保持不变
-        "system": "system",  # 系统消息
-        "tool": "tool",  # 工具消息
+        "human": "user",
+        "ai": "assistant",
+        "assistant": "assistant",
+        "user": "user",
+        "system": "system",
+        "tool": "tool",
     }
-    return mapping.get(raw, raw)  # 未映射则原样返回
+    return mapping.get(raw, raw)
 
 
 def serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
     """将 LangChain / dict 消息转为前端可用结构。"""
-    out: list[dict[str, Any]] = []  # 序列化结果列表
-    for msg in messages or []:  # 空列表时安全遍历
-        role = _msg_role(msg)  # 归一化角色名
-        content = _normalize_content(
-            # 对象取 content 属性，dict 取 content 键
+    out: list[dict[str, Any]] = []
+    for msg in messages or []:
+        role = _msg_role(msg)
+        content = normalize_message_content(
             getattr(msg, "content", None)
             or (msg.get("content") if isinstance(msg, dict) else None)
         )
         name = getattr(msg, "name", None) or (
-            # 工具名等可选字段
             msg.get("name") if isinstance(msg, dict) else None
         )
-        # 跳过空内容的中间 tool / 系统噪声（保留有文本的）
         if not content and role not in {"user", "assistant"}:
-            continue  # 无文本且非主对话角色则丢弃
-        out.append({"role": role, "content": content, "name": name})  # 追加前端结构
-    return out  # 返回可 JSON 序列化的消息列表
+            continue
+        out.append({"role": role, "content": content, "name": name})
+    return out
 
 
 def extract_final_text(result: dict[str, Any]) -> str:
     """从 agent.invoke 结果取出最后一条 AI 文本。"""
-    messages = result.get("messages") or []  # 取消息列表，缺省为空
-    for msg in reversed(messages):  # 从后往前找最新回复
-        role = _msg_role(msg)  # 归一化角色
-        content = _normalize_content(
-            # 兼容 Message 对象与 dict
+    messages = result.get("messages") or []
+    for msg in reversed(messages):
+        role = _msg_role(msg)
+        content = normalize_message_content(
             getattr(msg, "content", None)
             or (msg.get("content") if isinstance(msg, dict) else None)
         )
-        if role == "assistant" and content:  # 找到有文本的助手消息
-            return content  # 返回该条文本作为最终回复
-    return ""  # 没有可用 AI 文本则返回空串
+        if role == "assistant" and content:
+            return content
+    return ""
 
 
 def _pack_result(
