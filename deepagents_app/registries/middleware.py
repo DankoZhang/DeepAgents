@@ -7,15 +7,10 @@ Middleware Registry
 
 from __future__ import annotations
 
-import logging
 from typing import Any
-
-from sqlalchemy.orm import Session
 
 from deepagents_app.db.models import MiddlewareDefinition
 from deepagents_app.registries.tools import resolve_class_path
-
-logger = logging.getLogger(__name__)
 
 
 def load_middleware_object(mw_def: MiddlewareDefinition) -> Any:
@@ -29,21 +24,18 @@ def load_middleware_object(mw_def: MiddlewareDefinition) -> Any:
     return obj
 
 
-def load_middlewares_by_ids(db: Session, middleware_ids: list[str]) -> list[Any]:
-    """按 id 列表加载中间件（保持传入顺序；缺失则跳过并告警）。"""
-    if not middleware_ids:
-        return []
-    rows = (
-        db.query(MiddlewareDefinition)
-        .filter(MiddlewareDefinition.id.in_(middleware_ids))
-        .all()
+def middleware_definition_from_snapshot(payload: dict[str, Any]) -> MiddlewareDefinition:
+    """从快照 dict 构造脱离 Session 的 MiddlewareDefinition（仅供运行时实例化）。"""
+    return MiddlewareDefinition(
+        id=str(payload.get("id") or payload.get("name") or ""),
+        name=str(payload.get("name") or ""),
+        class_path=str(payload.get("class_path") or ""),
+        config=dict(payload.get("config") or {}),
     )
-    by_id = {r.id: r for r in rows}
-    result: list[Any] = []
-    for mid in middleware_ids:
-        row = by_id.get(mid)
-        if row is None:
-            logger.warning("中间件不存在，跳过：%s", mid)
-            continue
-        result.append(load_middleware_object(row))
-    return result
+
+
+def load_middlewares_from_snapshots(payloads: list[dict[str, Any]]) -> list[Any]:
+    """按快照内嵌的中间件 payload 实例化（顺序保留）。"""
+    return [
+        load_middleware_object(middleware_definition_from_snapshot(p)) for p in payloads
+    ]

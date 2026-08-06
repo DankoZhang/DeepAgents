@@ -1,5 +1,8 @@
 # Alembic 迁移
 
+本目录即 `alembic.ini` 的 `script_location`（`%(here)s/migrations`）。
+仓库根下不要再放名为 `alembic/` 的迁移目录，否则会遮蔽已安装的 `alembic` 包。
+
 Schema 变更走版本化迁移。**API 启动不会自动 migrate**；部署或本地建库时单独执行：
 
 ```bash

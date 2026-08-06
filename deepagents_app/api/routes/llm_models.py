@@ -11,6 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from deepagents_app.api.deps import require_user
 from deepagents_app.api.schemas import (
     ModelCreate,
     ModelOut,
@@ -24,46 +25,36 @@ from deepagents_app.services import llm_models as models_svc
 router = APIRouter(tags=["models"])
 
 
-def _to_out(row) -> ModelOut:  # noqa: ANN001
-    return ModelOut(
-        id=row.id,
-        name=row.name,
-        provider=row.provider,
-        model_name=row.model_name,
-        base_url=row.base_url,
-        temperature=row.temperature,
-        top_p=row.top_p,
-        max_tokens=row.max_tokens,
-        context_length=row.context_length,
-        timeout=row.timeout,
-        config=dict(row.config or {}),
-        status=row.status,
-        has_api_key=bool(row.api_key),
-        created_time=row.created_time,
-        updated_time=row.updated_time,
-    )
-
-
 @router.get("/model/list", response_model=list[ModelOut])
 def list_models(
     status: str | None = Query(None, description="active | disabled"),
     db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
 ):
-    return [_to_out(r) for r in models_svc.list_models(db, status=status)]
+    return models_svc.list_models(db, owner_user_id=user_id, status=status)
 
 
 @router.get("/model/{model_id}", response_model=ModelOut)
-def get_model(model_id: str, db: Session = Depends(get_db)):
-    row = models_svc.get_model(db, model_id)
+def get_model(
+    model_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
+    row = models_svc.get_model(db, model_id, owner_user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="模型不存在")
-    return _to_out(row)
+    return row
 
 
 @router.post("/model", response_model=ModelOut)
-def create_model(body: ModelCreate, db: Session = Depends(get_db)):
-    row = models_svc.create_model(
+def create_model(
+    body: ModelCreate,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
+    return models_svc.create_model(
         db,
+        owner_user_id=user_id,
         name=body.name,
         provider=body.provider,
         model_name=body.model_name,
@@ -78,14 +69,19 @@ def create_model(body: ModelCreate, db: Session = Depends(get_db)):
         status=body.status,
         model_id=body.id,
     )
-    return _to_out(row)
 
 
 @router.patch("/model/{model_id}", response_model=ModelOut)
-def update_model(model_id: str, body: ModelUpdate, db: Session = Depends(get_db)):
-    row = models_svc.update_model(
+def update_model(
+    model_id: str,
+    body: ModelUpdate,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
+    return models_svc.update_model(
         db,
         model_id,
+        owner_user_id=user_id,
         name=body.name,
         provider=body.provider,
         model_name=body.model_name,
@@ -100,17 +96,24 @@ def update_model(model_id: str, body: ModelUpdate, db: Session = Depends(get_db)
         config=body.config,
         status=body.status,
     )
-    return _to_out(row)
 
 
 @router.delete("/model/{model_id}")
-def delete_model(model_id: str, db: Session = Depends(get_db)):
-    models_svc.delete_model(db, model_id)
+def delete_model(
+    model_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
+    models_svc.delete_model(db, model_id, owner_user_id=user_id)
     return {"ok": True}
 
 
 @router.post("/model/test", response_model=ModelTestResult)
-def test_model_inline(body: ModelTestRequest, db: Session = Depends(get_db)):
+def test_model_inline(
+    body: ModelTestRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
     """
     连通性测试。
 
@@ -118,7 +121,9 @@ def test_model_inline(body: ModelTestRequest, db: Session = Depends(get_db)):
     - 否则用 body 内联字段（保存前试连）
     """
     if body.model_id:
-        return models_svc.test_model_by_id(db, body.model_id)
+        return models_svc.test_model_by_id(
+            db, body.model_id, owner_user_id=user_id
+        )
     if not body.provider or not body.model_name:
         raise HTTPException(
             status_code=400,
@@ -138,5 +143,9 @@ def test_model_inline(body: ModelTestRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/model/{model_id}/test", response_model=ModelTestResult)
-def test_model(model_id: str, db: Session = Depends(get_db)):
-    return models_svc.test_model_by_id(db, model_id)
+def test_model(
+    model_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
+    return models_svc.test_model_by_id(db, model_id, owner_user_id=user_id)

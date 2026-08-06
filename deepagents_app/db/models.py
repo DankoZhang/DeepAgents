@@ -54,9 +54,12 @@ class ModelDefinition(Base):
     """平台大模型目录：连接信息 + 超参数，供 Agent 勾选（方案 B）。"""
 
     __tablename__ = "model_definition"
-    __table_args__ = (UniqueConstraint("name", name="uq_model_name"),)
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_model_owner_name"),
+    )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # openai | anthropic | openai_compatible
     provider: Mapped[str] = mapped_column(String(32), nullable=False, default="openai")
@@ -86,9 +89,13 @@ class Methodology(Base):
 
     # 对应数据库表名
     __tablename__ = "methodology"
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_methodology_owner_name"),
+    )
 
     # 主键：方法论唯一 ID
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     # 方法论显示名称，非空
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # 方法论描述，默认空字符串
@@ -120,11 +127,14 @@ class AgentDefinition(Base):
     # 对应数据库表名
     __tablename__ = "agent_definition"
     # 表级约束：Agent 名称全局唯一
-    __table_args__ = (UniqueConstraint("name", name="uq_agent_name"),)
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_agent_owner_name"),
+    )
 
     # 主键：Agent 唯一 ID
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    # Agent 名称（唯一约束见上），非空
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # Agent 名称（用户内唯一），非空
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     # 系统提示词，默认空字符串
     system_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -171,11 +181,15 @@ class ToolDefinition(Base):
 
     # 对应数据库表名
     __tablename__ = "tool_definition"
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_tool_owner_name"),
+    )
 
     # 主键：工具唯一 ID
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    # 工具名称，全局唯一且非空
-    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # 工具名称，用户内唯一且非空
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
     # 工具描述，默认空字符串
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     # 工具类型：builtin | mcp，默认 builtin
@@ -206,10 +220,13 @@ class SkillDefinition(Base):
     """
 
     __tablename__ = "skill_definition"
-    __table_args__ = (UniqueConstraint("name", name="uq_skill_name"),)
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_skill_owner_name"),
+    )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    # 全局唯一；亦作物化目录名，如 document-writing
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # 用户内唯一；亦作物化目录名，如 document-writing
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     # 完整 SKILL.md 文本（含 YAML frontmatter + 正文）
@@ -234,11 +251,15 @@ class MiddlewareDefinition(Base):
 
     # 对应数据库表名
     __tablename__ = "middleware_definition"
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "name", name="uq_middleware_owner_name"),
+    )
 
     # 主键：中间件唯一 ID
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    # 中间件名称，全局唯一且非空
-    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # 中间件名称，用户内唯一且非空
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
     # Python 类导入路径，非空（运行时据此实例化）
     class_path: Mapped[str] = mapped_column(String(512), nullable=False)
     # 中间件初始化配置 JSON，默认空字典
@@ -348,10 +369,10 @@ class Conversation(Base):
 
     # 主键：会话唯一 ID
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    # LangGraph / 聊天线程 ID，唯一且建索引，便于按线程查找
+    # LangGraph / 聊天线程 ID（业务侧）；仍全局唯一
     thread_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
-    # 发起会话的用户 ID，可为空（匿名或系统会话）
-    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 会话归属用户（鉴权后强制写入）
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     # 绑定的方法论 ID（外键，非空）
     methodology_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("methodology.id"), nullable=False

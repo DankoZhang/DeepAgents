@@ -2,19 +2,23 @@
 聊天服务
 ========
 
-按 thread 加载 Conversation → Agent Factory（锁定 methodology_version）→
-invoke / resume / 读取 checkpointer 历史。
+按 thread 加载 Conversation → 校验 user_id → Agent Factory →
+invoke / resume；历史消息直接读 checkpointer，不触发 Agent 编译。
 """
 
-from __future__ import annotations  # 启用延迟注解求值，便于前向引用类型
+from __future__ import annotations
 
-import logging  # 标准日志模块
-from typing import Any  # 任意类型占位，用于消息/结果等异构结构
+import logging
+from typing import Any
 
-from sqlalchemy.orm import Session  # SQLAlchemy 数据库会话类型
+from sqlalchemy.orm import Session
 
-from deepagents_app.services.agent_factory import build_agent_from_methodology  # 按方法论构建 agent
-from deepagents_app.services.conversation import get_conversation_by_thread  # 按 thread_id 查会话
+from deepagents_app.api.errors import NotFoundError
+from deepagents_app.config import get_settings
+from deepagents_app.factory import build_checkpointer
+from deepagents_app.ownership import checkpoint_thread_id
+from deepagents_app.services.agent_factory import build_agent_from_methodology
+from deepagents_app.services.conversation import get_conversation_by_thread
 from deepagents_app.utils.text import normalize_message_content
 
 logger = logging.getLogger(__name__)
@@ -71,155 +75,145 @@ def extract_final_text(result: dict[str, Any]) -> str:
 
 def _pack_result(
     *,
-    thread_id: str,  # 会话线程 ID
-    result: dict[str, Any],  # agent.invoke 原始结果
-    methodology_id: str,  # 方法论 ID
-    methodology_version: int,  # 锁定的方法论版本号
+    thread_id: str,
+    result: dict[str, Any],
+    methodology_id: str,
+    methodology_version: int,
 ) -> dict[str, Any]:
     """统一 chat / resume 响应结构；``__interrupt__`` 表示 HITL 暂停。"""
-    interrupts = result.get("__interrupt__")  # LangGraph HITL 中断载荷
+    interrupts = result.get("__interrupt__")
     return {
-        "thread_id": thread_id,  # 回传线程 ID
-        "reply": extract_final_text(result),  # 提取最终助手文本
-        "interrupted": bool(interrupts),  # 是否处于 HITL 暂停
-        "interrupt": str(interrupts) if interrupts else None,  # 中断详情或 None
-        "methodology_id": methodology_id,  # 会话绑定的方法论
-        "methodology_version": methodology_version,  # 会话锁定的版本
+        "thread_id": thread_id,
+        "reply": extract_final_text(result),
+        "interrupted": bool(interrupts),
+        "interrupt": str(interrupts) if interrupts else None,
+        "methodology_id": methodology_id,
+        "methodology_version": methodology_version,
+    }
+
+
+def _runtime_config(user_id: str, thread_id: str) -> dict[str, Any]:
+    return {
+        "configurable": {
+            "thread_id": checkpoint_thread_id(user_id, thread_id),
+        }
     }
 
 
 def chat(
-    db: Session,  # 数据库会话
+    db: Session,
     *,
-    thread_id: str,  # 目标会话线程
-    message: str,  # 本轮用户输入
+    user_id: str,
+    thread_id: str,
+    message: str,
 ) -> dict[str, Any]:
-    """
-    执行一轮对话。
+    conversation = get_conversation_by_thread(db, thread_id, user_id=user_id)
+    if conversation is None:
+        raise NotFoundError(f"会话不存在：thread_id={thread_id}")
 
-    Returns:
-        {
-          "thread_id": ...,
-          "reply": "...",
-          "interrupted": bool,
-          "interrupt": ...,
-          "methodology_id": ...,
-          "methodology_version": ...,
-        }
-    """
-    conversation = get_conversation_by_thread(db, thread_id)  # 加载会话记录
-    if conversation is None:  # 线程不存在
-        raise LookupError(f"会话不存在：thread_id={thread_id}")  # 向上抛出查找错误
-
-    # 必须按会话创建时的 version 构建，避免方法论升级影响进行中的对话
     agent = build_agent_from_methodology(
-        db,  # 传入 DB 以读方法论/中间件配置
-        conversation.methodology_id,  # 会话绑定的方法论
-        version=conversation.methodology_version,  # 锁定创建时的版本
+        db,
+        conversation.methodology_id,
+        owner_user_id=user_id,
+        version=conversation.methodology_version,
     )
-    # LangGraph 用 thread_id 隔离多轮 checkpointer 状态
-    config = {"configurable": {"thread_id": thread_id}}  # 运行时配置
+    config = _runtime_config(user_id, thread_id)
     logger.info(
-        "chat thread=%s methodology=%s v%s",  # 结构化日志模板
-        thread_id,  # 当前线程
-        conversation.methodology_id,  # 方法论 ID
-        conversation.methodology_version,  # 方法论版本
+        "chat user=%s thread=%s methodology=%s v%s",
+        user_id,
+        thread_id,
+        conversation.methodology_id,
+        conversation.methodology_version,
     )
     result = agent.invoke(
-        {"messages": [{"role": "user", "content": message}]},  # 本轮用户消息
-        config=config,  # 带 thread_id 的配置
+        {"messages": [{"role": "user", "content": message}]},
+        config=config,
     )
     return _pack_result(
-        thread_id=thread_id,  # 回传线程
-        result=result,  # invoke 原始结果
-        methodology_id=conversation.methodology_id,  # 方法论 ID
-        methodology_version=conversation.methodology_version,  # 方法论版本
+        thread_id=thread_id,
+        result=result,
+        methodology_id=conversation.methodology_id,
+        methodology_version=conversation.methodology_version,
     )
 
 
 def resume_chat(
-    db: Session,  # 数据库会话
+    db: Session,
     *,
-    thread_id: str,  # 待恢复的线程
-    approve: bool = True,  # True 批准工具调用；False 拒绝
+    user_id: str,
+    thread_id: str,
+    approve: bool = True,
 ) -> dict[str, Any]:
-    """
-    恢复 HITL 中断的会话。
+    from langgraph.types import Command
 
-    approve=True → 批准当前工具调用并继续；
-    approve=False → 拒绝并结束本轮。
-    """
-    from langgraph.types import Command  # 延迟导入：用于 resume 决策命令
-
-    conversation = get_conversation_by_thread(db, thread_id)  # 加载会话
-    if conversation is None:  # 会话不存在
-        raise LookupError(f"会话不存在：thread_id={thread_id}")  # 抛出查找错误
+    conversation = get_conversation_by_thread(db, thread_id, user_id=user_id)
+    if conversation is None:
+        raise NotFoundError(f"会话不存在：thread_id={thread_id}")
 
     agent = build_agent_from_methodology(
-        db,  # DB 会话
-        conversation.methodology_id,  # 方法论 ID
-        version=conversation.methodology_version,  # 锁定版本
+        db,
+        conversation.methodology_id,
+        owner_user_id=user_id,
+        version=conversation.methodology_version,
     )
-    config = {"configurable": {"thread_id": thread_id}}  # checkpointer 线程隔离
-    decision_type = "approve" if approve else "reject"  # 映射为 LangGraph 决策类型
-    logger.info("chat resume thread=%s decision=%s", thread_id, decision_type)  # 记录恢复决策
+    config = _runtime_config(user_id, thread_id)
+    decision_type = "approve" if approve else "reject"
+    logger.info(
+        "chat resume user=%s thread=%s decision=%s",
+        user_id,
+        thread_id,
+        decision_type,
+    )
     result = agent.invoke(
-        Command(resume={"decisions": [{"type": decision_type}]}),  # 提交 HITL 决策并继续
-        config=config,  # 同一 thread 上恢复
+        Command(resume={"decisions": [{"type": decision_type}]}),
+        config=config,
     )
     return _pack_result(
-        thread_id=thread_id,  # 回传线程
-        result=result,  # resume 后的 invoke 结果
-        methodology_id=conversation.methodology_id,  # 方法论 ID
-        methodology_version=conversation.methodology_version,  # 方法论版本
+        thread_id=thread_id,
+        result=result,
+        methodology_id=conversation.methodology_id,
+        methodology_version=conversation.methodology_version,
     )
 
 
 def get_conversation_messages(
-    db: Session,  # 数据库会话
+    db: Session,
     *,
-    thread_id: str,  # 要回放的线程
+    user_id: str,
+    thread_id: str,
 ) -> dict[str, Any]:
-    """
-    从 checkpointer 读取会话历史（供前端聊天页回放）。
+    """只读：直接从 checkpointer 取历史，不编译 Agent、不物化 Skills。"""
+    conversation = get_conversation_by_thread(db, thread_id, user_id=user_id)
+    if conversation is None:
+        raise NotFoundError(f"会话不存在：thread_id={thread_id}")
 
-    无历史时返回空 messages 列表。
-    """
-    conversation = get_conversation_by_thread(db, thread_id)  # 加载会话元数据
-    if conversation is None:  # 找不到会话
-        raise LookupError(f"会话不存在：thread_id={thread_id}")  # 抛出查找错误
-
-    agent = build_agent_from_methodology(
-        db,  # DB 会话
-        conversation.methodology_id,  # 方法论 ID
-        version=conversation.methodology_version,  # 锁定版本（与对话时一致）
-    )
-    config = {"configurable": {"thread_id": thread_id}}  # 指定 checkpointer 线程
-    messages: list[Any] = []  # 默认无历史消息
-    interrupted = False  # 默认未处于 HITL 暂停
-    interrupt: str | None = None  # 中断详情，无则为 None
+    config = _runtime_config(user_id, thread_id)
+    messages: list[Any] = []
+    interrupted = False
+    interrupt: str | None = None
 
     try:
-        state = agent.get_state(config)  # 读取 LangGraph 当前状态快照
-        values = getattr(state, "values", None) or {}  # 状态中的 values 字典
-        if isinstance(values, dict):  # 防御非 dict 形态
-            messages = values.get("messages") or []  # 取出消息通道
-        # tasks 上挂着未解决的 interrupt（HITL 暂停中）
-        tasks = getattr(state, "tasks", None) or ()  # 未完成任务集合
-        for task in tasks:  # 扫描每个任务是否带中断
-            interrupts = getattr(task, "interrupts", None) or ()  # 任务上的 interrupt 列表
-            if interrupts:  # 存在未解决中断
-                interrupted = True  # 标记为已中断
-                interrupt = str(interrupts)  # 序列化中断信息供前端展示
-                break  # 找到一个即可
-    except Exception as exc:  # noqa: BLE001  # 读取失败不阻断接口（如无 checkpoint）
-        logger.warning("读取会话状态失败 thread=%s: %s", thread_id, exc)  # 记录告警日志
+        checkpointer = build_checkpointer(get_settings())
+        cp_tuple = checkpointer.get_tuple(config)
+        if cp_tuple is not None:
+            checkpoint = getattr(cp_tuple, "checkpoint", None) or {}
+            values = checkpoint.get("channel_values") or {}
+            if isinstance(values, dict):
+                messages = values.get("messages") or []
+            for task in getattr(cp_tuple, "tasks", None) or ():
+                interrupts = getattr(task, "interrupts", None) or ()
+                if interrupts:
+                    interrupted = True
+                    interrupt = str(interrupts)
+                    break
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取会话状态失败 thread=%s: %s", thread_id, exc)
 
     return {
-        "thread_id": thread_id,  # 线程 ID
-        "methodology_id": conversation.methodology_id,  # 方法论 ID
-        "methodology_version": conversation.methodology_version,  # 方法论版本
-        "messages": serialize_messages(messages),  # 序列化为前端消息结构
-        "interrupted": interrupted,  # 是否 HITL 暂停中
-        "interrupt": interrupt,  # 中断详情或 None
+        "thread_id": thread_id,
+        "methodology_id": conversation.methodology_id,
+        "methodology_version": conversation.methodology_version,
+        "messages": serialize_messages(messages),
+        "interrupted": interrupted,
+        "interrupt": interrupt,
     }

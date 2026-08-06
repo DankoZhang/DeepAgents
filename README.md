@@ -32,11 +32,14 @@ docker compose up -d
 # 迁移 schema（部署步骤；API 启动不会自动执行）
 python -m deepagents_app.db.migrate
 
-# 启动 FastAPI（默认 http://0.0.0.0:8001；启动时仅写入幂等种子数据）
+# 启动 FastAPI（默认 http://0.0.0.0:8001）
+# 需配置 AUTH_INTROSPECT_URL，或本地设 AUTH_DISABLED=true
 python server.py
 ```
 
-Schema 变更请用 Alembic（见 `migrations/README`）：
+鉴权：请求头带 `Authorization: Bearer <token>`，服务端调用外部 `AUTH_INTROSPECT_URL` 解析出 `user_id`；所有配置与会话按用户隔离。用户首次访问时幂等写入该用户的默认 Tool / demo 方法论。
+
+Schema 变更请用 Alembic（见 `migrations/README`）。脚本目录是 `migrations/`（由 `alembic.ini` 的 `script_location` 指定）；勿在仓库根再建 `alembic/`，会遮蔽 PyPI 包：
 
 ```bash
 alembic revision --autogenerate -m "your change"
@@ -113,8 +116,8 @@ OPENAI_API_KEY=sk-...
 DeepAgents/
 ├── main.py                 # CLI 入口（方法论组装）
 ├── server.py               # FastAPI 入口
-├── alembic.ini             # Alembic 配置
-├── migrations/             # Schema 迁移脚本（勿命名 alembic，会遮蔽包）
+├── alembic.ini             # Alembic 配置（script_location → migrations/）
+├── migrations/             # Schema 迁移脚本（env.py / versions/；勿命名 alembic）
 ├── docker-compose.yml      # PostgreSQL + Redis Stack
 ├── deepagents_app/
 │   ├── api/                # FastAPI 路由与 schemas

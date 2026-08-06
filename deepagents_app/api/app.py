@@ -1,10 +1,10 @@
-"""
+﻿"""
 FastAPI 应用工厂
 ================
 
 职责：
-- 应用启动时初始化日志、写入幂等种子数据（schema 须已由 migrate 准备好）
-- 挂载 CORS 与各业务路由（方法论 / Agent / Tool / 会话 / 聊天）
+- 应用启动时初始化日志、HarnessProfile、workspace memory
+- 挂载 CORS 与各业务路由
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from deepagents_app.api.errors import register_exception_handlers
 from deepagents_app.api.routes import (
     agents,
+    bootstrap,
     chat,
     conversations,
     llm_models,
@@ -27,8 +28,11 @@ from deepagents_app.api.routes import (
     tools,
 )
 from deepagents_app.config import get_settings
-from deepagents_app.db.seed import seed_defaults
 from deepagents_app.db.session import get_session_factory
+from deepagents_app.factory import (
+    configure_general_purpose_profile,
+    sync_memory_into_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +40,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """
-    应用生命周期钩子（由 FastAPI 在启动/关闭时自动调用）。
+    应用生命周期钩子。
 
-    启动阶段（yield 之前）：
-    1. 按配置初始化根日志
-    2. 幂等写入内置 Tool / Middleware / demo 方法论
-       （表结构请先执行 ``python -m deepagents_app.db.migrate``）
-    关闭阶段（yield 之后）：当前无额外清理逻辑
+    启动：日志、引擎、HarnessProfile、AGENTS.md 同步；
+    AUTH_DISABLED 时为开发用户预引导种子。
     """
     settings = get_settings()
     logging.basicConfig(
@@ -51,22 +52,32 @@ async def lifespan(_app: FastAPI):
         datefmt="%H:%M:%S",
     )
 
-    factory = get_session_factory()
-    db = factory()
-    try:
-        seed_defaults(db)
-        db.commit()
-    except Exception:
-        db.rollback()
-        logger.exception(
-            "种子数据写入失败（若提示表/列不存在，请先执行: "
-            "python -m deepagents_app.db.migrate）"
-        )
-        raise
-    finally:
-        db.close()
+    get_session_factory()
+    configure_general_purpose_profile(settings)
+    sync_memory_into_workspace(settings)
 
-    logger.info("DeepAgents API 已就绪（db=%s）", settings.database_url.split("@")[-1])
+    if settings.auth_disabled and settings.auth_dev_user_id:
+        from deepagents_app.db.seed import ensure_user_bootstrap
+        from deepagents_app.services.revisions import flush_cache_invalidations
+
+        factory = get_session_factory()
+        db = factory()
+        try:
+            ensure_user_bootstrap(db, settings.auth_dev_user_id)
+            db.commit()
+            flush_cache_invalidations(db)
+            logger.info("已为开发用户引导种子：%s", settings.auth_dev_user_id)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    logger.info(
+        "DeepAgents API 已就绪（db=%s, auth_disabled=%s）",
+        settings.database_url.split("@")[-1],
+        settings.auth_disabled,
+    )
     yield
 
 
@@ -90,6 +101,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(bootstrap.router, prefix="/api")
     app.include_router(llm_models.router, prefix="/api")
     app.include_router(methodologies.router, prefix="/api")
     app.include_router(agents.router, prefix="/api")
@@ -107,5 +119,4 @@ def create_app() -> FastAPI:
     return app
 
 
-# uvicorn deepagents_app.api.app:app 直接引用此实例
 app = create_app()

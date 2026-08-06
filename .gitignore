@@ -6,6 +6,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# 旧迁移目录名会遮蔽 PyPI alembic 包；正式脚本在 migrations/
+/alembic/
+
 # 虚拟环境
 .venv/
 venv/

@@ -33,9 +33,14 @@ def test_path_traversal_blocked() -> None:
 def test_shell_whitelist() -> None:
     from deepagents_app.tools.computer_tools import _validate_command
 
-    assert _validate_command("ls -la") is None
-    assert _validate_command("rm -rf /") is not None
-    assert _validate_command("sudo reboot") is not None
+    argv, err = _validate_command("ls -la")
+    assert err is None and argv == ["ls", "-la"]
+
+    assert _validate_command("rm -rf /")[0] is None
+    assert _validate_command("sudo reboot")[0] is None
+    # 分号 / 命令替换不得靠 shell 元字符绕过（shell=False 时整串作为非法 argv0）
+    assert _validate_command("ls; cat /etc/passwd")[0] is None
+    assert _validate_command("python -c 'print(1)'")[0] is None
 
 
 def test_document_roundtrip(tmp_path, monkeypatch) -> None:

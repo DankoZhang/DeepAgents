@@ -1,42 +1,49 @@
 """方法论 CRUD、发布、勾选全局 Agent。"""
 
-# 推迟注解求值
 from __future__ import annotations
 
-# 生成方法论 id 后缀
 import uuid
-# 更新 updated_time
 from datetime import datetime, timezone
 
-# Session + 预加载关系
 from sqlalchemy.orm import Session
 
-# Methodology / 勾选关系 / Agent（详情预加载）
+from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.db.loading import methodology_with_agents_options
-from deepagents_app.db.models import AgentDefinition, Methodology, MethodologyAgent
-# 配置变更后清 Compiled Agent 缓存
-from deepagents_app.services.agent_factory import invalidate_agent_cache
-from deepagents_app.services.revisions import bump_methodology, list_revisions, snapshot_methodology
+from deepagents_app.db.models import AgentDefinition, Conversation, Methodology
+from deepagents_app.services.revisions import (
+    bump_methodology,
+    list_revisions,
+    schedule_cache_invalidation,
+    snapshot_methodology,
+)
 
 
 def list_methodologies(
     db: Session,
     *,
-    status: str | None = None,  # draft | published | archived
+    owner_user_id: str,
+    status: str | None = None,
 ) -> list[Methodology]:
-    # 最近更新的在前
-    q = db.query(Methodology).order_by(Methodology.updated_time.desc())
+    q = (
+        db.query(Methodology)
+        .filter(Methodology.owner_user_id == owner_user_id)
+        .order_by(Methodology.updated_time.desc())
+    )
     if status:
         q = q.filter(Methodology.status == status)
     return q.all()
 
 
-def get_methodology(db: Session, methodology_id: str) -> Methodology | None:
-    # 详情需带出已勾选 Agent 及其 tools / middlewares / skills
+def get_methodology(
+    db: Session, methodology_id: str, *, owner_user_id: str
+) -> Methodology | None:
     return (
         db.query(Methodology)
         .options(*methodology_with_agents_options())
-        .filter(Methodology.id == methodology_id)
+        .filter(
+            Methodology.id == methodology_id,
+            Methodology.owner_user_id == owner_user_id,
+        )
         .one_or_none()
     )
 
@@ -44,128 +51,167 @@ def get_methodology(db: Session, methodology_id: str) -> Methodology | None:
 def create_methodology(
     db: Session,
     *,
+    owner_user_id: str,
     name: str,
     description: str = "",
-    methodology_id: str | None = None,  # 可选指定 id
-    agent_ids: list[str] | None = None,  # 创建时可直接勾选
+    methodology_id: str | None = None,
+    agent_ids: list[str] | None = None,
 ) -> Methodology:
     """创建草稿方法论，可选立即勾选全局 Agent，并写入 v1 快照。"""
-    mid = methodology_id or _slug_id(name)  # 无指定则由名称生成
+    name_clash = (
+        db.query(Methodology)
+        .filter(
+            Methodology.owner_user_id == owner_user_id,
+            Methodology.name == name,
+        )
+        .one_or_none()
+    )
+    if name_clash is not None:
+        raise BusinessError(f"已存在同名方法论：{name}")
+
+    mid = methodology_id or _slug_id(name)
     if db.get(Methodology, mid) is not None:
-        raise ValueError(f"方法论已存在：{mid}")
+        raise BusinessError(f"方法论已存在：{mid}")
     row = Methodology(
         id=mid,
+        owner_user_id=owner_user_id,
         name=name,
         description=description,
-        version=1,  # 初始版本
-        status="draft",  # 未发布不能建会话
+        version=1,
+        status="draft",
     )
     db.add(row)
     db.flush()
     if agent_ids:
-        # 创建路径不 bump（已是 v1），只写关系
-        bind_methodology_agents(db, mid, agent_ids, replace=True, bump_version=False)
-    snapshot_methodology(db, mid)  # 写入 v1 快照
-    return get_methodology(db, mid) or row  # 优先返回带关系的详情
+        bind_methodology_agents(
+            db,
+            mid,
+            agent_ids,
+            owner_user_id=owner_user_id,
+            replace=True,
+            bump_version=False,
+        )
+    snapshot_methodology(db, mid)
+    return get_methodology(db, mid, owner_user_id=owner_user_id) or row
 
 
 def update_methodology(
     db: Session,
     methodology_id: str,
     *,
+    owner_user_id: str,
     name: str | None = None,
     description: str | None = None,
-    bump_version: bool = True,  # False：只改文字不升版
 ) -> Methodology:
-    row = db.get(Methodology, methodology_id)
+    """仅更新元信息（名称/描述）；不影响 Agent 组装，不升版。"""
+    row = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"方法论不存在：{methodology_id}")
-    if name is not None:
+        raise NotFoundError(f"方法论不存在：{methodology_id}")
+    if name is not None and name != row.name:
+        clash = (
+            db.query(Methodology)
+            .filter(
+                Methodology.owner_user_id == owner_user_id,
+                Methodology.name == name,
+                Methodology.id != methodology_id,
+            )
+            .one_or_none()
+        )
+        if clash is not None:
+            raise BusinessError(f"已存在同名方法论：{name}")
         row.name = name
     if description is not None:
         row.description = description
-    if bump_version:
-        bump_methodology(db, row)
-    else:
-        row.updated_time = datetime.now(timezone.utc)
-        db.flush()
+    row.updated_time = datetime.now(timezone.utc)
+    db.flush()
     return row
 
 
-def delete_methodology(db: Session, methodology_id: str) -> None:
-    row = db.get(Methodology, methodology_id)
+def delete_methodology(
+    db: Session, methodology_id: str, *, owner_user_id: str
+) -> None:
+    row = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"方法论不存在：{methodology_id}")
-    invalidate_agent_cache(methodology_id)  # 先清缓存
-    db.delete(row)  # cascade 勾选关系与 revision；不删全局 Agent
+        raise NotFoundError(f"方法论不存在：{methodology_id}")
+
+    conv_count = (
+        db.query(Conversation)
+        .filter(Conversation.methodology_id == methodology_id)
+        .count()
+    )
+    if conv_count:
+        raise BusinessError(
+            f"方法论仍有 {conv_count} 个会话引用，无法删除；请先删除相关会话"
+        )
+
+    schedule_cache_invalidation(db, methodology_id)
+    db.delete(row)
     db.flush()
 
 
 def bind_methodology_agents(
     db: Session,
     methodology_id: str,
-    agent_ids: list[str],  # 要勾选的全局 Agent id
+    agent_ids: list[str],
     *,
-    replace: bool = True,  # True 先清空再绑
-    bump_version: bool = True,  # 创建时传 False 避免二次升版
+    owner_user_id: str,
+    replace: bool = True,
+    bump_version: bool = True,
 ) -> Methodology:
     """方法论勾选 / 替换全局 Agent 列表。"""
-    methodology = db.get(Methodology, methodology_id)
+    methodology = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if methodology is None:
-        raise LookupError(f"方法论不存在：{methodology_id}")
+        raise NotFoundError(f"方法论不存在：{methodology_id}")
 
-    if replace:
-        # 删掉该方法论全部旧勾选
-        db.query(MethodologyAgent).filter(
-            MethodologyAgent.methodology_id == methodology_id
-        ).delete()
-
+    agents: list[AgentDefinition] = []
     for aid in agent_ids:
         agent = db.get(AgentDefinition, aid)
         if agent is None:
-            raise LookupError(f"Agent 不存在：{aid}")
-        exists = (
-            db.query(MethodologyAgent)
-            .filter(
-                MethodologyAgent.methodology_id == methodology_id,
-                MethodologyAgent.agent_id == aid,
-            )
-            .one_or_none()
-        )
-        if exists is None:
-            db.add(MethodologyAgent(methodology_id=methodology_id, agent_id=aid))
+            raise NotFoundError(f"Agent 不存在：{aid}")
+        if agent.owner_user_id != owner_user_id:
+            raise BusinessError(f"Agent 不属于当前用户：{aid}")
+        agents.append(agent)
+
+    if replace:
+        methodology.agents = agents
+    else:
+        existing = {a.id for a in methodology.agents}
+        for agent in agents:
+            if agent.id not in existing:
+                methodology.agents.append(agent)
 
     if bump_version:
         bump_methodology(db, methodology)
     else:
         db.flush()
-    return get_methodology(db, methodology_id)  # type: ignore[return-value]
+    return get_methodology(db, methodology_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
-def publish_methodology(db: Session, methodology_id: str) -> Methodology:
+def publish_methodology(
+    db: Session, methodology_id: str, *, owner_user_id: str
+) -> Methodology:
     """发布：勾选的 Agent 中须至少有一个 Supervisor。"""
-    row = get_methodology(db, methodology_id)  # 带 agents 关系
+    row = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"方法论不存在：{methodology_id}")
-    # deepagents 需要主调度 Agent
+        raise NotFoundError(f"方法论不存在：{methodology_id}")
     has_supervisor = any(
         (a.config or {}).get("role") == "supervisor" for a in row.agents
     )
     if not has_supervisor:
-        raise ValueError("发布失败：请先勾选至少一个 Supervisor Agent")
-    row.status = "published"  # 此后才允许 create_conversation
+        raise BusinessError("发布失败：请先勾选至少一个 Supervisor Agent")
+    row.status = "published"
     row.updated_time = datetime.now(timezone.utc)
-    invalidate_agent_cache(methodology_id)
+    schedule_cache_invalidation(db, methodology_id)
     db.flush()
-    snapshot_methodology(db, methodology_id)  # 发布点快照
+    snapshot_methodology(db, methodology_id)
     return row
 
 
-def get_methodology_versions(db: Session, methodology_id: str) -> list[dict]:
-    # 先确认方法论存在
-    if db.get(Methodology, methodology_id) is None:
-        raise LookupError(f"方法论不存在：{methodology_id}")
-    # 转成前端友好的 dict 列表
+def get_methodology_versions(
+    db: Session, methodology_id: str, *, owner_user_id: str
+) -> list[dict]:
+    if get_methodology(db, methodology_id, owner_user_id=owner_user_id) is None:
+        raise NotFoundError(f"方法论不存在：{methodology_id}")
     return [
         {
             "methodology_id": r.methodology_id,
@@ -177,7 +223,6 @@ def get_methodology_versions(db: Session, methodology_id: str) -> list[dict]:
 
 
 def _slug_id(name: str) -> str:
-    # 名称转安全 id 前缀 + 短随机后缀，避免冲突
     base = "".join(c if c.isalnum() or c in "-_" else "_" for c in name.strip())
     base = base.strip("_")[:48] or "methodology"
     return f"{base}_{uuid.uuid4().hex[:8]}"

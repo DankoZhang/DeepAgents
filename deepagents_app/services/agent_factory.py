@@ -23,6 +23,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.backends import build_filesystem_backend
 from deepagents_app.config import Settings, get_settings
 from deepagents_app.db.loading import methodology_with_agents_options
@@ -31,19 +32,24 @@ from deepagents_app.factory import (
     build_checkpointer,
     build_interrupt_on,
     build_permissions,
-    configure_general_purpose_profile,
-    sync_memory_into_workspace,
 )
 from deepagents_app.llm import build_chat_model_from_spec
-from deepagents_app.registries.middleware import load_middlewares_by_ids
-from deepagents_app.registries.tools import load_tools_by_ids
+from deepagents_app.registries.middleware import load_middlewares_from_snapshots
+from deepagents_app.registries.tools import load_tools_from_snapshots
 from deepagents_app.services.llm_models import resolve_model_spec_for_agent
-from deepagents_app.services.revisions import get_revision
+from deepagents_app.services.revisions import get_revision, serialize_agent_for_snapshot
+from deepagents_app.services.skills import (
+    clear_materialized_skills,
+    load_skills_from_snapshots,
+    materialize_agent_skills,
+)
 
 logger = logging.getLogger(__name__)
 
 _cache: dict[str, Any] = {}
 _cache_lock = threading.Lock()
+_build_locks: dict[str, threading.Lock] = {}
+_build_locks_guard = threading.Lock()
 
 
 def cache_key(methodology_id: str, version: int) -> str:
@@ -52,8 +58,17 @@ def cache_key(methodology_id: str, version: int) -> str:
 
 
 def skills_scope(methodology_id: str, version: int) -> str:
-    """Skills 物化目录隔离键，避免并发组装互删。"""
+    """Skills 物化目录隔离键。"""
     return f"{methodology_id}/v{version}"
+
+
+def _build_lock_for(key: str) -> threading.Lock:
+    with _build_locks_guard:
+        lock = _build_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _build_locks[key] = lock
+        return lock
 
 
 def invalidate_agent_cache(
@@ -86,51 +101,35 @@ def get_methodology_config(
     db: Session,
     methodology_id: str,
     *,
-    version: int | None = None,
+    owner_user_id: str | None = None,
 ) -> Methodology:
     """查询方法论 live 行（含 agents / tools / middlewares / skills / llm）。"""
-    methodology = (
+    q = (
         db.query(Methodology)
         .options(*methodology_with_agents_options())
         .filter(Methodology.id == methodology_id)
-        .one_or_none()
     )
+    if owner_user_id is not None:
+        q = q.filter(Methodology.owner_user_id == owner_user_id)
+    methodology = q.one_or_none()
     if methodology is None:
-        raise LookupError(f"方法论不存在：{methodology_id}")
-    if version is not None and methodology.version != version:
-        logger.warning(
-            "请求版本 v%s 与当前方法论版本 v%s 不一致，将尝试快照重建",
-            version,
-            methodology.version,
-        )
+        raise NotFoundError(f"方法论不存在：{methodology_id}")
     return methodology
 
 
 def _normalize_agent_spec(agent: AgentDefinition | dict[str, Any]) -> dict[str, Any]:
-    """live ORM → 与 snapshot 同形的 dict，下游只保留一条组装路径。"""
+    """live ORM → 与 snapshot 同形的 dict；dict 原样返回。"""
     if isinstance(agent, dict):
         return agent
-    return {
-        "id": agent.id,
-        "name": agent.name,
-        "system_prompt": agent.system_prompt,
-        "model_id": agent.model_id,
-        "llm": None,
-        "config": dict(agent.config or {}),
-        "tool_ids": [t.id for t in agent.tools],
-        "middleware_ids": [m.id for m in agent.middlewares],
-        "skill_ids": [s.id for s in agent.skills],
-    }
+    return serialize_agent_for_snapshot(agent, include_llm=True)
 
 
 def _agent_role(agent: dict[str, Any]) -> str:
-    """读取 Agent 角色：supervisor / subagent（默认 subagent）。"""
     cfg = agent.get("config") or {}
     return str(cfg.get("role", "subagent")).lower()
 
 
 def _agent_enabled(agent: dict[str, Any]) -> bool:
-    """是否启用：enabled=false 时组装阶段跳过。"""
     cfg = agent.get("config") or {}
     return bool(cfg.get("enabled", True))
 
@@ -139,10 +138,13 @@ def _chat_model_for_agent(
     db: Session,
     settings: Settings,
     agent: dict[str, Any],
+    *,
+    owner_user_id: str,
 ) -> Any:
     """Supervisor / SubAgent 共用：快照 llm → model_id 目录 → Settings 默认。"""
     spec = resolve_model_spec_for_agent(
         db,
+        owner_user_id=owner_user_id,
         model_id=agent.get("model_id"),
         snapshot_llm=agent.get("llm"),
     )
@@ -150,24 +152,28 @@ def _chat_model_for_agent(
 
 
 def _resolve_runtime_bindings(
-    db: Session,
     agent: dict[str, Any],
 ) -> tuple[str, str, str, dict[str, Any], list[Any], list[Any], list[SkillDefinition]]:
     """
     从归一后的 Agent dict 解析组装字段。
 
-    Returns:
-        (agent_id, name, system_prompt, config, tools, middleware, skills)
+    要求快照 / 归一结果内嵌 tools / middlewares / skills payload。
     """
-    from deepagents_app.services.skills import load_skills_by_ids
-
     agent_id = str(agent.get("id") or agent["name"])
     name = str(agent["name"])
     system_prompt = agent.get("system_prompt") or ""
     config = dict(agent.get("config") or {})
-    tools = load_tools_by_ids(db, list(agent.get("tool_ids") or []))
-    middleware = load_middlewares_by_ids(db, list(agent.get("middleware_ids") or []))
-    skills = load_skills_by_ids(db, list(agent.get("skill_ids") or []))
+
+    if "tools" not in agent:
+        raise BusinessError(f"Agent {agent_id} 缺少 tools payload，无法组装")
+    if "middlewares" not in agent:
+        raise BusinessError(f"Agent {agent_id} 缺少 middlewares payload，无法组装")
+    if "skills" not in agent:
+        raise BusinessError(f"Agent {agent_id} 缺少 skills payload，无法组装")
+
+    tools = load_tools_from_snapshots(list(agent.get("tools") or []))
+    middleware = load_middlewares_from_snapshots(list(agent.get("middlewares") or []))
+    skills = load_skills_from_snapshots(list(agent.get("skills") or []))
     return agent_id, name, system_prompt, config, tools, middleware, skills
 
 
@@ -177,19 +183,20 @@ def _build_subagent_spec(
     agent: dict[str, Any],
     *,
     scope: str,
+    owner_user_id: str,
 ) -> dict[str, Any]:
     """归一后的 Agent dict → deepagents SubAgent 字典。"""
-    from deepagents_app.services.skills import materialize_agent_skills
-
     agent_id, name, system_prompt, config, tools, middleware, skills = (
-        _resolve_runtime_bindings(db, agent)
+        _resolve_runtime_bindings(agent)
     )
     spec: dict[str, Any] = {
         "name": name,
         "description": str(config.get("description") or name),
         "system_prompt": system_prompt,
         "tools": tools,
-        "model": _chat_model_for_agent(db, settings, agent),
+        "model": _chat_model_for_agent(
+            db, settings, agent, owner_user_id=owner_user_id
+        ),
     }
     skills_path = materialize_agent_skills(settings, agent_id, skills, scope=scope)
     if skills_path:
@@ -218,25 +225,20 @@ def _assemble_create_kwargs(
     else:
         interrupt_on = interrupt_cfg if settings.enable_hitl else None
 
-    backend = build_filesystem_backend(settings)
-    checkpointer = build_checkpointer(settings)
-    permissions = build_permissions()
-    configure_general_purpose_profile(settings)
-    sync_memory_into_workspace(settings)
-    memory_paths = (
-        ["/AGENTS.md"] if (settings.workspace_dir / "AGENTS.md").exists() else None
-    )
-
     create_kwargs: dict[str, Any] = {
         "model": supervisor_model,
         "system_prompt": supervisor_prompt,
         "subagents": subagents,
-        "backend": backend,
+        "backend": build_filesystem_backend(settings),
         "middleware": supervisor_middleware,
-        "memory": memory_paths,
-        "permissions": permissions,
+        "memory": (
+            ["/AGENTS.md"]
+            if (settings.workspace_dir / "AGENTS.md").exists()
+            else None
+        ),
+        "permissions": build_permissions(),
         "interrupt_on": interrupt_on,
-        "checkpointer": checkpointer,
+        "checkpointer": build_checkpointer(settings),
         "name": supervisor_name,
     }
     if supervisor_tools:
@@ -256,7 +258,7 @@ def _split_roles(
     supervisors = [a for a in enabled if _agent_role(a) == "supervisor"]
     subagents_defs = [a for a in enabled if _agent_role(a) != "supervisor"]
     if not supervisors:
-        raise ValueError(f"{context} 缺少 Supervisor Agent")
+        raise BusinessError(f"{context} 缺少 Supervisor Agent")
     if len(supervisors) > 1:
         logger.warning("%s 有多个 Supervisor，使用第一个", context)
     return supervisors[0], subagents_defs
@@ -270,23 +272,27 @@ def _compile_from_agents(
     methodology_id: str,
     version: int,
     source: str,
+    owner_user_id: str,
 ) -> Any:
     """统一组装入口：入口处将 live ORM / snapshot dict 归一为 dict。"""
     from deepagents import create_deep_agent
-    from deepagents_app.services.skills import (
-        clear_materialized_skills,
-        materialize_agent_skills,
-    )
 
     specs = [_normalize_agent_spec(a) for a in agents]
     scope = skills_scope(methodology_id, version)
     clear_materialized_skills(settings, scope=scope)
 
-    context = f"方法论 {methodology_id}" if source == "live" else f"快照 {methodology_id} v{version}"
+    context = (
+        f"方法论 {methodology_id}"
+        if source == "live"
+        else f"快照 {methodology_id} v{version}"
+    )
     supervisor, subagents_defs = _split_roles(specs, context=context)
 
     subagents = [
-        _build_subagent_spec(db, settings, a, scope=scope) for a in subagents_defs
+        _build_subagent_spec(
+            db, settings, a, scope=scope, owner_user_id=owner_user_id
+        )
+        for a in subagents_defs
     ]
     (
         supervisor_id,
@@ -296,8 +302,10 @@ def _compile_from_agents(
         supervisor_tools,
         supervisor_middleware,
         supervisor_skills_rows,
-    ) = _resolve_runtime_bindings(db, supervisor)
-    supervisor_model = _chat_model_for_agent(db, settings, supervisor)
+    ) = _resolve_runtime_bindings(supervisor)
+    supervisor_model = _chat_model_for_agent(
+        db, settings, supervisor, owner_user_id=owner_user_id
+    )
     skills_path = materialize_agent_skills(
         settings, supervisor_id, supervisor_skills_rows, scope=scope
     )
@@ -339,6 +347,7 @@ def _build_from_live(
         methodology_id=methodology.id,
         version=methodology.version,
         source="live",
+        owner_user_id=methodology.owner_user_id,
     )
 
 
@@ -347,11 +356,13 @@ def _build_from_snapshot(
     methodology_id: str,
     version: int,
     settings: Settings,
+    *,
+    owner_user_id: str,
 ) -> Any:
     """从 MethodologyRevision 快照组装 Agent。"""
     revision = get_revision(db, methodology_id, version)
     if revision is None:
-        raise LookupError(
+        raise NotFoundError(
             f"方法论快照不存在：{methodology_id} v{version}（无法按旧会话版本重建）"
         )
     snapshot = revision.snapshot or {}
@@ -363,6 +374,7 @@ def _build_from_snapshot(
         methodology_id=methodology_id,
         version=version,
         source="snapshot",
+        owner_user_id=owner_user_id,
     )
 
 
@@ -370,6 +382,7 @@ def build_agent_from_methodology(
     db: Session,
     methodology_id: str,
     *,
+    owner_user_id: str | None = None,
     version: int | None = None,
     settings: Settings | None = None,
     use_cache: bool = True,
@@ -381,23 +394,35 @@ def build_agent_from_methodology(
         LangGraph CompiledStateGraph
     """
     settings = settings or get_settings()
-    methodology = get_methodology_config(db, methodology_id, version=version)
+    methodology = get_methodology_config(
+        db,
+        methodology_id,
+        owner_user_id=owner_user_id,
+    )
+    owner = owner_user_id or methodology.owner_user_id
     target_version = version if version is not None else methodology.version
     key = cache_key(methodology.id, target_version)
 
-    if use_cache:
-        with _cache_lock:
-            cached = _cache.get(key)
-            if cached is not None:
-                logger.info("命中 Agent 缓存：%s", key)
-                return cached
+    with _build_lock_for(key):
+        if use_cache:
+            with _cache_lock:
+                cached = _cache.get(key)
+                if cached is not None:
+                    logger.info("命中 Agent 缓存：%s", key)
+                    return cached
 
-    if target_version == methodology.version:
-        agent = _build_from_live(db, methodology, settings)
-    else:
-        agent = _build_from_snapshot(db, methodology.id, target_version, settings)
+        if target_version == methodology.version:
+            agent = _build_from_live(db, methodology, settings)
+        else:
+            agent = _build_from_snapshot(
+                db,
+                methodology.id,
+                target_version,
+                settings,
+                owner_user_id=owner,
+            )
 
-    if use_cache:
-        with _cache_lock:
-            _cache[key] = agent
-    return agent
+        if use_cache:
+            with _cache_lock:
+                _cache[key] = agent
+        return agent

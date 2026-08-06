@@ -14,8 +14,6 @@ import importlib
 import logging
 from typing import Any
 
-from sqlalchemy.orm import Session
-
 from deepagents_app.db.models import ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -127,25 +125,30 @@ def expand_tool_definition(tool_def: ToolDefinition) -> list[Any]:
     return [load_builtin_tool(tool_def)]
 
 
-def load_tools_by_ids(db: Session, tool_ids: list[str]) -> list[Any]:
-    """按 id 列表加载并展开工具，保持顺序、去重。"""
-    if not tool_ids:
-        return []
-    rows = (
-        db.query(ToolDefinition)
-        .filter(ToolDefinition.id.in_(tool_ids), ToolDefinition.status == "active")
-        .all()
+def tool_definition_from_snapshot(payload: dict[str, Any]) -> ToolDefinition:
+    """从快照 dict 构造脱离 Session 的 ToolDefinition（仅供运行时展开）。"""
+    return ToolDefinition(
+        id=str(payload.get("id") or payload.get("name") or ""),
+        name=str(payload.get("name") or ""),
+        description=str(payload.get("description") or ""),
+        tool_type=str(payload.get("tool_type") or "builtin"),
+        class_path=payload.get("class_path"),
+        input_schema=payload.get("input_schema"),
+        output_schema=payload.get("output_schema"),
+        config=dict(payload.get("config") or {}),
+        status=str(payload.get("status") or "active"),
     )
-    by_id = {r.id: r for r in rows}
+
+
+def load_tools_from_snapshots(payloads: list[dict[str, Any]]) -> list[Any]:
+    """按快照内嵌的工具 payload 展开（顺序保留、按 id 去重）。"""
     tools: list[Any] = []
     seen: set[str] = set()
-    for tid in tool_ids:
-        if tid in seen:
+    for payload in payloads:
+        tid = str(payload.get("id") or payload.get("name") or "")
+        if tid and tid in seen:
             continue
-        seen.add(tid)
-        row = by_id.get(tid)
-        if row is None:
-            logger.warning("工具不存在或未激活，跳过：%s", tid)
-            continue
-        tools.extend(expand_tool_definition(row))
+        if tid:
+            seen.add(tid)
+        tools.extend(expand_tool_definition(tool_definition_from_snapshot(payload)))
     return tools

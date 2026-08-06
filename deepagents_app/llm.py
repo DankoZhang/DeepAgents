@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
+from deepagents_app.api.errors import BusinessError
 from deepagents_app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def build_chat_model(
 
         url = base_url if base_url is not None else settings.openai_base_url
         if not url:
-            raise ValueError("openai_compatible 模式必须设置 base_url / OPENAI_BASE_URL")
+            raise BusinessError("openai_compatible 模式必须设置 base_url / OPENAI_BASE_URL")
         key = api_key if api_key is not None else settings.openai_api_key
         logger.info(
             "使用兼容 OpenAI API 的模型：%s @ %s (temp=%s top_p=%s max_tokens=%s)",
@@ -110,7 +111,7 @@ def build_chat_model(
         )
         return ChatAnthropic(**kwargs)
 
-    raise ValueError(f"不支持的 model_provider：{resolved_provider}")
+    raise BusinessError(f"不支持的 model_provider：{resolved_provider}")
 
 
 def model_spec_from_row(row: Any) -> dict[str, Any]:

@@ -12,6 +12,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from deepagents_app.api.deps import require_user
 from deepagents_app.api.schemas import ToolCreate, ToolOut, ToolUpdate
 from deepagents_app.db.session import get_db
 from deepagents_app.services import tools as tools_svc
@@ -24,15 +25,23 @@ def list_tools(
     status: str | None = Query(None, description="active | disabled"),
     tool_type: str | None = Query(None, description="builtin | mcp"),
     db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
 ):
-    return tools_svc.list_tools(db, status=status, tool_type=tool_type)
+    return tools_svc.list_tools(
+        db, owner_user_id=user_id, status=status, tool_type=tool_type
+    )
 
 
 @router.post("/tool", response_model=ToolOut)
-def create_tool(body: ToolCreate, db: Session = Depends(get_db)):
+def create_tool(
+    body: ToolCreate,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
     """仅创建 MCP 工具（body.mcp 为连接配置；schema 层已禁止 class_path 式创建）。"""
     return tools_svc.create_mcp_tool(
         db,
+        owner_user_id=user_id,
         name=body.name,
         description=body.description,
         mcp_config=body.mcp.model_dump(),
@@ -42,18 +51,28 @@ def create_tool(body: ToolCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/tool/{tool_id}", response_model=ToolOut)
-def get_tool(tool_id: str, db: Session = Depends(get_db)):
-    row = tools_svc.get_tool(db, tool_id)
+def get_tool(
+    tool_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
+    row = tools_svc.get_tool(db, tool_id, owner_user_id=user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="工具不存在")
     return row
 
 
 @router.patch("/tool/{tool_id}", response_model=ToolOut)
-def update_tool(tool_id: str, body: ToolUpdate, db: Session = Depends(get_db)):
+def update_tool(
+    tool_id: str,
+    body: ToolUpdate,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
     return tools_svc.update_tool(
         db,
         tool_id,
+        owner_user_id=user_id,
         name=body.name,
         description=body.description,
         mcp_config=body.mcp.model_dump() if body.mcp else None,
@@ -62,6 +81,10 @@ def update_tool(tool_id: str, body: ToolUpdate, db: Session = Depends(get_db)):
 
 
 @router.delete("/tool/{tool_id}")
-def delete_tool(tool_id: str, db: Session = Depends(get_db)):
-    tools_svc.delete_tool(db, tool_id)
+def delete_tool(
+    tool_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(require_user),
+):
+    tools_svc.delete_tool(db, tool_id, owner_user_id=user_id)
     return {"ok": True}

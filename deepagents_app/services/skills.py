@@ -12,38 +12,48 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.config import Settings
-from deepagents_app.db.models import (
-    AgentSkill,
-    SkillDefinition,
+from deepagents_app.db.models import AgentSkill, SkillDefinition
+from deepagents_app.services.revisions import (
+    bump_methodologies_using_skill,
+    schedule_cache_invalidation,
 )
-from deepagents_app.services.agent_factory import invalidate_agent_cache
-from deepagents_app.services.revisions import bump_methodologies_using_agent
 
 logger = logging.getLogger(__name__)
 
-# 物化目录名：字母数字、连字符、下划线
 _SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
 def list_skills(
     db: Session,
     *,
+    owner_user_id: str,
     status: str | None = None,
 ) -> list[SkillDefinition]:
-    q = db.query(SkillDefinition).order_by(SkillDefinition.name)
+    q = (
+        db.query(SkillDefinition)
+        .filter(SkillDefinition.owner_user_id == owner_user_id)
+        .order_by(SkillDefinition.name)
+    )
     if status:
         q = q.filter(SkillDefinition.status == status)
     return q.all()
 
 
-def get_skill(db: Session, skill_id: str) -> SkillDefinition | None:
-    return db.get(SkillDefinition, skill_id)
+def get_skill(
+    db: Session, skill_id: str, *, owner_user_id: str
+) -> SkillDefinition | None:
+    row = db.get(SkillDefinition, skill_id)
+    if row is None or row.owner_user_id != owner_user_id:
+        return None
+    return row
 
 
 def create_skill(
     db: Session,
     *,
+    owner_user_id: str,
     name: str,
     content: str,
     description: str = "",
@@ -53,18 +63,25 @@ def create_skill(
 ) -> SkillDefinition:
     name = name.strip()
     _validate_skill_name(name)
-    if db.query(SkillDefinition).filter(SkillDefinition.name == name).one_or_none():
-        raise ValueError(f"已存在同名 Skill：{name}")
+    if (
+        db.query(SkillDefinition)
+        .filter(
+            SkillDefinition.owner_user_id == owner_user_id,
+            SkillDefinition.name == name,
+        )
+        .one_or_none()
+    ):
+        raise BusinessError(f"已存在同名 Skill：{name}")
 
     body = (content or "").strip()
     if not body:
-        raise ValueError("Skill content 不能为空")
-    # 无 frontmatter 时自动包一层，保证 SkillsMiddleware 能解析 name/description
+        raise BusinessError("Skill content 不能为空")
     if not body.lstrip().startswith("---"):
         body = build_skill_markdown(name=name, description=description, body=body)
 
     row = SkillDefinition(
         id=skill_id or f"skill_{uuid.uuid4().hex[:12]}",
+        owner_user_id=owner_user_id,
         name=name,
         description=(description or "").strip(),
         content=body,
@@ -80,6 +97,7 @@ def update_skill(
     db: Session,
     skill_id: str,
     *,
+    owner_user_id: str,
     name: str | None = None,
     description: str | None = None,
     content: str | None = None,
@@ -87,20 +105,24 @@ def update_skill(
     status: str | None = None,
     bump_related: bool = True,
 ) -> SkillDefinition:
-    row = get_skill(db, skill_id)
+    row = get_skill(db, skill_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"Skill 不存在：{skill_id}")
+        raise NotFoundError(f"Skill 不存在：{skill_id}")
 
     if name is not None and name.strip() != row.name:
         new_name = name.strip()
         _validate_skill_name(new_name)
         clash = (
             db.query(SkillDefinition)
-            .filter(SkillDefinition.name == new_name, SkillDefinition.id != skill_id)
+            .filter(
+                SkillDefinition.owner_user_id == owner_user_id,
+                SkillDefinition.name == new_name,
+                SkillDefinition.id != skill_id,
+            )
             .one_or_none()
         )
         if clash is not None:
-            raise ValueError(f"已存在同名 Skill：{new_name}")
+            raise BusinessError(f"已存在同名 Skill：{new_name}")
         row.name = new_name
 
     if description is not None:
@@ -108,7 +130,7 @@ def update_skill(
     if content is not None:
         body = content.strip()
         if not body:
-            raise ValueError("Skill content 不能为空")
+            raise BusinessError("Skill content 不能为空")
         if not body.lstrip().startswith("---"):
             body = build_skill_markdown(
                 name=row.name,
@@ -126,16 +148,22 @@ def update_skill(
     row.updated_time = datetime.now(timezone.utc)
     db.flush()
     if bump_related:
-        _bump_methodologies_using_skill(db, skill_id)
+        bump_methodologies_using_skill(db, skill_id)
     else:
-        invalidate_agent_cache()
+        schedule_cache_invalidation(db, all_keys=True)
     return row
 
 
-def delete_skill(db: Session, skill_id: str, *, bump_related: bool = True) -> None:
-    row = get_skill(db, skill_id)
+def delete_skill(
+    db: Session,
+    skill_id: str,
+    *,
+    owner_user_id: str,
+    bump_related: bool = True,
+) -> None:
+    row = get_skill(db, skill_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"Skill 不存在：{skill_id}")
+        raise NotFoundError(f"Skill 不存在：{skill_id}")
 
     agent_ids = [
         r.agent_id
@@ -143,31 +171,33 @@ def delete_skill(db: Session, skill_id: str, *, bump_related: bool = True) -> No
     ]
     db.delete(row)
     db.flush()
-    if bump_related:
-        for agent_id in agent_ids:
-            bump_methodologies_using_agent(db, agent_id)
+    if bump_related and agent_ids:
+        from deepagents_app.services.revisions import bump_methodologies_for_agent_ids
+
+        bump_methodologies_for_agent_ids(db, agent_ids)
     else:
-        invalidate_agent_cache()
+        schedule_cache_invalidation(db, all_keys=True)
 
 
-def load_skills_by_ids(db: Session, skill_ids: list[str]) -> list[SkillDefinition]:
-    """按 id 列表加载（保持顺序；缺失跳过；仅返回 active）。"""
-    if not skill_ids:
-        return []
-    rows = (
-        db.query(SkillDefinition)
-        .filter(SkillDefinition.id.in_(skill_ids))
-        .all()
+def skill_definition_from_snapshot(payload: dict[str, Any]) -> SkillDefinition:
+    """从快照 dict 构造脱离 Session 的 SkillDefinition（仅供物化）。"""
+    return SkillDefinition(
+        id=str(payload.get("id") or payload.get("name") or ""),
+        name=str(payload.get("name") or ""),
+        description=str(payload.get("description") or ""),
+        content=str(payload.get("content") or ""),
+        config=dict(payload.get("config") or {}),
+        status=str(payload.get("status") or "active"),
     )
-    by_id = {r.id: r for r in rows}
+
+
+def load_skills_from_snapshots(payloads: list[dict[str, Any]]) -> list[SkillDefinition]:
+    """按快照内嵌的 Skill payload 还原（顺序保留；仅 active）。"""
     result: list[SkillDefinition] = []
-    for sid in skill_ids:
-        row = by_id.get(sid)
-        if row is None:
-            logger.warning("快照引用的 Skill 不存在，跳过：%s", sid)
-            continue
-        if row.status != "active":
-            logger.warning("Skill 已禁用，跳过：%s (%s)", row.name, sid)
+    for payload in payloads:
+        row = skill_definition_from_snapshot(payload)
+        if (row.status or "active") != "active":
+            logger.warning("快照中 Skill 已禁用，跳过：%s (%s)", row.name, row.id)
             continue
         result.append(row)
     return result
@@ -182,8 +212,6 @@ def materialize_agent_skills(
 ) -> str | None:
     """
     把 Agent 已绑 Skills 物化到 ``workspace/skills/<scope>/<agent_id>/<name>/SKILL.md``。
-
-    ``scope`` 一般为 ``{methodology_id}/v{version}``，避免并发组装互删。
 
     Returns:
         供 ``skills=`` 使用的源目录虚拟路径；无可用 skill 返回 None。
@@ -204,7 +232,7 @@ def materialize_agent_skills(
 
 
 def clear_materialized_skills(settings: Settings, *, scope: str) -> None:
-    """清空指定 scope 下的物化 Skills（组装前调用，避免该方法论版本残留）。"""
+    """清空指定 scope 下的物化 Skills（组装前调用）。"""
     dst = settings.workspace_dir / "skills" / scope
     if dst.exists():
         shutil.rmtree(dst)
@@ -214,7 +242,6 @@ def clear_materialized_skills(settings: Settings, *, scope: str) -> None:
 def build_skill_markdown(*, name: str, description: str, body: str) -> str:
     """用 name/description + 正文拼出带 frontmatter 的 SKILL.md。"""
     desc = (description or "").strip() or name
-    # YAML 多行 description，避免特殊字符破坏 frontmatter
     desc_yaml = desc.replace("\r\n", "\n")
     if "\n" in desc_yaml:
         desc_block = ">\n  " + "\n  ".join(desc_yaml.split("\n"))
@@ -240,7 +267,6 @@ def parse_skill_markdown(content: str) -> tuple[str | None, str | None]:
     fm = text[3:end].strip()
     name: str | None = None
     description: str | None = None
-    # 简易 YAML：支持 name: xxx 与 description: > 多行
     lines = fm.splitlines()
     i = 0
     while i < len(lines):
@@ -255,7 +281,9 @@ def parse_skill_markdown(content: str) -> tuple[str | None, str | None]:
                 parts: list[str] = []
                 i += 1
                 while i < len(lines) and (
-                    lines[i].startswith("  ") or lines[i].startswith("\t") or lines[i] == ""
+                    lines[i].startswith("  ")
+                    or lines[i].startswith("\t")
+                    or lines[i] == ""
                 ):
                     parts.append(lines[i].strip())
                     i += 1
@@ -272,6 +300,7 @@ def import_skill_from_file(
     db: Session,
     path: Path,
     *,
+    owner_user_id: str,
     skill_id: str | None = None,
     name_override: str | None = None,
 ) -> SkillDefinition | None:
@@ -281,15 +310,23 @@ def import_skill_from_file(
     content = path.read_text(encoding="utf-8")
     fm_name, fm_desc = parse_skill_markdown(content)
     name = (name_override or fm_name or path.parent.name).strip()
-    if skill_id and db.get(SkillDefinition, skill_id) is not None:
-        return db.get(SkillDefinition, skill_id)
+    if skill_id:
+        existing_by_id = get_skill(db, skill_id, owner_user_id=owner_user_id)
+        if existing_by_id is not None:
+            return existing_by_id
     existing = (
-        db.query(SkillDefinition).filter(SkillDefinition.name == name).one_or_none()
+        db.query(SkillDefinition)
+        .filter(
+            SkillDefinition.owner_user_id == owner_user_id,
+            SkillDefinition.name == name,
+        )
+        .one_or_none()
     )
     if existing is not None:
         return existing
     return create_skill(
         db,
+        owner_user_id=owner_user_id,
         name=name,
         description=fm_desc or "",
         content=content,
@@ -299,16 +336,6 @@ def import_skill_from_file(
 
 def _validate_skill_name(name: str) -> None:
     if not _SKILL_NAME_RE.match(name):
-        raise ValueError(
+        raise BusinessError(
             "Skill name 须为字母/数字开头，仅含字母数字、连字符、下划线（亦作物化目录名）"
         )
-
-
-def _bump_methodologies_using_skill(db: Session, skill_id: str) -> None:
-    links = db.query(AgentSkill).filter(AgentSkill.skill_id == skill_id).all()
-    seen: set[str] = set()
-    for link in links:
-        if link.agent_id in seen:
-            continue
-        seen.add(link.agent_id)
-        bump_methodologies_using_agent(db, link.agent_id)

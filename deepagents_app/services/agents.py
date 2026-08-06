@@ -7,13 +7,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.constants import DEFAULT_MODEL_ID
 from deepagents_app.db.loading import agent_detail_options
 from deepagents_app.db.models import (
     AgentDefinition,
-    AgentMiddleware,
-    AgentSkill,
-    AgentTool,
     Methodology,
     MethodologyAgent,
     MiddlewareDefinition,
@@ -21,6 +19,7 @@ from deepagents_app.db.models import (
     SkillDefinition,
     ToolDefinition,
 )
+from deepagents_app.ownership import default_model_id_for_user
 from deepagents_app.services.revisions import (
     bump_methodologies_using_agent,
     bump_methodology,
@@ -30,10 +29,15 @@ from deepagents_app.services.revisions import (
 def list_agents(
     db: Session,
     *,
+    owner_user_id: str,
     methodology_id: str | None = None,
 ) -> list[AgentDefinition]:
     """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。"""
-    q = db.query(AgentDefinition).options(*agent_detail_options())
+    q = (
+        db.query(AgentDefinition)
+        .options(*agent_detail_options())
+        .filter(AgentDefinition.owner_user_id == owner_user_id)
+    )
     if methodology_id:
         q = q.join(MethodologyAgent).filter(
             MethodologyAgent.methodology_id == methodology_id
@@ -41,24 +45,26 @@ def list_agents(
     return q.order_by(AgentDefinition.name).all()
 
 
-def get_agent(db: Session, agent_id: str) -> AgentDefinition | None:
+def get_agent(
+    db: Session, agent_id: str, *, owner_user_id: str
+) -> AgentDefinition | None:
     """按主键取单个全局 Agent，并带上 tools / middlewares / skills / llm_model。"""
-    # 同会话内刚改过 association 时，先 expire 关系集合再 joinedload
-    cached = db.get(AgentDefinition, agent_id)
-    if cached is not None:
-        db.expire(cached, ["tools", "middlewares", "skills", "llm_model"])
-    return (
+    row = (
         db.query(AgentDefinition)
         .options(*agent_detail_options())
-        .execution_options(populate_existing=True)
-        .filter(AgentDefinition.id == agent_id)
+        .filter(
+            AgentDefinition.id == agent_id,
+            AgentDefinition.owner_user_id == owner_user_id,
+        )
         .one_or_none()
     )
+    return row
 
 
 def create_agent(
     db: Session,
     *,
+    owner_user_id: str,
     name: str,
     system_prompt: str = "",
     model_id: str | None = None,
@@ -72,13 +78,18 @@ def create_agent(
     """创建全局 Agent（不隶属单一方法论；由方法论另行勾选）。"""
     existing = (
         db.query(AgentDefinition)
-        .filter(AgentDefinition.name == name)
+        .filter(
+            AgentDefinition.owner_user_id == owner_user_id,
+            AgentDefinition.name == name,
+        )
         .one_or_none()
     )
     if existing is not None:
-        raise ValueError(f"已存在同名 Agent：{name}")
+        raise BusinessError(f"已存在同名 Agent：{name}")
 
-    resolved_model_id = _validate_model_id(db, model_id or DEFAULT_MODEL_ID)
+    resolved_model_id = _resolve_model_id_for_user(
+        db, model_id, owner_user_id=owner_user_id
+    )
 
     cfg = dict(config or {})
     cfg.setdefault("role", "subagent")
@@ -86,6 +97,7 @@ def create_agent(
 
     row = AgentDefinition(
         id=agent_id or f"agent_{uuid.uuid4().hex[:12]}",
+        owner_user_id=owner_user_id,
         name=name,
         system_prompt=system_prompt,
         model_id=resolved_model_id,
@@ -95,21 +107,24 @@ def create_agent(
     db.flush()
 
     if tool_ids:
-        _bind_tools(db, row.id, tool_ids, replace=True)
+        _set_agent_tools(db, row, tool_ids, owner_user_id=owner_user_id)
     if middleware_ids:
-        _bind_middlewares(db, row.id, middleware_ids, replace=True)
+        _set_agent_middlewares(
+            db, row, middleware_ids, owner_user_id=owner_user_id
+        )
     if skill_ids:
-        _bind_skills(db, row.id, skill_ids, replace=True)
+        _set_agent_skills(db, row, skill_ids, owner_user_id=owner_user_id)
 
     if bump_related:
         bump_methodologies_using_agent(db, row.id)
-    return get_agent(db, row.id)  # type: ignore[return-value]
+    return get_agent(db, row.id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
 def update_agent(
     db: Session,
     agent_id: str,
     *,
+    owner_user_id: str,
     name: str | None = None,
     system_prompt: str | None = None,
     model_id: str | None = None,
@@ -119,44 +134,58 @@ def update_agent(
     skill_ids: list[str] | None = None,
     bump_related: bool = True,
 ) -> AgentDefinition:
-    row = get_agent(db, agent_id)
+    row = get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"Agent 不存在：{agent_id}")
+        raise NotFoundError(f"Agent 不存在：{agent_id}")
 
     if name is not None and name != row.name:
         clash = (
             db.query(AgentDefinition)
-            .filter(AgentDefinition.name == name, AgentDefinition.id != agent_id)
+            .filter(
+                AgentDefinition.owner_user_id == owner_user_id,
+                AgentDefinition.name == name,
+                AgentDefinition.id != agent_id,
+            )
             .one_or_none()
         )
         if clash is not None:
-            raise ValueError(f"已存在同名 Agent：{name}")
+            raise BusinessError(f"已存在同名 Agent：{name}")
         row.name = name
     if system_prompt is not None:
         row.system_prompt = system_prompt
     if model_id is not None:
-        row.model_id = _validate_model_id(db, model_id or DEFAULT_MODEL_ID)
+        row.model_id = _resolve_model_id_for_user(
+            db, model_id, owner_user_id=owner_user_id
+        )
     if config is not None:
         merged = dict(row.config or {})
         merged.update(config)
         row.config = merged
     if tool_ids is not None:
-        _bind_tools(db, row.id, tool_ids, replace=True)
+        _set_agent_tools(db, row, tool_ids, owner_user_id=owner_user_id)
     if middleware_ids is not None:
-        _bind_middlewares(db, row.id, middleware_ids, replace=True)
+        _set_agent_middlewares(
+            db, row, middleware_ids, owner_user_id=owner_user_id
+        )
     if skill_ids is not None:
-        _bind_skills(db, row.id, skill_ids, replace=True)
+        _set_agent_skills(db, row, skill_ids, owner_user_id=owner_user_id)
 
     db.flush()
     if bump_related:
         bump_methodologies_using_agent(db, agent_id)
-    return get_agent(db, agent_id)  # type: ignore[return-value]
+    return get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
-def delete_agent(db: Session, agent_id: str, *, bump_related: bool = True) -> None:
-    row = db.get(AgentDefinition, agent_id)
+def delete_agent(
+    db: Session,
+    agent_id: str,
+    *,
+    owner_user_id: str,
+    bump_related: bool = True,
+) -> None:
+    row = get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"Agent 不存在：{agent_id}")
+        raise NotFoundError(f"Agent 不存在：{agent_id}")
     methodology_ids = [
         r.methodology_id
         for r in db.query(MethodologyAgent)
@@ -177,6 +206,7 @@ def bind_agent_tools(
     agent_id: str,
     tool_ids: list[str],
     *,
+    owner_user_id: str,
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
@@ -184,9 +214,11 @@ def bind_agent_tools(
         db,
         agent_id,
         tool_ids,
+        owner_user_id=owner_user_id,
         replace=replace,
         bump_related=bump_related,
-        binder=_bind_tools,
+        setter=_set_agent_tools,
+        merger=_merge_agent_tools,
     )
 
 
@@ -195,6 +227,7 @@ def bind_agent_middlewares(
     agent_id: str,
     middleware_ids: list[str],
     *,
+    owner_user_id: str,
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
@@ -202,9 +235,11 @@ def bind_agent_middlewares(
         db,
         agent_id,
         middleware_ids,
+        owner_user_id=owner_user_id,
         replace=replace,
         bump_related=bump_related,
-        binder=_bind_middlewares,
+        setter=_set_agent_middlewares,
+        merger=_merge_agent_middlewares,
     )
 
 
@@ -213,6 +248,7 @@ def bind_agent_skills(
     agent_id: str,
     skill_ids: list[str],
     *,
+    owner_user_id: str,
     replace: bool = True,
     bump_related: bool = True,
 ) -> AgentDefinition:
@@ -220,9 +256,11 @@ def bind_agent_skills(
         db,
         agent_id,
         skill_ids,
+        owner_user_id=owner_user_id,
         replace=replace,
         bump_related=bump_related,
-        binder=_bind_skills,
+        setter=_set_agent_skills,
+        merger=_merge_agent_skills,
     )
 
 
@@ -231,119 +269,189 @@ def _bind_and_reload(
     agent_id: str,
     target_ids: list[str],
     *,
+    owner_user_id: str,
     replace: bool,
     bump_related: bool,
-    binder,
+    setter,
+    merger,
 ) -> AgentDefinition:
-    row = get_agent(db, agent_id)
+    row = get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"Agent 不存在：{agent_id}")
-    binder(db, agent_id, target_ids, replace=replace)
+        raise NotFoundError(f"Agent 不存在：{agent_id}")
+    if replace:
+        setter(db, row, target_ids, owner_user_id=owner_user_id)
+    else:
+        merger(db, row, target_ids, owner_user_id=owner_user_id)
     db.flush()
     if bump_related:
         bump_methodologies_using_agent(db, agent_id)
-    return get_agent(db, agent_id)  # type: ignore[return-value]
+    return get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
-def _bind_links(
+def _load_owned(
     db: Session,
-    agent_id: str,
-    target_ids: list[str],
+    model: type,
+    target_id: str,
     *,
-    replace: bool,
-    link_model: type,
-    target_model: type,
-    link_fk: str,
+    owner_user_id: str,
     missing_label: str,
-    validate_target=None,
-) -> None:
-    """通用 Agent ↔ 目标实体多对多绑定。"""
-    if replace:
-        db.query(link_model).filter(link_model.agent_id == agent_id).delete()
-    for tid in target_ids:
-        target = db.get(target_model, tid)
-        if target is None:
-            raise LookupError(f"{missing_label}不存在：{tid}")
-        if validate_target is not None:
-            validate_target(target)
-        exists = (
-            db.query(link_model)
-            .filter_by(agent_id=agent_id, **{link_fk: tid})
-            .one_or_none()
-        )
-        if exists is None:
-            db.add(link_model(agent_id=agent_id, **{link_fk: tid}))
+) -> Any:
+    target = db.get(model, target_id)
+    if target is None:
+        raise NotFoundError(f"{missing_label}不存在：{target_id}")
+    if target.owner_user_id != owner_user_id:
+        raise BusinessError(f"{missing_label}不属于当前用户：{target_id}")
+    return target
 
 
-def _bind_tools(
+def _set_agent_tools(
     db: Session,
-    agent_id: str,
+    agent: AgentDefinition,
     tool_ids: list[str],
     *,
-    replace: bool,
+    owner_user_id: str,
 ) -> None:
-    _bind_links(
-        db,
-        agent_id,
-        tool_ids,
-        replace=replace,
-        link_model=AgentTool,
-        target_model=ToolDefinition,
-        link_fk="tool_id",
-        missing_label="工具",
-    )
+    tools = [
+        _load_owned(
+            db, ToolDefinition, tid, owner_user_id=owner_user_id, missing_label="工具"
+        )
+        for tid in tool_ids
+    ]
+    agent.tools = tools
 
 
-def _bind_middlewares(
+def _merge_agent_tools(
     db: Session,
-    agent_id: str,
+    agent: AgentDefinition,
+    tool_ids: list[str],
+    *,
+    owner_user_id: str,
+) -> None:
+    existing = {t.id for t in agent.tools}
+    for tid in tool_ids:
+        if tid in existing:
+            continue
+        agent.tools.append(
+            _load_owned(
+                db,
+                ToolDefinition,
+                tid,
+                owner_user_id=owner_user_id,
+                missing_label="工具",
+            )
+        )
+
+
+def _set_agent_middlewares(
+    db: Session,
+    agent: AgentDefinition,
     middleware_ids: list[str],
     *,
-    replace: bool,
+    owner_user_id: str,
 ) -> None:
-    _bind_links(
-        db,
-        agent_id,
-        middleware_ids,
-        replace=replace,
-        link_model=AgentMiddleware,
-        target_model=MiddlewareDefinition,
-        link_fk="middleware_id",
-        missing_label="中间件",
-    )
+    rows = [
+        _load_owned(
+            db,
+            MiddlewareDefinition,
+            mid,
+            owner_user_id=owner_user_id,
+            missing_label="中间件",
+        )
+        for mid in middleware_ids
+    ]
+    agent.middlewares = rows
 
 
-def _bind_skills(
+def _merge_agent_middlewares(
     db: Session,
-    agent_id: str,
+    agent: AgentDefinition,
+    middleware_ids: list[str],
+    *,
+    owner_user_id: str,
+) -> None:
+    existing = {m.id for m in agent.middlewares}
+    for mid in middleware_ids:
+        if mid in existing:
+            continue
+        agent.middlewares.append(
+            _load_owned(
+                db,
+                MiddlewareDefinition,
+                mid,
+                owner_user_id=owner_user_id,
+                missing_label="中间件",
+            )
+        )
+
+
+def _set_agent_skills(
+    db: Session,
+    agent: AgentDefinition,
     skill_ids: list[str],
     *,
-    replace: bool,
+    owner_user_id: str,
 ) -> None:
-    def _check_active(skill: SkillDefinition) -> None:
+    rows = []
+    for sid in skill_ids:
+        skill = _load_owned(
+            db,
+            SkillDefinition,
+            sid,
+            owner_user_id=owner_user_id,
+            missing_label="Skill",
+        )
         if skill.status != "active":
-            raise ValueError(f"Skill 已禁用：{skill.name}")
-
-    _bind_links(
-        db,
-        agent_id,
-        skill_ids,
-        replace=replace,
-        link_model=AgentSkill,
-        target_model=SkillDefinition,
-        link_fk="skill_id",
-        missing_label="Skill",
-        validate_target=_check_active,
-    )
+            raise BusinessError(f"Skill 已禁用：{skill.name}")
+        rows.append(skill)
+    agent.skills = rows
 
 
-def _validate_model_id(db: Session, model_id: str | None) -> str | None:
+def _merge_agent_skills(
+    db: Session,
+    agent: AgentDefinition,
+    skill_ids: list[str],
+    *,
+    owner_user_id: str,
+) -> None:
+    existing = {s.id for s in agent.skills}
+    for sid in skill_ids:
+        if sid in existing:
+            continue
+        skill = _load_owned(
+            db,
+            SkillDefinition,
+            sid,
+            owner_user_id=owner_user_id,
+            missing_label="Skill",
+        )
+        if skill.status != "active":
+            raise BusinessError(f"Skill 已禁用：{skill.name}")
+        agent.skills.append(skill)
+
+
+def _resolve_model_id_for_user(
+    db: Session,
+    model_id: str | None,
+    *,
+    owner_user_id: str,
+) -> str | None:
+    """解析并校验 model_id；None / 默认 base id 映射为该用户 scoped 默认模型。"""
+    if not model_id or model_id == DEFAULT_MODEL_ID:
+        model_id = default_model_id_for_user(owner_user_id)
+    return _validate_model_id(db, model_id, owner_user_id=owner_user_id)
+
+
+def _validate_model_id(
+    db: Session, model_id: str | None, *, owner_user_id: str
+) -> str | None:
     """校验 model_id 存在且可用；None 表示不绑定目录。"""
     if not model_id:
         return None
     row = db.get(ModelDefinition, model_id)
     if row is None:
-        raise LookupError(f"模型不存在：{model_id}")
+        raise NotFoundError(f"模型不存在：{model_id}")
+    if row.owner_user_id != owner_user_id:
+        raise BusinessError(f"模型不属于当前用户：{model_id}")
     if row.status != "active":
-        raise ValueError(f"模型已禁用：{row.name}")
+        raise BusinessError(f"模型已禁用：{row.name}")
     return model_id

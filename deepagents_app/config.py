@@ -59,6 +59,19 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8001
 
+    # ── 鉴权（外部 API 解析 Bearer token → user_id）────────────────────
+    # 验 token 的完整 URL；AUTH_DISABLED=false 时必填
+    auth_introspect_url: str = ""
+    # GET：仅带 Authorization；POST：另发 JSON {"token": "..."}
+    auth_introspect_method: Literal["GET", "POST"] = "GET"
+    # 响应 JSON 中用户字段（支持点路径，如 data.user_id）
+    auth_user_id_field: str = "user_id"
+    auth_timeout_seconds: float = 5.0
+    auth_cache_ttl_seconds: float = 60.0
+    # True：跳过外部鉴权，固定使用 auth_dev_user_id（仅本地/测试）
+    auth_disabled: bool = True
+    auth_dev_user_id: str = "dev-user"
+
     # ── 功能开关 ──────────────────────────────────────────────────────
     # 是否在危险工具（shell / 写文件）前暂停等待人工批准
     enable_hitl: bool = False

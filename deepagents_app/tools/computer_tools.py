@@ -26,29 +26,27 @@ from pydantic import BaseModel, Field
 from deepagents_app.config import get_settings
 from deepagents_app.utils.paths import resolve_under_root
 
-# 允许执行的命令前缀（演示白名单）
-_ALLOWED_PREFIXES = (
-    "ls",
-    "pwd",
-    "echo",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "find",
-    "grep",
-    "python",
-    "python3",
-    "pip",
-    "pip3",
-    "mkdir",
-    "touch",
-    "cp",
-    "mv",
-    "date",
-    "uname",
-    "which",
-    "tree",
+# 允许执行的命令名（argv[0]；不以 shell 元字符拼接，故不含 python/pip）
+_ALLOWED_COMMANDS = frozenset(
+    {
+        "ls",
+        "pwd",
+        "echo",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "find",
+        "grep",
+        "mkdir",
+        "touch",
+        "cp",
+        "mv",
+        "date",
+        "uname",
+        "which",
+        "tree",
+    }
 )
 
 # 明显危险模式
@@ -76,32 +74,41 @@ def _safe_path(relative_path: str) -> Path:
         raise ValueError(f"路径越界，仅允许访问 workspace：{relative_path}") from exc
 
 
-def _validate_command(command: str) -> str | None:
-    """校验 shell 命令；不合法时返回错误信息，合法返回 None。"""
+def _validate_command(command: str) -> tuple[list[str] | None, str | None]:
+    """
+    解析并校验命令。
+
+    Returns:
+        (argv, None) 合法； (None, error) 不合法。
+    使用 argv 列表 + ``shell=False``，避免 ``;`` / ``$()`` / 管道等元字符绕过。
+    """
     stripped = command.strip()
     if not stripped:
-        return "命令为空"
+        return None, "命令为空"
+
+    # 显式拒绝 shell 元字符（即便 shell=False，也避免混淆与参数注入观感）
+    if re.search(r"[;&|`$]|\$\(|\n", stripped):
+        return None, "禁止 shell 元字符与命令拼接；请传入单一命令及参数"
 
     for pat in _DANGEROUS_PATTERNS:
         if pat.search(stripped):
-            return f"命令匹配危险模式，已拒绝：{pat.pattern}"
+            return None, f"命令匹配危险模式，已拒绝：{pat.pattern}"
 
     try:
         parts = shlex.split(stripped)
     except ValueError as exc:
-        return f"命令解析失败：{exc}"
+        return None, f"命令解析失败：{exc}"
 
     if not parts:
-        return "命令为空"
+        return None, "命令为空"
 
-    head = parts[0]
-    # 允许 ``python -c`` 等，但首 token 必须在白名单
-    if not any(head == p or head.endswith(f"/{p}") for p in _ALLOWED_PREFIXES):
-        return (
+    head = Path(parts[0]).name
+    if head not in _ALLOWED_COMMANDS:
+        return None, (
             f"命令「{head}」不在白名单。允许："
-            + ", ".join(_ALLOWED_PREFIXES)
+            + ", ".join(sorted(_ALLOWED_COMMANDS))
         )
-    return None
+    return parts, None
 
 
 class ListWorkspaceArgs(BaseModel):
@@ -189,16 +196,16 @@ def write_workspace_file(relative_path: str, content: str, overwrite: bool = Fal
 
 @tool(args_schema=RunShellCommandArgs)
 def run_shell_command(command: str, timeout_seconds: int = 30) -> str:
-    """在 workspace 目录下执行白名单内的 shell 命令，返回 stdout/stderr 摘要。"""
-    err = _validate_command(command)
-    if err:
+    """在 workspace 目录下执行白名单内命令（``shell=False``），返回 stdout/stderr 摘要。"""
+    argv, err = _validate_command(command)
+    if err or argv is None:
         return f"[拒绝执行] {err}"
 
     cwd = _workspace()
     try:
         completed = subprocess.run(
-            command,
-            shell=True,
+            argv,
+            shell=False,
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -212,15 +219,15 @@ def run_shell_command(command: str, timeout_seconds: int = 30) -> str:
 
     stdout = (completed.stdout or "").strip()
     stderr = (completed.stderr or "").strip()
-    parts = [
+    lines = [
         f"exit_code={completed.returncode}",
         f"cwd={cwd}",
-        f"command={command}",
+        f"command={' '.join(argv)}",
     ]
     if stdout:
-        parts.append(f"--- stdout ---\n{stdout}")
+        lines.append(f"--- stdout ---\n{stdout}")
     if stderr:
-        parts.append(f"--- stderr ---\n{stderr}")
+        lines.append(f"--- stderr ---\n{stderr}")
     if not stdout and not stderr:
-        parts.append("(无输出)")
-    return "\n".join(parts)
+        lines.append("(无输出)")
+    return "\n".join(lines)

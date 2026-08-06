@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 # BaseModel：schema 基类；Field：默认值/工厂；model_validator：跨字段校验
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 # ── Tool / Middleware briefs（嵌套在 Agent 响应里的精简摘要）──────────────
@@ -106,11 +106,17 @@ class ModelOut(BaseModel):
     timeout: float | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     status: str
-    has_api_key: bool = False
     created_time: datetime
     updated_time: datetime
+    # 由 ORM api_key 派生，不在响应中暴露密钥本身
+    api_key: str | None = Field(default=None, exclude=True)
 
     model_config = {"from_attributes": True}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def has_api_key(self) -> bool:
+        return bool(self.api_key)
 
 
 class ModelBrief(BaseModel):
@@ -230,12 +236,10 @@ class MethodologyCreate(BaseModel):
 
 
 class MethodologyUpdate(BaseModel):
-    """PATCH /api/methodology/{id}：改元信息。"""
+    """PATCH /api/methodology/{id}：仅改元信息（不升版）。"""
 
     name: str | None = None
     description: str | None = None
-    # True：version+1 并写快照；False：只改文字不 bump
-    bump_version: bool = True
 
 
 class MethodologyBindAgents(BaseModel):
@@ -398,8 +402,7 @@ class SkillOut(BaseModel):
 class ConversationCreate(BaseModel):
     """POST /api/conversation：基于已发布方法论开新会话。"""
 
-    methodology_id: str  # 必须是 published 方法论
-    user_id: str | None = None  # 可选用户标识
+    methodology_id: str  # 必须是 published 方法论（且归属当前用户）
     thread_id: str | None = None  # 可选指定；否则服务端生成（LangGraph 用）
 
 
@@ -408,7 +411,7 @@ class ConversationOut(BaseModel):
 
     id: str
     thread_id: str  # 多轮状态隔离键
-    user_id: str | None
+    user_id: str
     methodology_id: str
     methodology_version: int  # 创建时锁定的方法论版本
     created_time: datetime

@@ -9,9 +9,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.config import Settings, get_settings
 from deepagents_app.db.models import AgentDefinition, ModelDefinition
 from deepagents_app.llm import build_chat_model, model_spec_from_row
+from deepagents_app.ownership import default_model_id_for_user
 from deepagents_app.utils.text import normalize_message_content
 
 logger = logging.getLogger(__name__)
@@ -22,21 +24,32 @@ ALLOWED_PROVIDERS = frozenset({"openai", "anthropic", "openai_compatible"})
 def list_models(
     db: Session,
     *,
+    owner_user_id: str,
     status: str | None = None,
 ) -> list[ModelDefinition]:
-    q = db.query(ModelDefinition).order_by(ModelDefinition.name)
+    q = (
+        db.query(ModelDefinition)
+        .filter(ModelDefinition.owner_user_id == owner_user_id)
+        .order_by(ModelDefinition.name)
+    )
     if status:
         q = q.filter(ModelDefinition.status == status)
     return q.all()
 
 
-def get_model(db: Session, model_id: str) -> ModelDefinition | None:
-    return db.get(ModelDefinition, model_id)
+def get_model(
+    db: Session, model_id: str, *, owner_user_id: str
+) -> ModelDefinition | None:
+    row = db.get(ModelDefinition, model_id)
+    if row is None or row.owner_user_id != owner_user_id:
+        return None
+    return row
 
 
 def create_model(
     db: Session,
     *,
+    owner_user_id: str,
     name: str,
     provider: str,
     model_name: str,
@@ -53,13 +66,19 @@ def create_model(
 ) -> ModelDefinition:
     _validate_provider(provider, base_url=base_url)
     existing = (
-        db.query(ModelDefinition).filter(ModelDefinition.name == name).one_or_none()
+        db.query(ModelDefinition)
+        .filter(
+            ModelDefinition.owner_user_id == owner_user_id,
+            ModelDefinition.name == name,
+        )
+        .one_or_none()
     )
     if existing is not None:
-        raise ValueError(f"已存在同名模型配置：{name}")
+        raise BusinessError(f"已存在同名模型配置：{name}")
 
     row = ModelDefinition(
         id=model_id or f"model_{uuid.uuid4().hex[:12]}",
+        owner_user_id=owner_user_id,
         name=name,
         provider=provider,
         model_name=model_name,
@@ -82,6 +101,7 @@ def update_model(
     db: Session,
     model_id: str,
     *,
+    owner_user_id: str,
     name: str | None = None,
     provider: str | None = None,
     model_name: str | None = None,
@@ -97,18 +117,22 @@ def update_model(
     status: str | None = None,
     bump_related: bool = True,
 ) -> ModelDefinition:
-    row = get_model(db, model_id)
+    row = get_model(db, model_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"模型不存在：{model_id}")
+        raise NotFoundError(f"模型不存在：{model_id}")
 
     if name is not None and name != row.name:
         clash = (
             db.query(ModelDefinition)
-            .filter(ModelDefinition.name == name, ModelDefinition.id != model_id)
+            .filter(
+                ModelDefinition.owner_user_id == owner_user_id,
+                ModelDefinition.name == name,
+                ModelDefinition.id != model_id,
+            )
             .one_or_none()
         )
         if clash is not None:
-            raise ValueError(f"已存在同名模型配置：{name}")
+            raise BusinessError(f"已存在同名模型配置：{name}")
         row.name = name
 
     if provider is not None:
@@ -143,27 +167,40 @@ def update_model(
     db.flush()
 
     if bump_related:
-        _bump_methodologies_using_model(db, model_id)
+        from deepagents_app.services.revisions import bump_methodologies_using_model
+
+        bump_methodologies_using_model(db, model_id)
     return row
 
 
-def delete_model(db: Session, model_id: str, *, bump_related: bool = True) -> None:
-    row = get_model(db, model_id)
+def delete_model(
+    db: Session,
+    model_id: str,
+    *,
+    owner_user_id: str,
+    bump_related: bool = True,
+) -> None:
+    row = get_model(db, model_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"模型不存在：{model_id}")
+        raise NotFoundError(f"模型不存在：{model_id}")
 
     agents = (
-        db.query(AgentDefinition).filter(AgentDefinition.model_id == model_id).all()
+        db.query(AgentDefinition)
+        .filter(
+            AgentDefinition.model_id == model_id,
+            AgentDefinition.owner_user_id == owner_user_id,
+        )
+        .all()
     )
     if agents:
         names = ", ".join(a.name for a in agents[:5])
         more = "" if len(agents) <= 5 else f" 等 {len(agents)} 个"
-        raise ValueError(f"模型仍被 Agent 引用，无法删除：{names}{more}")
+        raise BusinessError(f"模型仍被 Agent 引用，无法删除：{names}{more}")
 
     if bump_related:
-        from deepagents_app.services.agent_factory import invalidate_agent_cache
+        from deepagents_app.services.revisions import schedule_cache_invalidation
 
-        invalidate_agent_cache()
+        schedule_cache_invalidation(db, all_keys=True)
     db.delete(row)
     db.flush()
 
@@ -205,7 +242,7 @@ def test_model_connectivity(
             "message": "连通性测试成功",
             "reply_preview": text[:200],
         }
-    except Exception as exc:  # noqa: BLE001 — 测试接口需把错误回给前端
+    except Exception as exc:  # noqa: BLE001
         logger.warning("模型连通性测试失败：%s", exc)
         return {
             "ok": False,
@@ -214,12 +251,18 @@ def test_model_connectivity(
         }
 
 
-def test_model_by_id(db: Session, model_id: str) -> dict[str, Any]:
-    row = get_model(db, model_id)
+def test_model_by_id(
+    db: Session, model_id: str, *, owner_user_id: str
+) -> dict[str, Any]:
+    row = get_model(db, model_id, owner_user_id=owner_user_id)
     if row is None:
-        raise LookupError(f"模型不存在：{model_id}")
+        raise NotFoundError(f"模型不存在：{model_id}")
     if row.status != "active":
-        return {"ok": False, "message": f"模型状态为 {row.status}，未测试", "reply_preview": None}
+        return {
+            "ok": False,
+            "message": f"模型状态为 {row.status}，未测试",
+            "reply_preview": None,
+        }
     return test_model_connectivity(
         provider=row.provider,
         model_name=row.model_name,
@@ -262,6 +305,7 @@ def serialize_model_for_snapshot(
 def resolve_model_spec_for_agent(
     db: Session,
     *,
+    owner_user_id: str,
     model_id: str | None,
     snapshot_llm: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
@@ -274,7 +318,7 @@ def resolve_model_spec_for_agent(
         spec = dict(snapshot_llm)
         mid = spec.get("model_id")
         if mid and not spec.get("api_key"):
-            live = get_model(db, str(mid))
+            live = get_model(db, str(mid), owner_user_id=owner_user_id)
             if live is not None:
                 spec["api_key"] = live.api_key
                 if not spec.get("base_url"):
@@ -282,11 +326,11 @@ def resolve_model_spec_for_agent(
         return spec
 
     if model_id:
-        row = get_model(db, model_id)
+        row = get_model(db, model_id, owner_user_id=owner_user_id)
         if row is None:
-            raise LookupError(f"Agent 绑定的模型不存在：{model_id}")
+            raise NotFoundError(f"Agent 绑定的模型不存在：{model_id}")
         if row.status != "active":
-            raise ValueError(f"模型已禁用：{row.name} ({model_id})")
+            raise BusinessError(f"模型已禁用：{row.name} ({model_id})")
         return model_spec_from_row(row)
 
     return None
@@ -296,16 +340,21 @@ def ensure_default_model_from_settings(
     db: Session,
     settings: Settings | None = None,
     *,
-    model_id: str = "model_default",
+    owner_user_id: str,
+    model_id: str | None = None,
 ) -> ModelDefinition:
     """幂等：用 Settings/.env 种子一条默认模型目录项。"""
     settings = settings or get_settings()
-    existing = db.get(ModelDefinition, model_id)
+    resolved_id = (
+        model_id if model_id is not None else default_model_id_for_user(owner_user_id)
+    )
+    existing = get_model(db, resolved_id, owner_user_id=owner_user_id)
     if existing is not None:
         return existing
     return create_model(
         db,
-        model_id=model_id,
+        owner_user_id=owner_user_id,
+        model_id=resolved_id,
         name="默认模型",
         provider=settings.model_provider,
         model_name=settings.model_name,
@@ -320,14 +369,6 @@ def ensure_default_model_from_settings(
 
 def _validate_provider(provider: str, *, base_url: str | None) -> None:
     if provider not in ALLOWED_PROVIDERS:
-        raise ValueError(
+        raise BusinessError(
             f"不支持的 provider：{provider}，可选：{', '.join(sorted(ALLOWED_PROVIDERS))}"
         )
-    # openai_compatible 允许创建时 base_url 为空，运行时回退 Settings.openai_base_url
-
-
-def _bump_methodologies_using_model(db: Session, model_id: str) -> None:
-    """模型超参数变更：bump 所有引用该模型的 Agent 所在方法论。"""
-    from deepagents_app.services.revisions import bump_methodologies_using_model
-
-    bump_methodologies_using_model(db, model_id)

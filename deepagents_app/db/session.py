@@ -134,26 +134,17 @@ def migrate_db(database_url: str | None = None) -> None:
 
 
 def get_db() -> Generator[Session, None, None]:
-    """
-    FastAPI Depends 用的会话生成器（与 lifespan 里手动开 Session 模式一致）。
-
-    请求成功结束自动 commit；异常则 rollback。
-    路由内一般不必手动 commit。
-    """
-    # 拿到与引擎绑定的 sessionmaker（必要时懒初始化引擎）
+    """FastAPI Depends：请求成功 commit，异常 rollback；commit 后执行缓存失效。"""
     factory = get_session_factory()
-    # 为当前请求创建独立 Session
     db = factory()
     try:
-        # 把 Session 交给路由；此处暂停，等请求处理完再继续
         yield db
-        # 请求无异常：提交本请求内的全部变更
         db.commit()
+        from deepagents_app.services.revisions import flush_cache_invalidations
+
+        flush_cache_invalidations(db)
     except Exception:
-        # 请求抛错：回滚，避免脏数据落库
         db.rollback()
-        # 继续向上抛，让 FastAPI 走异常处理
         raise
     finally:
-        # 请求结束必关 Session，归还连接给连接池
         db.close()

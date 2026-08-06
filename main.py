@@ -38,10 +38,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from deepagents_app.config import get_settings  # noqa: E402
+from deepagents_app.ownership import demo_methodology_id_for_user  # noqa: E402
 
 console = Console()
 
-DEFAULT_METHODOLOGY_ID = "demo_deepagents"
+DEFAULT_CLI_USER = "cli-user"
 
 
 def _setup_logging(level: str) -> None:
@@ -95,9 +96,11 @@ def _handle_interrupt(
         return result
 
 
-def run_once(agent: Any, text: str, thread_id: str) -> None:
-    config = {"configurable": {"thread_id": thread_id}}
-    console.print(f"[dim]thread={thread_id}[/dim]")
+def run_once(agent: Any, text: str, thread_id: str, *, user_id: str) -> None:
+    from deepagents_app.ownership import checkpoint_thread_id
+
+    config = {"configurable": {"thread_id": checkpoint_thread_id(user_id, thread_id)}}
+    console.print(f"[dim]thread={thread_id} user={user_id}[/dim]")
     with console.status("[bold cyan]Agent 思考 / 调度中…[/bold cyan]"):
         result = agent.invoke(
             {"messages": [{"role": "user", "content": text}]},
@@ -108,7 +111,7 @@ def run_once(agent: Any, text: str, thread_id: str) -> None:
     console.print(Panel(Markdown(final), title="Supervisor 回复", border_style="green"))
 
 
-def interactive_loop(agent: Any, thread_id: str, *, title: str) -> None:
+def interactive_loop(agent: Any, thread_id: str, *, title: str, user_id: str) -> None:
     console.print(
         Panel(
             f"{title}\n"
@@ -151,24 +154,31 @@ def interactive_loop(agent: Any, thread_id: str, *, title: str) -> None:
             continue
 
         try:
-            run_once(agent, text, current_thread)
+            run_once(agent, text, current_thread, user_id=user_id)
         except Exception as exc:  # noqa: BLE001
             console.print(f"[red]执行失败：{exc}[/red]")
             logging.exception("run_once failed")
 
 
-def _build_agent_methodology(settings: Any, methodology_id: str) -> Any:
-    from deepagents_app.db.seed import seed_defaults
+def _build_agent_methodology(settings: Any, methodology_id: str, user_id: str) -> Any:
+    from deepagents_app.db.seed import ensure_user_bootstrap
     from deepagents_app.db.session import get_session_factory, migrate_db
     from deepagents_app.services.agent_factory import build_agent_from_methodology
+    from deepagents_app.services.revisions import flush_cache_invalidations
 
     migrate_db()
     factory = get_session_factory()
     db = factory()
     try:
-        seed_defaults(db)
+        ensure_user_bootstrap(db, user_id)
         db.commit()
-        return build_agent_from_methodology(db, methodology_id, settings=settings)
+        flush_cache_invalidations(db)
+        return build_agent_from_methodology(
+            db,
+            methodology_id,
+            owner_user_id=user_id,
+            settings=settings,
+        )
     except Exception:
         db.rollback()
         raise
@@ -185,9 +195,14 @@ def parse_args() -> argparse.Namespace:
         help="LangGraph thread_id，用于多轮状态隔离",
     )
     parser.add_argument(
+        "--user",
+        default=None,
+        help="CLI 用户 id（默认 AUTH_DEV_USER_ID 或 cli-user）",
+    )
+    parser.add_argument(
         "--methodology",
-        default=DEFAULT_METHODOLOGY_ID,
-        help=f"方法论 ID（默认 {DEFAULT_METHODOLOGY_ID}）",
+        default=None,
+        help="方法论 ID（默认当前用户的 demo 方法论）",
     )
     parser.add_argument(
         "--hitl",
@@ -204,11 +219,15 @@ def main() -> int:
         settings.enable_hitl = True
 
     _setup_logging(settings.log_level)
+    user_id = args.user or settings.auth_dev_user_id or DEFAULT_CLI_USER
+    methodology_id = args.methodology or demo_methodology_id_for_user(user_id)
 
     try:
-        console.print(f"[dim]正在按方法论组装 Agent：{args.methodology}…[/dim]")
-        agent = _build_agent_methodology(settings, args.methodology)
-        title = f"方法论驱动：`{args.methodology}`"
+        console.print(
+            f"[dim]正在按方法论组装 Agent：{methodology_id}（user={user_id}）…[/dim]"
+        )
+        agent = _build_agent_methodology(settings, methodology_id, user_id)
+        title = f"方法论驱动：`{methodology_id}`"
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]组装失败：{exc}[/red]")
         console.print(
@@ -217,9 +236,9 @@ def main() -> int:
         return 1
 
     if args.query:
-        run_once(agent, args.query, args.thread)
+        run_once(agent, args.query, args.thread, user_id=user_id)
     else:
-        interactive_loop(agent, args.thread, title=title)
+        interactive_loop(agent, args.thread, title=title, user_id=user_id)
     return 0
 
 
