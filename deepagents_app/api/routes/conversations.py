@@ -8,10 +8,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
-from deepagents_app.api.deps import require_user
+from deepagents_app.auth import get_current_user_id as require_user
 from deepagents_app.api.pagination import (
     limit_query,
     offset_query,
@@ -70,8 +70,6 @@ def get_conversation(
     db: Session = Depends(get_db),
     user_id: str = Depends(require_user),
 ):
-    from fastapi import HTTPException
-
     row = conversation_svc.get_conversation_by_thread(
         db, thread_id, user_id=user_id
     )

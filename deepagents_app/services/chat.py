@@ -293,6 +293,22 @@ def iter_chat_sse(
         yield _sse("error", {"message": str(exc)})
 
 
+def resume_agent(
+    agent: Any,
+    config: dict[str, Any],
+    *,
+    approve: bool = True,
+) -> dict[str, Any]:
+    """对已编译 Agent 执行 HITL resume（CLI / API 共用）。"""
+    from langgraph.types import Command
+
+    decision_type = "approve" if approve else "reject"
+    return agent.invoke(
+        Command(resume={"decisions": [{"type": decision_type}]}),
+        config=config,
+    )
+
+
 def resume_chat(
     db: Session,
     *,
@@ -301,23 +317,17 @@ def resume_chat(
     approve: bool = True,
 ) -> dict[str, Any]:
     """HITL 恢复：对上次 interrupt 做 approve/reject，继续图执行。"""
-    from langgraph.types import Command
-
     conversation, agent, settings, config = _prepare_agent(
         db, user_id=user_id, thread_id=thread_id
     )
-    decision_type = "approve" if approve else "reject"
     logger.info(
         "chat resume user=%s thread=%s decision=%s",
         user_id,
         thread_id,
-        decision_type,
+        "approve" if approve else "reject",
     )
     with workspace_context(user_workspace_dir(settings, user_id)):
-        result = agent.invoke(
-            Command(resume={"decisions": [{"type": decision_type}]}),
-            config=config,
-        )
+        result = resume_agent(agent, config, approve=approve)
     return _pack_result(
         thread_id=thread_id,
         result=result,

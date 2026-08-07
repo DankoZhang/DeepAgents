@@ -13,7 +13,6 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from deepagents_app.api.errors import BusinessError
 from deepagents_app.db.models import MiddlewareDefinition
 from deepagents_app.ownership import validate_resource_id
 
@@ -40,10 +39,11 @@ def get_middleware(
     db: Session, middleware_id: str, *, owner_user_id: str
 ) -> MiddlewareDefinition | None:
     """按主键取中间件；不属于当前用户则视为不存在。"""
-    row = db.get(MiddlewareDefinition, middleware_id)
-    if row is None or row.owner_user_id != owner_user_id:
-        return None
-    return row
+    from deepagents_app.services.crud_helpers import get_owned
+
+    return get_owned(
+        db, MiddlewareDefinition, middleware_id, owner_user_id=owner_user_id
+    )
 
 
 def create_middleware(
@@ -60,15 +60,16 @@ def create_middleware(
 
     ``class_path`` 指向可 import 的中间件类；``config`` 作为构造参数。
     """
-    if (
-        db.query(MiddlewareDefinition)
-        .filter(
-            MiddlewareDefinition.owner_user_id == owner_user_id,
-            MiddlewareDefinition.name == name,
-        )
-        .one_or_none()
-    ):
-        raise BusinessError(f"中间件名已存在：{name}")
+    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+    ensure_unique_owned_name(
+        db,
+        MiddlewareDefinition,
+        owner_user_id=owner_user_id,
+        name=name,
+        label="中间件",
+        message=f"中间件名已存在：{name}",
+    )
     row = MiddlewareDefinition(
         id=_resolve_middleware_id(middleware_id),
         owner_user_id=owner_user_id,

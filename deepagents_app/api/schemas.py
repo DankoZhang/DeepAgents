@@ -66,7 +66,6 @@ class ModelCreate(BaseModel):
     temperature: float | None = 0.2
     top_p: float | None = None
     max_tokens: int | None = None  # 单次生成上限
-    context_length: int | None = None  # 上下文窗口（展示/校验用）
     timeout: float | None = None
     config: dict[str, Any] = Field(default_factory=dict)  # 额外 SDK 参数
     status: str = "active"
@@ -85,7 +84,6 @@ class ModelUpdate(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     max_tokens: int | None = None
-    context_length: int | None = None
     timeout: float | None = None
     config: dict[str, Any] | None = None
     status: str | None = None
@@ -102,7 +100,6 @@ class ModelOut(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     max_tokens: int | None = None
-    context_length: int | None = None
     timeout: float | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     status: str
@@ -131,7 +128,6 @@ class ModelBrief(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     max_tokens: int | None = None
-    context_length: int | None = None
     status: str = "active"
 
     model_config = {"from_attributes": True}
@@ -340,8 +336,8 @@ class ToolOut(BaseModel):
     description: str
     tool_type: str  # builtin | mcp
     class_path: str | None = None  # builtin 有值；mcp 一般为 None
-    input_schema: dict[str, Any] | None = None  # 可选 JSON Schema（展示/校验）
-    output_schema: dict[str, Any] | None = None
+    input_schema: dict[str, Any] | None = None  # 纯展示；运行时不校验入参
+    output_schema: dict[str, Any] | None = None  # 纯展示
     config: dict[str, Any]  # builtin 扩展配置，或 mcp 的连接 dict
     status: str
 

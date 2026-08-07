@@ -55,10 +55,9 @@ def get_model(
     db: Session, model_id: str, *, owner_user_id: str
 ) -> ModelDefinition | None:
     """按主键取模型；不属于当前用户则视为不存在。"""
-    row = db.get(ModelDefinition, model_id)
-    if row is None or row.owner_user_id != owner_user_id:
-        return None
-    return row
+    from deepagents_app.services.crud_helpers import get_owned
+
+    return get_owned(db, ModelDefinition, model_id, owner_user_id=owner_user_id)
 
 
 def create_model(
@@ -73,24 +72,22 @@ def create_model(
     temperature: float | None = 0.2,
     top_p: float | None = None,
     max_tokens: int | None = None,
-    context_length: int | None = None,
     timeout: float | None = None,
     config: dict[str, Any] | None = None,
     status: str = "active",
     model_id: str | None = None,
 ) -> ModelDefinition:
     """创建模型目录项；同用户下 name 唯一。"""
+    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
     _validate_provider(provider, base_url=base_url)
-    existing = (
-        db.query(ModelDefinition)
-        .filter(
-            ModelDefinition.owner_user_id == owner_user_id,
-            ModelDefinition.name == name,
-        )
-        .one_or_none()
+    ensure_unique_owned_name(
+        db,
+        ModelDefinition,
+        owner_user_id=owner_user_id,
+        name=name,
+        label="模型配置",
     )
-    if existing is not None:
-        raise BusinessError(f"已存在同名模型配置：{name}")
 
     row = ModelDefinition(
         id=_resolve_model_create_id(model_id),
@@ -103,7 +100,6 @@ def create_model(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
-        context_length=context_length,
         timeout=timeout,
         config=dict(config or {}),
         status=status,
@@ -127,7 +123,6 @@ def update_model(
     temperature: float | None = None,
     top_p: float | None = None,
     max_tokens: int | None = None,
-    context_length: int | None = None,
     timeout: float | None = None,
     config: dict[str, Any] | None = None,
     status: str | None = None,
@@ -144,17 +139,16 @@ def update_model(
         raise NotFoundError(f"模型不存在：{model_id}")
 
     if name is not None and name != row.name:
-        clash = (
-            db.query(ModelDefinition)
-            .filter(
-                ModelDefinition.owner_user_id == owner_user_id,
-                ModelDefinition.name == name,
-                ModelDefinition.id != model_id,
-            )
-            .one_or_none()
+        from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+        ensure_unique_owned_name(
+            db,
+            ModelDefinition,
+            owner_user_id=owner_user_id,
+            name=name,
+            exclude_id=model_id,
+            label="模型配置",
         )
-        if clash is not None:
-            raise BusinessError(f"已存在同名模型配置：{name}")
         row.name = name
 
     if provider is not None:
@@ -173,8 +167,6 @@ def update_model(
         row.top_p = top_p
     if max_tokens is not None:
         row.max_tokens = max_tokens
-    if context_length is not None:
-        row.context_length = context_length
     if timeout is not None:
         row.timeout = timeout
     if config is not None:
@@ -322,7 +314,6 @@ def serialize_model_for_snapshot(
         "temperature": row.temperature,
         "top_p": row.top_p,
         "max_tokens": row.max_tokens,
-        "context_length": row.context_length,
         "timeout": row.timeout,
         "extra": dict(row.config or {}),
     }

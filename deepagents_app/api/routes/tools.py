@@ -12,7 +12,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
-from deepagents_app.api.deps import require_user
+from deepagents_app.auth import get_current_user_id as require_user
 from deepagents_app.api.pagination import (
     limit_query,
     offset_query,

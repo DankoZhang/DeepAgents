@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from deepagents_app.api.deps import require_user
+from deepagents_app.auth import get_current_user_id as require_user
 from deepagents_app.api.schemas import ChatRequest, ChatResponse, ChatResumeRequest
 from deepagents_app.db.session import get_db
 from deepagents_app.services.chat import chat as run_chat

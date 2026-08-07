@@ -127,7 +127,6 @@ def model_spec_from_row(row: Any) -> dict[str, Any]:
         "max_tokens": row.max_tokens,
         "timeout": row.timeout,
         "extra": dict(row.config or {}),
-        "context_length": row.context_length,
         "model_id": row.id,
         "display_name": row.name,
     }

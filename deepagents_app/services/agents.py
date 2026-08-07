@@ -88,16 +88,15 @@ def create_agent(
     bump_related: bool = True,
 ) -> AgentDefinition:
     """创建全局 Agent（不隶属单一方法论；由方法论另行勾选）。"""
-    existing = (
-        db.query(AgentDefinition)
-        .filter(
-            AgentDefinition.owner_user_id == owner_user_id,
-            AgentDefinition.name == name,
-        )
-        .one_or_none()
+    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+    ensure_unique_owned_name(
+        db,
+        AgentDefinition,
+        owner_user_id=owner_user_id,
+        name=name,
+        label="Agent",
     )
-    if existing is not None:
-        raise BusinessError(f"已存在同名 Agent：{name}")
 
     resolved_model_id = _resolve_model_id_for_user(
         db, model_id, owner_user_id=owner_user_id
@@ -153,17 +152,16 @@ def update_agent(
         raise NotFoundError(f"Agent 不存在：{agent_id}")
 
     if name is not None and name != row.name:
-        clash = (
-            db.query(AgentDefinition)
-            .filter(
-                AgentDefinition.owner_user_id == owner_user_id,
-                AgentDefinition.name == name,
-                AgentDefinition.id != agent_id,
-            )
-            .one_or_none()
+        from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+        ensure_unique_owned_name(
+            db,
+            AgentDefinition,
+            owner_user_id=owner_user_id,
+            name=name,
+            exclude_id=agent_id,
+            label="Agent",
         )
-        if clash is not None:
-            raise BusinessError(f"已存在同名 Agent：{name}")
         row.name = name
     if system_prompt is not None:
         row.system_prompt = system_prompt
@@ -238,8 +236,9 @@ def bind_agent_tools(
         owner_user_id=owner_user_id,
         replace=replace,
         bump_related=bump_related,
-        setter=_set_agent_tools,
-        merger=_merge_agent_tools,
+        model=ToolDefinition,
+        attr="tools",
+        label="工具",
     )
 
 
@@ -260,8 +259,9 @@ def bind_agent_middlewares(
         owner_user_id=owner_user_id,
         replace=replace,
         bump_related=bump_related,
-        setter=_set_agent_middlewares,
-        merger=_merge_agent_middlewares,
+        model=MiddlewareDefinition,
+        attr="middlewares",
+        label="中间件",
     )
 
 
@@ -282,12 +282,14 @@ def bind_agent_skills(
         owner_user_id=owner_user_id,
         replace=replace,
         bump_related=bump_related,
-        setter=_set_agent_skills,
-        merger=_merge_agent_skills,
+        model=SkillDefinition,
+        attr="skills",
+        label="Skill",
+        require_active=True,
     )
 
 
-# ── 绑定辅助：全量替换 / 增量合并；一律校验资源归属当前用户 ─────────────
+# ── 绑定辅助：工具 / 中间件 / Skill 共用一套 set / merge ───────────────
 
 
 def _bind_and_reload(
@@ -298,17 +300,37 @@ def _bind_and_reload(
     owner_user_id: str,
     replace: bool,
     bump_related: bool,
-    setter,
-    merger,
+    model: type,
+    attr: str,
+    label: str,
+    require_active: bool = False,
 ) -> AgentDefinition:
-    """工具 / 中间件 / Skill 绑定的共用收尾：写关联 → 可选 bump → 重新加载详情。"""
+    """写关联 → 可选 bump → 重新加载详情。"""
     row = get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
     if replace:
-        setter(db, row, target_ids, owner_user_id=owner_user_id)
+        _set_agent_relations(
+            db,
+            row,
+            target_ids,
+            owner_user_id=owner_user_id,
+            model=model,
+            attr=attr,
+            label=label,
+            require_active=require_active,
+        )
     else:
-        merger(db, row, target_ids, owner_user_id=owner_user_id)
+        _merge_agent_relations(
+            db,
+            row,
+            target_ids,
+            owner_user_id=owner_user_id,
+            model=model,
+            attr=attr,
+            label=label,
+            require_active=require_active,
+        )
     db.flush()
     if bump_related:
         bump_methodologies_using_agent(db, agent_id)
@@ -322,6 +344,7 @@ def _load_owned(
     *,
     owner_user_id: str,
     missing_label: str,
+    require_active: bool = False,
 ) -> Any:
     """加载并校验归属：只能绑定当前用户自己的目录资源。"""
     target = db.get(model, target_id)
@@ -329,7 +352,62 @@ def _load_owned(
         raise NotFoundError(f"{missing_label}不存在：{target_id}")
     if target.owner_user_id != owner_user_id:
         raise BusinessError(f"{missing_label}不属于当前用户：{target_id}")
+    if require_active and getattr(target, "status", "active") != "active":
+        raise BusinessError(f"{missing_label}已禁用：{getattr(target, 'name', target_id)}")
     return target
+
+
+def _set_agent_relations(
+    db: Session,
+    agent: AgentDefinition,
+    target_ids: list[str],
+    *,
+    owner_user_id: str,
+    model: type,
+    attr: str,
+    label: str,
+    require_active: bool = False,
+) -> None:
+    rows = [
+        _load_owned(
+            db,
+            model,
+            tid,
+            owner_user_id=owner_user_id,
+            missing_label=label,
+            require_active=require_active,
+        )
+        for tid in target_ids
+    ]
+    setattr(agent, attr, rows)
+
+
+def _merge_agent_relations(
+    db: Session,
+    agent: AgentDefinition,
+    target_ids: list[str],
+    *,
+    owner_user_id: str,
+    model: type,
+    attr: str,
+    label: str,
+    require_active: bool = False,
+) -> None:
+    current: list[Any] = getattr(agent, attr)
+    existing = {item.id for item in current}
+    for tid in target_ids:
+        if tid in existing:
+            continue
+        current.append(
+            _load_owned(
+                db,
+                model,
+                tid,
+                owner_user_id=owner_user_id,
+                missing_label=label,
+                require_active=require_active,
+            )
+        )
 
 
 def _set_agent_tools(
@@ -339,35 +417,15 @@ def _set_agent_tools(
     *,
     owner_user_id: str,
 ) -> None:
-    tools = [
-        _load_owned(
-            db, ToolDefinition, tid, owner_user_id=owner_user_id, missing_label="工具"
-        )
-        for tid in tool_ids
-    ]
-    agent.tools = tools
-
-
-def _merge_agent_tools(
-    db: Session,
-    agent: AgentDefinition,
-    tool_ids: list[str],
-    *,
-    owner_user_id: str,
-) -> None:
-    existing = {t.id for t in agent.tools}
-    for tid in tool_ids:
-        if tid in existing:
-            continue
-        agent.tools.append(
-            _load_owned(
-                db,
-                ToolDefinition,
-                tid,
-                owner_user_id=owner_user_id,
-                missing_label="工具",
-            )
-        )
+    _set_agent_relations(
+        db,
+        agent,
+        tool_ids,
+        owner_user_id=owner_user_id,
+        model=ToolDefinition,
+        attr="tools",
+        label="工具",
+    )
 
 
 def _set_agent_middlewares(
@@ -377,39 +435,15 @@ def _set_agent_middlewares(
     *,
     owner_user_id: str,
 ) -> None:
-    rows = [
-        _load_owned(
-            db,
-            MiddlewareDefinition,
-            mid,
-            owner_user_id=owner_user_id,
-            missing_label="中间件",
-        )
-        for mid in middleware_ids
-    ]
-    agent.middlewares = rows
-
-
-def _merge_agent_middlewares(
-    db: Session,
-    agent: AgentDefinition,
-    middleware_ids: list[str],
-    *,
-    owner_user_id: str,
-) -> None:
-    existing = {m.id for m in agent.middlewares}
-    for mid in middleware_ids:
-        if mid in existing:
-            continue
-        agent.middlewares.append(
-            _load_owned(
-                db,
-                MiddlewareDefinition,
-                mid,
-                owner_user_id=owner_user_id,
-                missing_label="中间件",
-            )
-        )
+    _set_agent_relations(
+        db,
+        agent,
+        middleware_ids,
+        owner_user_id=owner_user_id,
+        model=MiddlewareDefinition,
+        attr="middlewares",
+        label="中间件",
+    )
 
 
 def _set_agent_skills(
@@ -419,42 +453,16 @@ def _set_agent_skills(
     *,
     owner_user_id: str,
 ) -> None:
-    rows = []
-    for sid in skill_ids:
-        skill = _load_owned(
-            db,
-            SkillDefinition,
-            sid,
-            owner_user_id=owner_user_id,
-            missing_label="Skill",
-        )
-        if skill.status != "active":
-            raise BusinessError(f"Skill 已禁用：{skill.name}")
-        rows.append(skill)
-    agent.skills = rows
-
-
-def _merge_agent_skills(
-    db: Session,
-    agent: AgentDefinition,
-    skill_ids: list[str],
-    *,
-    owner_user_id: str,
-) -> None:
-    existing = {s.id for s in agent.skills}
-    for sid in skill_ids:
-        if sid in existing:
-            continue
-        skill = _load_owned(
-            db,
-            SkillDefinition,
-            sid,
-            owner_user_id=owner_user_id,
-            missing_label="Skill",
-        )
-        if skill.status != "active":
-            raise BusinessError(f"Skill 已禁用：{skill.name}")
-        agent.skills.append(skill)
+    _set_agent_relations(
+        db,
+        agent,
+        skill_ids,
+        owner_user_id=owner_user_id,
+        model=SkillDefinition,
+        attr="skills",
+        label="Skill",
+        require_active=True,
+    )
 
 
 # ── 模型绑定：默认模型映射 + 归属/状态校验 ─────────────────────────────

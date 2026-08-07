@@ -60,10 +60,9 @@ def get_skill(
     db: Session, skill_id: str, *, owner_user_id: str
 ) -> SkillDefinition | None:
     """按主键取 Skill；不属于当前用户则视为不存在。"""
-    row = db.get(SkillDefinition, skill_id)
-    if row is None or row.owner_user_id != owner_user_id:
-        return None
-    return row
+    from deepagents_app.services.crud_helpers import get_owned
+
+    return get_owned(db, SkillDefinition, skill_id, owner_user_id=owner_user_id)
 
 
 def create_skill(
@@ -84,15 +83,15 @@ def create_skill(
     """
     name = name.strip()
     _validate_skill_name(name)
-    if (
-        db.query(SkillDefinition)
-        .filter(
-            SkillDefinition.owner_user_id == owner_user_id,
-            SkillDefinition.name == name,
-        )
-        .one_or_none()
-    ):
-        raise BusinessError(f"已存在同名 Skill：{name}")
+    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+    ensure_unique_owned_name(
+        db,
+        SkillDefinition,
+        owner_user_id=owner_user_id,
+        name=name,
+        label="Skill",
+    )
 
     body = (content or "").strip()
     if not body:
@@ -135,17 +134,16 @@ def update_skill(
     if name is not None and name.strip() != row.name:
         new_name = name.strip()
         _validate_skill_name(new_name)
-        clash = (
-            db.query(SkillDefinition)
-            .filter(
-                SkillDefinition.owner_user_id == owner_user_id,
-                SkillDefinition.name == new_name,
-                SkillDefinition.id != skill_id,
-            )
-            .one_or_none()
+        from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+        ensure_unique_owned_name(
+            db,
+            SkillDefinition,
+            owner_user_id=owner_user_id,
+            name=new_name,
+            exclude_id=skill_id,
+            label="Skill",
         )
-        if clash is not None:
-            raise BusinessError(f"已存在同名 Skill：{new_name}")
         row.name = new_name
 
     if description is not None:

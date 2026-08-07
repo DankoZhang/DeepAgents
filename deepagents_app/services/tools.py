@@ -51,10 +51,9 @@ def get_tool(
     db: Session, tool_id: str, *, owner_user_id: str
 ) -> ToolDefinition | None:
     """按主键取工具；不属于当前用户则视为不存在。"""
-    row = db.get(ToolDefinition, tool_id)
-    if row is None or row.owner_user_id != owner_user_id:
-        return None
-    return row
+    from deepagents_app.services.crud_helpers import get_owned
+
+    return get_owned(db, ToolDefinition, tool_id, owner_user_id=owner_user_id)
 
 
 def create_builtin_tool(
@@ -71,15 +70,16 @@ def create_builtin_tool(
     tool_id: str | None = None,
 ) -> ToolDefinition:
     """种子/内部用：写入 builtin 工具（不走对外「仅 MCP」创建 API）。"""
-    if (
-        db.query(ToolDefinition)
-        .filter(
-            ToolDefinition.owner_user_id == owner_user_id,
-            ToolDefinition.name == name,
-        )
-        .one_or_none()
-    ):
-        raise BusinessError(f"工具名已存在：{name}")
+    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+    ensure_unique_owned_name(
+        db,
+        ToolDefinition,
+        owner_user_id=owner_user_id,
+        name=name,
+        label="工具",
+        message=f"工具名已存在：{name}",
+    )
     row = ToolDefinition(
         id=_resolve_tool_id(tool_id),
         owner_user_id=owner_user_id,
@@ -108,15 +108,16 @@ def create_mcp_tool(
     tool_id: str | None = None,
 ) -> ToolDefinition:
     """前端/API：仅创建 MCP 工具（连接信息放在 config）。"""
-    if (
-        db.query(ToolDefinition)
-        .filter(
-            ToolDefinition.owner_user_id == owner_user_id,
-            ToolDefinition.name == name,
-        )
-        .one_or_none()
-    ):
-        raise BusinessError(f"工具名已存在：{name}")
+    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+    ensure_unique_owned_name(
+        db,
+        ToolDefinition,
+        owner_user_id=owner_user_id,
+        name=name,
+        label="工具",
+        message=f"工具名已存在：{name}",
+    )
     row = ToolDefinition(
         id=_resolve_tool_id(tool_id),
         owner_user_id=owner_user_id,
@@ -160,17 +161,17 @@ def update_tool(
             )
     if name is not None:
         if name != row.name:
-            clash = (
-                db.query(ToolDefinition)
-                .filter(
-                    ToolDefinition.owner_user_id == owner_user_id,
-                    ToolDefinition.name == name,
-                    ToolDefinition.id != tool_id,
-                )
-                .one_or_none()
+            from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+            ensure_unique_owned_name(
+                db,
+                ToolDefinition,
+                owner_user_id=owner_user_id,
+                name=name,
+                exclude_id=tool_id,
+                label="工具",
+                message=f"工具名已存在：{name}",
             )
-            if clash is not None:
-                raise BusinessError(f"工具名已存在：{name}")
         row.name = name
     if description is not None:
         row.description = description

@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
-from deepagents_app.api.deps import require_user
+from deepagents_app.auth import get_current_user_id as require_user
 from deepagents_app.api.pagination import (
     limit_query,
     offset_query,
@@ -79,7 +79,6 @@ def create_model(
         temperature=body.temperature,
         top_p=body.top_p,
         max_tokens=body.max_tokens,
-        context_length=body.context_length,
         timeout=body.timeout,
         config=body.config,
         status=body.status,
@@ -107,7 +106,6 @@ def update_model(
         temperature=body.temperature,
         top_p=body.top_p,
         max_tokens=body.max_tokens,
-        context_length=body.context_length,
         timeout=body.timeout,
         config=body.config,
         status=body.status,

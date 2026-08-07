@@ -56,12 +56,6 @@ def _setup_logging(level: str) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def _extract_final_text(result: dict[str, Any]) -> str:
-    from deepagents_app.services.chat import extract_final_text
-
-    return extract_final_text(result) or "(未获得模型文本回复，请查看日志)"
-
-
 def _handle_interrupt(
     agent: Any, config: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
@@ -84,16 +78,12 @@ def _handle_interrupt(
         return result
 
     try:
-        from langgraph.types import Command
-
+        from deepagents_app.services.chat import resume_agent
         from deepagents_app.workspace import get_workspace_root, workspace_context
 
-        # 复用当前用户 workspace（run_once 已设置 ContextVar）
         root = get_workspace_root()
         with workspace_context(root):
-            return agent.invoke(
-                Command(resume={"decisions": [{"type": "approve"}]}), config=config
-            )
+            return resume_agent(agent, config, approve=True)
     except Exception as exc:  # noqa: BLE001
         console.print(
             f"[yellow]Resume 失败：{exc}。请检查 deepagents/langgraph 版本。[/yellow]"
@@ -103,6 +93,7 @@ def _handle_interrupt(
 
 def run_once(agent: Any, text: str, thread_id: str, *, user_id: str) -> None:
     from deepagents_app.ownership import checkpoint_thread_id
+    from deepagents_app.services.chat import extract_final_text
     from deepagents_app.workspace import user_workspace_dir, workspace_context
 
     settings = get_settings()
@@ -115,7 +106,7 @@ def run_once(agent: Any, text: str, thread_id: str, *, user_id: str) -> None:
                 config=config,
             )
     result = _handle_interrupt(agent, config, result)
-    final = _extract_final_text(result)
+    final = extract_final_text(result) or "(未获得模型文本回复，请查看日志)"
     console.print(Panel(Markdown(final), title="Supervisor 回复", border_style="green"))
 
 
@@ -169,30 +160,16 @@ def interactive_loop(agent: Any, thread_id: str, *, title: str, user_id: str) ->
 
 
 def _build_agent_methodology(settings: Any, methodology_id: str, user_id: str) -> Any:
-    from deepagents_app.db.seed import ensure_user_bootstrap
-    from deepagents_app.db.session import get_session_factory, migrate_db
+    from deepagents_app.db.bootstrap_session import bootstrapped_db_session
     from deepagents_app.services.agent_factory import build_agent_from_methodology
-    from deepagents_app.services.revisions import flush_cache_invalidations
 
-    migrate_db()
-    factory = get_session_factory()
-    db = factory()
-    try:
-        ensure_user_bootstrap(db, user_id)
-        db.commit()
-        flush_cache_invalidations(db)
+    with bootstrapped_db_session(user_id, migrate=True) as db:
         return build_agent_from_methodology(
             db,
             methodology_id,
             owner_user_id=user_id,
             settings=settings,
         )
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepAgents CLI")

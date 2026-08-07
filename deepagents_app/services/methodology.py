@@ -76,16 +76,15 @@ def create_methodology(
     agent_ids: list[str] | None = None,
 ) -> Methodology:
     """创建草稿方法论，可选立即勾选全局 Agent，并写入 v1 快照。"""
-    name_clash = (
-        db.query(Methodology)
-        .filter(
-            Methodology.owner_user_id == owner_user_id,
-            Methodology.name == name,
-        )
-        .one_or_none()
+    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+    ensure_unique_owned_name(
+        db,
+        Methodology,
+        owner_user_id=owner_user_id,
+        name=name,
+        label="方法论",
     )
-    if name_clash is not None:
-        raise BusinessError(f"已存在同名方法论：{name}")
 
     mid = methodology_id or _slug_id(name)
     mid = validate_resource_id(mid, label="methodology id")
@@ -128,17 +127,16 @@ def update_methodology(
     if row is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
     if name is not None and name != row.name:
-        clash = (
-            db.query(Methodology)
-            .filter(
-                Methodology.owner_user_id == owner_user_id,
-                Methodology.name == name,
-                Methodology.id != methodology_id,
-            )
-            .one_or_none()
+        from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+
+        ensure_unique_owned_name(
+            db,
+            Methodology,
+            owner_user_id=owner_user_id,
+            name=name,
+            exclude_id=methodology_id,
+            label="方法论",
         )
-        if clash is not None:
-            raise BusinessError(f"已存在同名方法论：{name}")
         row.name = name
     if description is not None:
         row.description = description

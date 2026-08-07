@@ -145,7 +145,6 @@ def test_model_catalog_crud(client, demo_ids):
             "temperature": 0.3,
             "top_p": 0.9,
             "max_tokens": 2048,
-            "context_length": 128000,
             "api_key": "sk-test",
         },
     )
@@ -154,7 +153,7 @@ def test_model_catalog_crud(client, demo_ids):
     assert body["has_api_key"] is True
     assert "api_key" not in body
     assert body["top_p"] == 0.9
-    assert body["context_length"] == 128000
+    assert "context_length" not in body
     model_id = body["id"]
 
     patched = client.patch(

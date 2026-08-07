@@ -56,22 +56,10 @@ async def lifespan(_app: FastAPI):
     sync_memory_into_workspace(settings)
 
     if settings.auth_disabled and settings.auth_dev_user_id:
-        from deepagents_app.db.seed import ensure_user_bootstrap
-        from deepagents_app.services.revisions import flush_cache_invalidations
+        from deepagents_app.db.bootstrap_session import bootstrapped_db_session
 
-        factory = get_session_factory()
-        db = factory()
-        try:
-            ensure_user_bootstrap(db, settings.auth_dev_user_id)
-            db.commit()
-            flush_cache_invalidations(db)
+        with bootstrapped_db_session(settings.auth_dev_user_id) as _db:
             logger.info("已为开发用户引导种子：%s", settings.auth_dev_user_id)
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-
     logger.info(
         "DeepAgents API 已就绪（db=%s, auth_disabled=%s）",
         settings.database_url.split("@")[-1],
