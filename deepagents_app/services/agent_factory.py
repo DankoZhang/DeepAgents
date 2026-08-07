@@ -2,17 +2,26 @@
 Agent Factory（方法论驱动）
 ==========================
 
-流程：
-  methodology_id → 加载 Agent/SubAgent/Tool/Middleware → create_deep_agent()
+职责：按方法论（live 或历史快照）组装可运行的 deep agent，并做进程内缓存。
+
+主流程::
+
+    methodology_id (+ version)
+      → 读 live 表 / MethodologyRevision 快照
+      → 归一 Agent 规格（内嵌 tools / middlewares / skills / llm）
+      → 绑定用户 workspace + 物化 Skills
+      → create_deep_agent(...)
+      → 按「用户 + 方法论 + 版本」LRU 缓存
 
 缓存：
-  key = user_scope + methodology_id + version
-    有上限 LRU；淘汰时清理构建锁与对应用户 workspace 下的 Skills 物化目录
+  - key = user_scope + methodology_id + version
+  - 有上限 LRU；淘汰 / 失效时清理构建锁与对应 Skills 物化目录
+  - 仅本进程有效，多 worker 各自一份
 
 版本：
-  旧会话按 Conversation.methodology_version 从快照重建；
-  与当前行一致时直接读 live 表。
-  live / snapshot 先归一成统一 Agent 规格，再走同一条组装路径。
+  - 旧会话按 Conversation.methodology_version 从快照重建
+  - 与 live.version 一致时直接读当前表
+  - live / snapshot 先归一成同形 dict，再走 ``_compile_from_agents``
 """
 
 from __future__ import annotations
@@ -56,12 +65,16 @@ from deepagents_app.workspace import (
 
 logger = logging.getLogger(__name__)
 
-# 进程内 Compiled Agent 缓存（OrderedDict 充当 LRU）
+# ── 进程内缓存（非跨 worker）──────────────────────────────────────────
+# OrderedDict：命中 move_to_end，满则从头部 pop → LRU
 _cache: OrderedDict[str, Any] = OrderedDict()
 _cache_lock = threading.Lock()
-# 按 cache key 串行化构建，避免并发 miss 时重复 create_deep_agent
+# 同一 cache key 并发 miss 时只允许一个线程真正 create_deep_agent
 _build_locks: dict[str, threading.Lock] = {}
 _build_locks_guard = threading.Lock()
+
+
+# ── 键与路径辅助 ──────────────────────────────────────────────────────
 
 
 def cache_key(owner_user_id: str, methodology_id: str, version: int) -> str:
@@ -70,7 +83,12 @@ def cache_key(owner_user_id: str, methodology_id: str, version: int) -> str:
 
 
 def skills_scope(methodology_id: str, version: int) -> str:
-    """Skills 物化目录隔离键（不同版本写不同路径，避免互相覆盖）。"""
+    """
+    Skills 物化目录隔离键。
+
+    磁盘路径：``<用户工作区>/skills/<methodology_id>/v<version>/...``
+    不同版本互不覆盖，便于旧会话按锁定版本重建。
+    """
     return f"{methodology_id}/v{version}"
 
 
@@ -89,19 +107,29 @@ def _parse_cache_key(key: str) -> tuple[str, str, int] | None:
 
 
 def _cache_max_size() -> int:
+    """读取 LRU 上限；配置异常时回退 32。"""
     try:
         return int(get_settings().agent_cache_max_size)
     except Exception:  # noqa: BLE001
         return 32
 
 
+# ── 缓存读写 / 失效 ──────────────────────────────────────────────────
+
+
 def _drop_build_lock(key: str) -> None:
+    """缓存条目消失后释放对应构建锁，避免 _build_locks 泄漏。"""
     with _build_locks_guard:
         _build_locks.pop(key, None)
 
 
 def _cleanup_evicted_key(key: str, *, settings: Settings | None = None) -> None:
-    """淘汰 / 失效某条缓存后：释放构建锁，并尽量清掉对应用户工作区物化目录。"""
+    """
+    淘汰 / 失效某条缓存后的收尾。
+
+    1. 去掉该 key 的进程内构建锁
+    2. 尽量清空对应用户工作区里该方法论版本的 Skills 物化目录
+    """
     _drop_build_lock(key)
     parsed = _parse_cache_key(key)
     if parsed is None:
@@ -109,6 +137,7 @@ def _cleanup_evicted_key(key: str, *, settings: Settings | None = None) -> None:
     uhash, methodology_id, version = parsed
     try:
         cfg = settings or get_settings()
+        # 与 user_workspace_dir 布局一致：workspace/users/<uhash>/
         root = (cfg.workspace_dir / "users" / uhash).resolve()
         clear_materialized_skills(
             cfg,
@@ -120,7 +149,7 @@ def _cleanup_evicted_key(key: str, *, settings: Settings | None = None) -> None:
 
 
 def _build_lock_for(key: str) -> threading.Lock:
-    """懒创建并返回某个 cache key 的构建锁。"""
+    """懒创建并返回某个 cache key 的构建锁（进程内线程互斥）。"""
     with _build_locks_guard:
         lock = _build_locks.get(key)
         if lock is None:
@@ -130,6 +159,7 @@ def _build_lock_for(key: str) -> threading.Lock:
 
 
 def _cache_get(key: str) -> Any | None:
+    """命中则移到队尾（标记为最近使用）。"""
     with _cache_lock:
         if key not in _cache:
             return None
@@ -146,6 +176,7 @@ def _cache_put(key: str, value: Any) -> list[str]:
             _cache.move_to_end(key)
             _cache[key] = value
             return evicted
+        # popitem(last=False)：弹出最久未使用的项
         while len(_cache) >= maxsize:
             old_key, _ = _cache.popitem(last=False)
             evicted.append(old_key)
@@ -164,7 +195,7 @@ def invalidate_agent_cache(
 
     - 指定 id+version：删匹配条目（可带 owner 精确定位）
     - 仅指定 id：删该方法论所有版本
-    - 都不指定：清空
+    - 都不指定：清空全部
     """
     with _cache_lock:
         if methodology_id is None:
@@ -191,6 +222,9 @@ def invalidate_agent_cache(
     return len(keys)
 
 
+# ── 配置加载与规格归一 ──────────────────────────────────────────────
+
+
 def get_methodology_config(
     db: Session,
     methodology_id: str,
@@ -212,20 +246,29 @@ def get_methodology_config(
 
 
 def _normalize_agent_spec(agent: AgentDefinition | dict[str, Any]) -> dict[str, Any]:
-    """live ORM → 与 snapshot 同形的 dict；dict 原样返回。"""
+    """
+    live ORM → 与 snapshot 同形的 dict；dict 原样返回。
+
+    统一后才能共用 ``_resolve_runtime_bindings``（要求内嵌 tools 等 payload）。
+    """
     if isinstance(agent, dict):
         return agent
     return serialize_agent_for_snapshot(agent, include_llm=True)
 
 
 def _agent_role(agent: dict[str, Any]) -> str:
+    """从 config.role 读取角色；缺省视为 subagent。"""
     cfg = agent.get("config") or {}
     return str(cfg.get("role", "subagent")).lower()
 
 
 def _agent_enabled(agent: dict[str, Any]) -> bool:
+    """从 config.enabled 读取是否参与组装；缺省 True。"""
     cfg = agent.get("config") or {}
     return bool(cfg.get("enabled", True))
+
+
+# ── 运行时绑定：模型 / 工具 / 中间件 / Skill ──────────────────────────
 
 
 def _chat_model_for_agent(
@@ -235,7 +278,11 @@ def _chat_model_for_agent(
     *,
     owner_user_id: str,
 ) -> Any:
-    """Supervisor / SubAgent 共用：快照 llm → model_id 目录 → Settings 默认。"""
+    """
+    Supervisor / SubAgent 共用的模型解析。
+
+    优先级：快照 llm（可补密钥）→ model_id 目录 → Settings/.env 默认。
+    """
     spec = resolve_model_spec_for_agent(
         db,
         owner_user_id=owner_user_id,
@@ -251,7 +298,8 @@ def _resolve_runtime_bindings(
     """
     从归一后的 Agent dict 解析组装字段。
 
-    要求快照 / 归一结果内嵌 tools / middlewares / skills payload。
+    要求快照 / 归一结果内嵌 tools / middlewares / skills 完整 payload，
+    运行时直接展开，不再按 id 回查 live 目录表。
     """
     agent_id = str(agent.get("id") or agent["name"])
     name = str(agent["name"])
@@ -265,8 +313,10 @@ def _resolve_runtime_bindings(
     if "skills" not in agent:
         raise BusinessError(f"Agent {agent_id} 缺少 skills payload，无法组装")
 
+    # MCP 一条可展开为多个底层 tool；非 active 展开为空列表
     tools = load_tools_from_snapshots(list(agent.get("tools") or []))
     middleware = load_middlewares_from_snapshots(list(agent.get("middlewares") or []))
+    # 仅保留 active Skill，供后续物化
     skills = load_skills_from_snapshots(list(agent.get("skills") or []))
     return agent_id, name, system_prompt, config, tools, middleware, skills
 
@@ -286,6 +336,7 @@ def _build_subagent_spec(
     )
     spec: dict[str, Any] = {
         "name": name,
+        # description 供主 Agent 调度（task 工具列表展示）
         "description": str(config.get("description") or name),
         "system_prompt": system_prompt,
         "tools": tools,
@@ -293,7 +344,7 @@ def _build_subagent_spec(
             db, settings, agent, owner_user_id=owner_user_id
         ),
     }
-    # Skill 需落盘成 SKILL.md；返回的虚拟路径再塞进 create_deep_agent
+    # Skill 需落盘成 SKILL.md；返回虚拟路径再塞进 create_deep_agent(skills=...)
     skills_path = materialize_agent_skills(
         settings,
         agent_id,
@@ -334,9 +385,11 @@ def _assemble_create_kwargs(
         "model": supervisor_model,
         "system_prompt": supervisor_prompt,
         "subagents": subagents,
+        # 虚拟 FS 根钉死到用户工作区；Memory / Skills / 摘要落盘都走它
         "backend": build_filesystem_backend(
             settings, workspace_root=workspace_root
         ),
+        # 用户自定义中间件；框架默认栈（TodoList/FS/Summarization 等）由 create_deep_agent 自动挂
         "middleware": supervisor_middleware,
         # 用户工作区根下有 AGENTS.md 才注入 memory，避免空路径报错
         "memory": ["/AGENTS.md"] if memory_file.exists() else None,
@@ -369,6 +422,9 @@ def _split_roles(
     return supervisors[0], subagents_defs
 
 
+# ── 核心组装 ──────────────────────────────────────────────────────────
+
+
 def _compile_from_agents(
     db: Session,
     settings: Settings,
@@ -379,12 +435,17 @@ def _compile_from_agents(
     source: str,
     owner_user_id: str,
 ) -> Any:
-    """统一组装入口：入口处将 live ORM / snapshot dict 归一为 dict。"""
+    """
+    统一组装入口：live ORM / snapshot dict 在此归一后走同一条路径。
+
+    仅在缓存未命中、需要真正 ``create_deep_agent`` 时调用（非每条聊天）。
+    """
     from deepagents import create_deep_agent
 
-    # live ORM 与 snapshot dict 在此统一成同形规格，后续路径完全一致
+    # live ORM 与 snapshot dict → 同形规格，后续路径完全一致
     specs = [_normalize_agent_spec(a) for a in agents]
     scope = skills_scope(methodology_id, version)
+    # 确保用户工作区存在（含 documents/notes/audit/skills、同步 AGENTS.md）
     workspace_root = user_workspace_dir(settings, owner_user_id)
 
     context = (
@@ -393,15 +454,21 @@ def _compile_from_agents(
         else f"快照 {methodology_id} v{version}"
     )
 
+    # 请求上下文：ContextVar 绑定当前用户工作区根（不是锁）
+    # 工具 / Audit 等通过 get_workspace_root() 落到该目录，请求结束自动 reset
     with workspace_context(workspace_root):
-        # 跨进程锁：多 worker 同时 clear/write 同一 scope 时串行化
+        # 跨进程文件锁：锁的是「该用户下某方法论版本的 Skills 物化 scope」
+        # 防止多 worker 同时 clear/write 同一目录互相踩踏（不是锁用户、也不是锁请求）
         with interprocess_lock(skills_materialize_lock(workspace_root, scope)):
+            # 先清空整个 scope（含其下所有 agent_id），再按 Agent 重新物化
             clear_materialized_skills(
                 settings, scope=scope, workspace_root=workspace_root
             )
 
             supervisor, subagents_defs = _split_roles(specs, context=context)
 
+            # 子 Agent：各自展开工具/中间件，并把 Skills 物化到
+            # <workspace>/skills/<scope>/<agent_id>/<name>/SKILL.md
             subagents = [
                 _build_subagent_spec(
                     db,
@@ -474,7 +541,7 @@ def _build_from_live(
     methodology: Methodology,
     settings: Settings,
 ) -> Any:
-    """从当前 live 表组装 Agent。"""
+    """从当前 live 表组装 Agent（会话版本 == 方法论当前 version）。"""
     return _compile_from_agents(
         db,
         settings,
@@ -494,7 +561,7 @@ def _build_from_snapshot(
     *,
     owner_user_id: str,
 ) -> Any:
-    """从 MethodologyRevision 快照组装 Agent。"""
+    """从 MethodologyRevision 快照组装 Agent（旧会话锁定的历史版本）。"""
     revision = get_revision(db, methodology_id, version)
     if revision is None:
         raise NotFoundError(
@@ -513,6 +580,9 @@ def _build_from_snapshot(
     )
 
 
+# ── 对外主入口 ────────────────────────────────────────────────────────
+
+
 def build_agent_from_methodology(
     db: Session,
     methodology_id: str,
@@ -527,7 +597,7 @@ def build_agent_from_methodology(
 
     - ``version is None`` 或等于 live.version → 读当前表组装
     - ``version`` 落后于 live → 从 ``MethodologyRevision`` 快照重建（旧会话）
-    - 同 key 命中进程缓存则直接返回，避免重复 ``create_deep_agent``
+    - 同 key 命中进程缓存则直接返回，避免重复 ``create_deep_agent`` / 重复物化 Skills
 
     Returns:
         LangGraph CompiledStateGraph
@@ -542,7 +612,7 @@ def build_agent_from_methodology(
     target_version = version if version is not None else methodology.version
     key = cache_key(owner, methodology.id, target_version)
 
-    # 按 key 加锁：缓存 miss 时并发请求只组装一次
+    # 按 key 加锁：缓存 miss 时同进程并发请求只组装一次
     with _build_lock_for(key):
         if use_cache:
             cached = _cache_get(key)
