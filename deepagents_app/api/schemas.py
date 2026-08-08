@@ -315,17 +315,19 @@ class ToolCreate(BaseModel):
     name: str  # 全局唯一名（也常作 MCP Server 逻辑名）
     description: str = ""
     mcp: McpServerConfig  # 必填连接配置 → 落入 DB config
+    requires_hitl: bool = False  # 调用前是否人工审批
     status: str = "active"  # active | disabled
     id: str | None = None  # 可选指定主键
 
 
 class ToolUpdate(BaseModel):
-    """PATCH /api/tool/{id}：部分更新；builtin 在 service 层限制可改字段。"""
+    """PATCH /api/tool/{id}：部分更新；builtin 仅可改 status / requires_hitl。"""
 
     name: str | None = None
     description: str | None = None
     mcp: McpServerConfig | None = None  # 仅 mcp 类型可更新连接
-    status: str | None = None  # builtin 通常只允许改这个
+    requires_hitl: bool | None = None  # builtin / mcp 均可改
+    status: str | None = None
 
 
 class ToolOut(BaseModel):
@@ -336,8 +338,7 @@ class ToolOut(BaseModel):
     description: str
     tool_type: str  # builtin | mcp
     class_path: str | None = None  # builtin 有值；mcp 一般为 None
-    input_schema: dict[str, Any] | None = None  # 纯展示；运行时不校验入参
-    output_schema: dict[str, Any] | None = None  # 纯展示
+    requires_hitl: bool = False
     config: dict[str, Any]  # builtin 扩展配置，或 mcp 的连接 dict
     status: str
 

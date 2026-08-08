@@ -96,7 +96,7 @@ def get_engine():
 def get_session_factory() -> sessionmaker[Session]:
     """返回已绑定引擎的 sessionmaker（副作用：触发引擎初始化）。
 
-    被 app.lifespan 用于启动时 seed；也被 get_db 用于每个请求。
+    被 app.lifespan 用于启动时初始化引擎；也被 get_db 用于每个请求。
     """
     # 确保 _engine / _SessionLocal 已就绪（首次调用会真正 create_engine）
     get_engine()

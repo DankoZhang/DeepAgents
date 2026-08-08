@@ -2,7 +2,7 @@
 用户 bootstrap 会话上下文
 ========================
 
-CLI / lifespan 共用：migrate（可选）→ ensure_user_bootstrap → commit → 缓存失效。
+CLI 共用：migrate（可选）→ ensure_user_bootstrap → commit → 缓存失效。
 请求路径请继续用 ``get_db`` + ``POST /api/bootstrap``，不要走这里。
 """
 

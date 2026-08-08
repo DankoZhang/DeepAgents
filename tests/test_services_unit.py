@@ -146,3 +146,144 @@ def test_bind_agents_returns_detail(db_session):
     assert draft is not None
     assert draft.version == 1
     assert len(draft.agents) == 1
+
+
+def test_settings_frozen_and_settings_with():
+    from pydantic import ValidationError
+
+    from deepagents_app.config import get_settings, settings_with
+
+    base = get_settings()
+    with pytest.raises(ValidationError):
+        base.enable_hitl = True  # type: ignore[misc]
+
+    overridden = settings_with(enable_hitl=True)
+    assert overridden.enable_hitl is True
+    assert get_settings().enable_hitl is False
+    assert overridden is not get_settings()
+
+
+def test_cors_origins_default_explicit(monkeypatch):
+    from deepagents_app import config
+
+    monkeypatch.setenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    )
+    config.get_settings.cache_clear()
+    origins = config.get_settings().cors_origin_list()
+    assert origins == [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+    assert "*" not in origins
+    config.get_settings.cache_clear()
+
+
+def test_mcp_tools_cache_hit(monkeypatch):
+    from deepagents_app.db.models import ToolDefinition
+    from deepagents_app.registries import tools as tools_reg
+
+    tools_reg.clear_mcp_tools_cache()
+    calls = {"n": 0}
+
+    async def fake_aload(tool_def):  # noqa: ANN001
+        calls["n"] += 1
+        return [object()]
+
+    monkeypatch.setattr(tools_reg, "_aload_mcp_tools", fake_aload)
+    row = ToolDefinition(
+        id="tool_mcp_cache",
+        name="mcp-cache",
+        description="",
+        tool_type="mcp",
+        class_path=None,
+        requires_hitl=False,
+        config={"transport": "stdio", "command": "echo", "args": []},
+        status="active",
+    )
+    a = tools_reg.load_mcp_tools(row)
+    b = tools_reg.load_mcp_tools(row)
+    assert calls["n"] == 1
+    assert len(a) == 1 and len(b) == 1
+    tools_reg.clear_mcp_tools_cache(tool_id=row.id)
+
+
+def test_seed_dangerous_tools_require_hitl(db_session):
+    from deepagents_app.db.models import ToolDefinition
+
+    rows = (
+        db_session.query(ToolDefinition)
+        .filter(ToolDefinition.owner_user_id == TEST_USER)
+        .filter(
+            ToolDefinition.name.in_(("run_shell_command", "write_workspace_file"))
+        )
+        .all()
+    )
+    assert len(rows) == 2
+    assert all(r.requires_hitl for r in rows)
+
+
+def test_interrupt_tool_names_from_payloads():
+    from deepagents_app.registries.tools import interrupt_tool_names_from_payloads
+
+    names = interrupt_tool_names_from_payloads(
+        [
+            {
+                "name": "run_shell_command",
+                "tool_type": "builtin",
+                "requires_hitl": True,
+                "status": "active",
+            },
+            {
+                "name": "list_workspace",
+                "tool_type": "builtin",
+                "requires_hitl": False,
+                "status": "active",
+            },
+            {
+                "name": "mcp-fs",
+                "tool_type": "mcp",
+                "requires_hitl": True,
+                "status": "active",
+                "config": {"include_tools": ["read_file", "write_file"]},
+            },
+        ]
+    )
+    assert names == {
+        "run_shell_command": True,
+        "read_file": True,
+        "write_file": True,
+    }
+
+
+def test_resolve_interrupt_on_merges_system_and_catalog(monkeypatch):
+    from deepagents_app import config
+    from deepagents_app.services.agent_factory import _resolve_interrupt_on
+
+    monkeypatch.setenv("ENABLE_HITL", "true")
+    config.get_settings.cache_clear()
+    settings = config.get_settings()
+    merged = _resolve_interrupt_on(
+        settings,
+        supervisor_config={},
+        catalog_interrupt_on={"run_shell_command": True},
+    )
+    assert merged is not None
+    assert merged["run_shell_command"] is True
+    assert merged["write_file"] is True
+    assert merged["edit_file"] is True
+    assert merged["execute"] is True
+
+    monkeypatch.setenv("ENABLE_HITL", "false")
+    config.get_settings.cache_clear()
+    settings = config.get_settings()
+    assert (
+        _resolve_interrupt_on(
+            settings,
+            supervisor_config={},
+            catalog_interrupt_on={"run_shell_command": True},
+        )
+        is None
+    )
+    config.get_settings.cache_clear()

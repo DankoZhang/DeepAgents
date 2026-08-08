@@ -4,7 +4,7 @@ Tool 注册 API
 
 - 列表 / 详情：builtin + mcp
 - 新建 / 删除：仅 MCP
-- 内置工具不可改执行体、不可删（可 disabled）
+- 内置工具不可改执行体、不可删（可改 status / requires_hitl）
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ def create_tool(
         name=body.name,
         description=body.description,
         mcp_config=body.mcp.model_dump(),
+        requires_hitl=body.requires_hitl,
         status=body.status,
         tool_id=body.id,
     )
@@ -91,6 +92,7 @@ def update_tool(
         name=body.name,
         description=body.description,
         mcp_config=body.mcp.model_dump() if body.mcp else None,
+        requires_hitl=body.requires_hitl,
         status=body.status,
     )
 

@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deepagents_app.config import get_settings  # noqa: E402
+from deepagents_app.config import get_settings, settings_with  # noqa: E402
 from deepagents_app.ownership import demo_methodology_id_for_user  # noqa: E402
 
 console = Console()
@@ -199,9 +199,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    settings = get_settings()
-    if args.hitl:
-        settings.enable_hitl = True
+    # 单例不可就地改；CLI 覆盖用副本
+    settings = (
+        settings_with(enable_hitl=True) if args.hitl else get_settings()
+    )
 
     _setup_logging(settings.log_level)
     user_id = args.user or settings.auth_dev_user_id or DEFAULT_CLI_USER

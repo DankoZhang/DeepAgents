@@ -48,6 +48,8 @@ def client(tmp_path, monkeypatch):
 
     app = create_app()
     with TestClient(app) as c:
+        boot = c.post("/api/bootstrap")
+        assert boot.status_code == 200, boot.text
         yield c
 
     reset_engine()
@@ -76,8 +78,15 @@ def demo_ids():
 
 def test_health(client):
     r = client.get("/health")
+    assert r.status_code in (200, 503)
+    body = r.json()
+    assert body["status"] in ("ok", "degraded", "error")
+    assert "checks" in body
+    assert "db" in body["checks"]
+    assert "redis" in body["checks"]
+    # 测试库必须可用
+    assert body["checks"]["db"] == "ok"
     assert r.status_code == 200
-    assert r.json()["status"] == "ok"
 
 
 def test_seeded_demo_methodology(client, demo_ids):

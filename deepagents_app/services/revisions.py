@@ -51,8 +51,7 @@ def serialize_tool_for_snapshot(row: ToolDefinition) -> dict[str, Any]:
         "description": row.description,
         "tool_type": row.tool_type,
         "class_path": row.class_path,
-        "input_schema": row.input_schema,
-        "output_schema": row.output_schema,
+        "requires_hitl": bool(row.requires_hitl),
         "config": dict(row.config or {}),
         "status": row.status,
     }

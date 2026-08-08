@@ -27,6 +27,7 @@ _checkpointer_key: tuple[str, bool] | None = None
 _checkpointer_lock = threading.Lock()
 
 __all__ = [
+    "SYSTEM_HITL_TOOLS",
     "build_permissions",
     "build_interrupt_on",
     "build_checkpointer",
@@ -57,17 +58,20 @@ def build_permissions() -> list[FilesystemPermission]:
     ]
 
 
+# deepagents 框架自带、不在 ToolDefinition 目录中的危险工具
+SYSTEM_HITL_TOOLS: tuple[str, ...] = ("write_file", "edit_file", "execute")
+
+
 def build_interrupt_on(settings: Settings) -> dict[str, bool] | None:
-    """危险工具人工审批配置；关闭 HITL 时返回 None。"""
+    """
+    系统默认 HITL 名单（仅框架原生工具）。
+
+    目录工具（builtin / MCP）的审批由 ``ToolDefinition.requires_hitl`` 在组装时合并。
+    关闭 ``enable_hitl`` 时返回 None。
+    """
     if not settings.enable_hitl:
         return None
-    return {
-        "run_shell_command": True,
-        "write_workspace_file": True,
-        "write_file": True,
-        "edit_file": True,
-        "execute": True,
-    }
+    return {name: True for name in SYSTEM_HITL_TOOLS}
 
 
 def build_checkpointer(settings: Settings):

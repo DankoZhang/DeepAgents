@@ -2,8 +2,8 @@
 Tool 注册管理
 =============
 
-- 内置工具（builtin）：种子写入，API 侧基本只读（仅可改 status）
-- MCP 工具：前端/API 可创建与编辑连接配置
+- 内置工具（builtin）：种子写入；API 可改 status / requires_hitl
+- MCP 工具：前端/API 可创建与编辑连接配置及 HITL
 - 变更后默认 bump 引用该方法论，保证旧会话快照可重建
 """
 
@@ -21,6 +21,12 @@ from deepagents_app.services.revisions import (
     bump_methodologies_using_tool,
     schedule_cache_invalidation_for_agent_ids,
 )
+
+
+def _invalidate_mcp_cache(tool_id: str) -> None:
+    from deepagents_app.registries.tools import clear_mcp_tools_cache
+
+    clear_mcp_tools_cache(tool_id=tool_id)
 
 
 def list_tools(
@@ -63,8 +69,7 @@ def create_builtin_tool(
     name: str,
     class_path: str,
     description: str = "",
-    input_schema: dict[str, Any] | None = None,
-    output_schema: dict[str, Any] | None = None,
+    requires_hitl: bool = False,
     config: dict[str, Any] | None = None,
     status: str = "active",
     tool_id: str | None = None,
@@ -87,8 +92,7 @@ def create_builtin_tool(
         description=description,
         tool_type="builtin",
         class_path=class_path,
-        input_schema=input_schema,
-        output_schema=output_schema,
+        requires_hitl=bool(requires_hitl),
         config=config or {},
         status=status,
     )
@@ -104,6 +108,7 @@ def create_mcp_tool(
     name: str,
     mcp_config: dict[str, Any],
     description: str = "",
+    requires_hitl: bool = False,
     status: str = "active",
     tool_id: str | None = None,
 ) -> ToolDefinition:
@@ -125,6 +130,7 @@ def create_mcp_tool(
         description=description,
         tool_type="mcp",
         class_path=None,
+        requires_hitl=bool(requires_hitl),
         config=dict(mcp_config),
         status=status,
     )
@@ -141,23 +147,23 @@ def update_tool(
     name: str | None = None,
     description: str | None = None,
     mcp_config: dict[str, Any] | None = None,
+    requires_hitl: bool | None = None,
     status: str | None = None,
     bump_related: bool = True,
 ) -> ToolDefinition:
     """
     更新工具。
 
-    内置工具仅允许改 status；MCP 可改名称/描述/连接配置。
+    内置工具仅允许改 status / requires_hitl；MCP 可改名称/描述/连接配置/HITL。
     ``bump_related=True`` 时升版所有引用该方法论。
     """
     row = get_tool(db, tool_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"工具不存在：{tool_id}")
-    # 内置工具由代码种子管理，禁止改语义字段，避免与 class_path 脱节
     if row.tool_type == "builtin":
         if name is not None or description is not None or mcp_config is not None:
             raise BusinessError(
-                "内置工具不可修改名称/描述/连接配置，仅可更新 status"
+                "内置工具不可修改名称/描述/连接配置，仅可更新 status / requires_hitl"
             )
     if name is not None:
         if name != row.name:
@@ -179,9 +185,13 @@ def update_tool(
         if row.tool_type != "mcp":
             raise BusinessError("仅 MCP 工具可更新连接配置")
         row.config = dict(mcp_config)
+    if requires_hitl is not None:
+        row.requires_hitl = bool(requires_hitl)
     if status is not None:
         row.status = status
     db.flush()
+    if row.tool_type == "mcp":
+        _invalidate_mcp_cache(tool_id)
     if bump_related:
         bump_methodologies_using_tool(db, tool_id)
     else:
@@ -206,13 +216,13 @@ def delete_tool(
         raise NotFoundError(f"工具不存在：{tool_id}")
     if row.tool_type == "builtin":
         raise BusinessError("内置工具不可删除，请改为 disabled")
-    # 先记下引用再删，删除后 AgentTool 行会级联消失
     agent_ids = [
         r.agent_id
         for r in db.query(AgentTool).filter(AgentTool.tool_id == tool_id).all()
     ]
     db.delete(row)
     db.flush()
+    _invalidate_mcp_cache(tool_id)
     if bump_related:
         if agent_ids:
             from deepagents_app.services.revisions import bump_methodologies_for_agent_ids

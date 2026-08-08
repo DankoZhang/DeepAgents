@@ -48,7 +48,10 @@ from deepagents_app.factory import (
 from deepagents_app.llm import build_chat_model_from_spec
 from deepagents_app.ownership import user_scope_key
 from deepagents_app.registries.middleware import load_middlewares_from_snapshots
-from deepagents_app.registries.tools import load_tools_from_snapshots
+from deepagents_app.registries.tools import (
+    interrupt_tool_names_from_payloads,
+    load_tools_from_snapshots,
+)
 from deepagents_app.services.llm_models import resolve_model_spec_for_agent
 from deepagents_app.services.revisions import get_revision, serialize_agent_for_snapshot
 from deepagents_app.services.skills import (
@@ -370,15 +373,15 @@ def _assemble_create_kwargs(
     supervisor_middleware: list[Any],
     supervisor_config: dict[str, Any],
     subagents: list[dict[str, Any]],
+    catalog_interrupt_on: dict[str, bool] | None = None,
     supervisor_skills: list[str] | None = None,
 ) -> dict[str, Any]:
     """``create_deep_agent`` 参数组装（live / snapshot 共用）。"""
-    # HITL：未显式配置时跟全局开关；显式配置了也要受 enable_hitl 总闸控制
-    interrupt_cfg = supervisor_config.get("interrupt_on")
-    if interrupt_cfg is None:
-        interrupt_on = build_interrupt_on(settings)
-    else:
-        interrupt_on = interrupt_cfg if settings.enable_hitl else None
+    interrupt_on = _resolve_interrupt_on(
+        settings,
+        supervisor_config=supervisor_config,
+        catalog_interrupt_on=catalog_interrupt_on,
+    )
 
     memory_file = workspace_root / "AGENTS.md"
     create_kwargs: dict[str, Any] = {
@@ -404,6 +407,42 @@ def _assemble_create_kwargs(
     if supervisor_skills:
         create_kwargs["skills"] = list(supervisor_skills)
     return create_kwargs
+
+
+def _resolve_interrupt_on(
+    settings: Settings,
+    *,
+    supervisor_config: dict[str, Any],
+    catalog_interrupt_on: dict[str, bool] | None,
+) -> dict[str, bool] | None:
+    """
+    HITL 名单 = 系统默认（框架原生）∪ 目录工具 requires_hitl。
+
+    Supervisor ``config.interrupt_on`` 若存在则再合并覆盖；总闸 ``enable_hitl``。
+    """
+    if not settings.enable_hitl:
+        return None
+    merged: dict[str, bool] = {}
+    system = build_interrupt_on(settings)
+    if system:
+        merged.update(system)
+    if catalog_interrupt_on:
+        merged.update(catalog_interrupt_on)
+    explicit = supervisor_config.get("interrupt_on")
+    if isinstance(explicit, dict):
+        merged.update({str(k): bool(v) for k, v in explicit.items()})
+    return merged or None
+
+
+def _catalog_interrupt_on_from_agents(
+    agents: list[dict[str, Any]],
+) -> dict[str, bool]:
+    """汇总方法论内所有 Agent 绑定工具的 requires_hitl 运行时名。"""
+    merged: dict[str, bool] = {}
+    for agent in agents:
+        payloads = list(agent.get("tools") or [])
+        merged.update(interrupt_tool_names_from_payloads(payloads))
+    return merged
 
 
 def _split_roles(
@@ -531,6 +570,7 @@ def _compile_from_agents(
                 supervisor_middleware=supervisor_middleware,
                 supervisor_config=supervisor_config,
                 subagents=subagents,
+                catalog_interrupt_on=_catalog_interrupt_on_from_agents(specs),
                 supervisor_skills=supervisor_skills,
             )
             return create_deep_agent(**kwargs)

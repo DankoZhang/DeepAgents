@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from deepagents_app.api.errors import register_exception_handlers
 from deepagents_app.api.routes import (
@@ -42,8 +44,8 @@ async def lifespan(_app: FastAPI):
     """
     应用生命周期钩子。
 
-    启动：日志、引擎、兼容旧路径的 AGENTS.md 同步；
-    AUTH_DISABLED 时为开发用户预引导种子。
+    启动：日志、引擎、兼容旧路径的 AGENTS.md 同步。
+    用户种子由 ``POST /api/bootstrap``（及 CLI）按用户幂等灌入，不在此预灌。
     """
     settings = get_settings()
     logging.basicConfig(
@@ -55,21 +57,47 @@ async def lifespan(_app: FastAPI):
     get_session_factory()
     sync_memory_into_workspace(settings)
 
-    if settings.auth_disabled and settings.auth_dev_user_id:
-        from deepagents_app.db.bootstrap_session import bootstrapped_db_session
-
-        with bootstrapped_db_session(settings.auth_dev_user_id) as _db:
-            logger.info("已为开发用户引导种子：%s", settings.auth_dev_user_id)
     logger.info(
-        "DeepAgents API 已就绪（db=%s, auth_disabled=%s）",
+        "DeepAgents API 已就绪（db=%s, auth_disabled=%s, cors=%s）",
         settings.database_url.split("@")[-1],
         settings.auth_disabled,
+        settings.cors_origin_list(),
     )
     yield
 
 
+def _check_db() -> str:
+    try:
+        db = get_session_factory()()
+        try:
+            db.execute(text("SELECT 1"))
+            return "ok"
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("health db check failed: %s", exc)
+        return "error"
+
+
+def _check_redis(redis_url: str) -> str:
+    try:
+        import redis
+
+        client = redis.Redis.from_url(redis_url, socket_connect_timeout=1.5)
+        try:
+            if client.ping():
+                return "ok"
+            return "error"
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("health redis check failed: %s", exc)
+        return "error"
+
+
 def create_app() -> FastAPI:
     """创建并配置 FastAPI 实例（可被 uvicorn / 测试复用）。"""
+    settings = get_settings()
     app = FastAPI(
         title="DeepAgents Methodology Platform",
         description="可配置方法论驱动的多 Agent 平台（MVP）",
@@ -79,10 +107,18 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
 
-    # MVP 放开全部来源；生产应改为前端域名白名单
+    origins = list(settings.cors_origin_list())
+    if not origins:
+        origins = ["http://localhost:5173"]
+    if "*" in origins:
+        logger.warning(
+            "CORS_ORIGINS 含 * 且 enable credentials 时不合规，已忽略 *；请改为具体前端源"
+        )
+        origins = [o for o in origins if o != "*"] or ["http://localhost:5173"]
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -99,9 +135,36 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api")
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        """进程探活，不检查 DB / Redis。"""
-        return {"status": "ok"}
+    def health(response: Response) -> dict[str, Any]:
+        """
+        探活：检查进程 + DB + Redis。
+
+        - db 失败 → 503 / status=error
+        - redis 失败且 REQUIRE_REDIS_CHECKPOINTER=true → 503
+        - redis 失败但未强制 → 200 / status=degraded
+        """
+        cfg = get_settings()
+        db_status = _check_db()
+        redis_status = _check_redis(cfg.redis_url)
+
+        overall = "ok"
+        if db_status != "ok":
+            overall = "error"
+        elif redis_status != "ok" and cfg.require_redis_checkpointer:
+            overall = "error"
+        elif redis_status != "ok":
+            overall = "degraded"
+
+        if overall == "error":
+            response.status_code = 503
+
+        return {
+            "status": overall,
+            "checks": {
+                "db": db_status,
+                "redis": redis_status,
+            },
+        }
 
     return app
 

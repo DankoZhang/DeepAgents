@@ -39,7 +39,7 @@ python -m deepagents_app.db.migrate
 python server.py
 ```
 
-鉴权：请求头带 `Authorization: Bearer <token>`，服务端调用外部 `AUTH_INTROSPECT_URL` 解析出 `user_id`；所有配置与会话按用户隔离。前端进入布局时会调 `POST /api/bootstrap`，幂等写入该用户的默认 Tool / demo 方法论（本地 `AUTH_DISABLED` 时 lifespan 也会预灌 dev 用户）。
+鉴权：请求头带 `Authorization: Bearer <token>`，服务端调用外部 `AUTH_INTROSPECT_URL` 解析出 `user_id`；所有配置与会话按用户隔离。前端进入布局时会调 `POST /api/bootstrap`，幂等写入该用户的默认 Tool / demo 方法论。
 
 Schema 变更请用 Alembic（见 `migrations/README`）。脚本目录是 `migrations/`（由 `alembic.ini` 的 `script_location` 指定）；勿在仓库根再建 `alembic/`，会遮蔽 PyPI 包：
 

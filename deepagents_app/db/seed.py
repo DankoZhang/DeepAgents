@@ -73,12 +73,14 @@ DEFAULT_TOOLS: list[dict] = [
         "name": "write_workspace_file",
         "description": "写入工作区文件",
         "class_path": "deepagents_app.tools.computer_tools:write_workspace_file",
+        "requires_hitl": True,
     },
     {
         "id": "tool_run_shell_command",
         "name": "run_shell_command",
         "description": "执行白名单 shell 命令",
         "class_path": "deepagents_app.tools.computer_tools:run_shell_command",
+        "requires_hitl": True,
     },
     {
         "id": "tool_search_knowledge",
@@ -165,6 +167,7 @@ def seed_tools_and_middlewares(db: Session, *, owner_user_id: str) -> None:
                 name=item["name"],
                 description=item["description"],
                 class_path=item["class_path"],
+                requires_hitl=bool(item.get("requires_hitl", False)),
             )
             logger.info("种子工具[%s]：%s", owner_user_id, item["name"])
     for item in DEFAULT_MIDDLEWARES:

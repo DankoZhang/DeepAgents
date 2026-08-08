@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -144,8 +145,6 @@ class ToolDefinition(Base):
 
     - builtin：种子内置，class_path 指向 Python 对象
     - mcp：MCP Server 连接；运行时展开为工具列表
-
-    ``input_schema`` / ``output_schema`` 仅供前端展示，运行时不校验入参。
     """
 
     __tablename__ = "tool_definition"
@@ -159,8 +158,8 @@ class ToolDefinition(Base):
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     tool_type: Mapped[str] = mapped_column(String(32), default="builtin", nullable=False)
     class_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    input_schema: Mapped[dict[str, Any] | None] = mapped_column(JsonType, nullable=True)
-    output_schema: Mapped[dict[str, Any] | None] = mapped_column(JsonType, nullable=True)
+    # 调用前是否需 HITL；组装时并入 create_deep_agent(interrupt_on=...)
+    requires_hitl: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     created_time: Mapped[datetime] = mapped_column(

@@ -8,13 +8,14 @@
 - 使用 ``pydantic-settings`` 从环境变量 / ``.env`` 自动加载
 - 路径统一解析为绝对路径，避免 cwd 变化导致 workspace 漂移
 - 业务代码只依赖 ``get_settings()``，不直接读 ``os.environ``
+- Settings 为 frozen：禁止就地改字段；临时覆盖用 ``settings_with`` / ``model_copy``
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,12 +25,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
-    """DeepAgents 演示框架的全局配置。"""
+    """DeepAgents 演示框架的全局配置（不可变单例字段）。"""
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
+        frozen=True,
     )
 
     # ── 模型 ──────────────────────────────────────────────────────────
@@ -58,6 +60,10 @@ class Settings(BaseSettings):
     # FastAPI
     api_host: str = "0.0.0.0"
     api_port: int = 8001
+    # CORS 允许的前端源：逗号分隔字符串（避免 list 字段被 dotenv 当 JSON 解析）
+    cors_origins: str = (
+        "http://localhost:5173,http://127.0.0.1:5173"
+    )
 
     # ── 鉴权（外部 API 解析 Bearer token → user_id）────────────────────
     # 验 token 的完整 URL；AUTH_DISABLED=false 时必填
@@ -105,6 +111,20 @@ class Settings(BaseSettings):
         (self.workspace_dir / "documents").mkdir(parents=True, exist_ok=True)
         (self.workspace_dir / "notes").mkdir(parents=True, exist_ok=True)
 
+    def cors_origin_list(self) -> list[str]:
+        """解析 ``cors_origins`` 为前端源列表。"""
+        text = (self.cors_origins or "").strip()
+        if not text:
+            return ["http://localhost:5173", "http://127.0.0.1:5173"]
+        if text.startswith("["):
+            import json
+
+            parsed = json.loads(text)
+            if not isinstance(parsed, list):
+                raise ValueError("cors_origins JSON 必须是数组")
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        return [part.strip() for part in text.split(",") if part.strip()]
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -112,3 +132,12 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.ensure_directories()
     return settings
+
+
+def settings_with(**overrides: Any) -> Settings:
+    """
+    基于单例复制一份覆盖后的 Settings（不改动缓存中的原对象）。
+
+    例：``settings_with(enable_hitl=True)``
+    """
+    return get_settings().model_copy(update=overrides)
