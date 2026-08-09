@@ -8,13 +8,16 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, Query, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.auth import get_current_user_id as require_user
+from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
+    cursor_query,
     limit_query,
     offset_query,
+    set_next_cursor,
     set_total_count,
 )
 from deepagents_app.api.schemas import (
@@ -22,7 +25,7 @@ from deepagents_app.api.schemas import (
     ConversationMessagesOut,
     ConversationOut,
 )
-from deepagents_app.db.session import get_db
+from deepagents_app.db.session import get_async_db
 from deepagents_app.services import conversation as conversation_svc
 from deepagents_app.services.chat import get_conversation_messages as load_conversation_messages
 
@@ -30,13 +33,13 @@ router = APIRouter(tags=["conversation"])
 
 
 @router.post("/conversation", response_model=ConversationOut)
-def create_conversation(
+async def create_conversation(
     body: ConversationCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
     """仅允许对本用户已发布方法论建会话；写入当前 methodology_version。"""
-    return conversation_svc.create_conversation(
+    return await conversation_svc.create_conversation(
         db,
         user_id=user_id,
         methodology_id=body.methodology_id,
@@ -45,47 +48,48 @@ def create_conversation(
 
 
 @router.get("/conversation/list", response_model=list[ConversationOut])
-def list_conversations(
+async def list_conversations(
     response: Response,
     methodology_id: str | None = Query(None),
     limit: int = Depends(limit_query),
     offset: int = Depends(offset_query),
-    db: Session = Depends(get_db),
+    cursor: str | None = Depends(cursor_query),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    rows, total = conversation_svc.list_conversations(
+    rows, total, next_cursor = await conversation_svc.list_conversations(
         db,
         user_id=user_id,
         methodology_id=methodology_id,
         limit=limit,
         offset=offset,
+        cursor=cursor,
     )
     set_total_count(response, total)
+    set_next_cursor(response, next_cursor)
     return rows
 
 
 @router.get("/conversation/{thread_id}", response_model=ConversationOut)
-def get_conversation(
+async def get_conversation(
     thread_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    row = conversation_svc.get_conversation_by_thread(
+    row = await conversation_svc.get_conversation_by_thread(
         db, thread_id, user_id=user_id
     )
-    if row is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    return row
+    return require_entity(row, "会话不存在")
 
 
 @router.delete("/conversation/{thread_id}")
-def delete_conversation(
+async def delete_conversation(
     thread_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
     """仅删 Conversation 行，并尽量清理 checkpointer 中的 thread 状态。"""
-    conversation_svc.delete_conversation(db, thread_id, user_id=user_id)
+    await conversation_svc.delete_conversation(db, thread_id, user_id=user_id)
     return {"ok": True}
 
 
@@ -93,12 +97,12 @@ def delete_conversation(
     "/conversation/{thread_id}/messages",
     response_model=ConversationMessagesOut,
 )
-def get_conversation_messages(
+async def get_conversation_messages(
     thread_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
     """读取会话历史消息（checkpointer state，不编译 Agent）。"""
     return ConversationMessagesOut(
-        **load_conversation_messages(db, user_id=user_id, thread_id=thread_id)
+        **(await load_conversation_messages(db, user_id=user_id, thread_id=thread_id))
     )

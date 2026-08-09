@@ -49,8 +49,6 @@ class Settings(BaseSettings):
     # Redis checkpointer 连接串（多轮对话持久化）
     # 需要 Redis 8+ 或 Redis Stack（含 RedisJSON + RediSearch）
     redis_url: str = "redis://localhost:6379"
-    # True：Redis 不可用时直接失败（生产建议开启）；False：回退 InMemorySaver
-    require_redis_checkpointer: bool = False
 
     # PostgreSQL：方法论 / Agent / Tool / Middleware / Conversation 配置库
     database_url: str = (
@@ -60,6 +58,10 @@ class Settings(BaseSettings):
     # FastAPI
     api_host: str = "0.0.0.0"
     api_port: int = 8001
+    # 进程数：1=单进程；>1 时 uvicorn --workers / gunicorn UvicornWorker
+    api_workers: int = Field(default=1, ge=1, le=64)
+    # 启动器：uvicorn（内置多 worker）或 gunicorn+UvicornWorker
+    api_server: Literal["uvicorn", "gunicorn"] = "uvicorn"
     # CORS 允许的前端源：逗号分隔字符串（避免 list 字段被 dotenv 当 JSON 解析）
     cors_origins: str = (
         "http://localhost:5173,http://127.0.0.1:5173"
@@ -74,23 +76,58 @@ class Settings(BaseSettings):
     auth_user_id_field: str = "user_id"
     auth_timeout_seconds: float = 5.0
     auth_cache_ttl_seconds: float = 60.0
-    # True：跳过外部鉴权，固定使用 auth_dev_user_id（仅本地/测试）
-    auth_disabled: bool = True
+    # True：跳过外部鉴权，固定使用 auth_dev_user_id（仅本地/测试；生产必须 false）
+    auth_disabled: bool = False
     auth_dev_user_id: str = "dev-user"
+
+    # ── MCP 安全 ──────────────────────────────────────────────────────
+    # stdio 会在 API 进程内拉起子进程，默认关闭；本地调试显式打开
+    mcp_stdio_enabled: bool = False
+    # 允许的可执行文件 basename（逗号分隔）；启用 stdio 时必填
+    mcp_stdio_command_allowlist: str = "npx,uvx,node,python,python3"
 
     # ── 功能开关 ──────────────────────────────────────────────────────
     # 是否在危险工具（shell / 写文件）前暂停等待人工批准
-    enable_hitl: bool = False
+    enable_hitl: bool = True
     # 日志级别
     log_level: str = "INFO"
+    # 单进程同时进行的 SSE / 流式对话上限（0=不限制）
+    chat_stream_max_concurrent: int = Field(default=32, ge=0, le=10_000)
+    # 获取流式槽位的最长等待秒数；超时返回 429（0=立即失败不排队）
+    chat_stream_acquire_timeout_seconds: float = Field(default=1.0, ge=0, le=120)
+    # 流式限流作用域：auto=多 worker 用 Redis 全局限流，否则进程内；local/redis 可强制
+    chat_stream_limiter: Literal["auto", "local", "redis"] = "auto"
+    # 单条用户消息最大字符数
+    chat_message_max_chars: int = Field(default=32_000, ge=1, le=2_000_000)
+    # SQLAlchemy 异步连接池（与流式并发匹配；0=使用驱动默认）
+    db_pool_size: int = Field(default=10, ge=1, le=200)
+    db_max_overflow: int = Field(default=20, ge=0, le=200)
+    db_pool_timeout: float = Field(default=30.0, ge=1, le=600)
+    # 连接回收秒数；0=不回收（依赖 pool_pre_ping）
+    db_pool_recycle: int = Field(default=1800, ge=0, le=86_400)
 
     # ── 运行时资源生命周期 ────────────────────────────────────────────
-    # 进程内 Compiled Agent 缓存上限；淘汰时顺带清构建锁与物化 Skills
+    # 进程内 Compiled Agent 缓存上限；淘汰时顺带清构建锁（Skills 物化按内容寻址保留）
     agent_cache_max_size: int = Field(default=32, ge=1, le=10_000)
     # 每个方法论最多保留的历史快照数（仍被会话引用的版本不会删）
     methodology_revision_keep: int = Field(default=20, ge=1, le=10_000)
+    # Skills 物化 GC：``.complete`` 超过该天数未刷新则删除（0=禁用）
+    skills_gc_max_age_days: float = Field(default=14.0, ge=0, le=3650)
+    # Skills 物化 GC：残留临时目录超过该小时数则删除
+    skills_gc_tmp_max_age_hours: float = Field(default=1.0, ge=0.01, le=720)
+    # API 进程内后台 GC 间隔（小时）；0=不启动后台任务（可用模块 CLI）
+    skills_gc_interval_hours: float = Field(default=24.0, ge=0, le=720)
+    # content_blob 孤儿 GC 后台间隔（小时）；0=不启动（可用模块 CLI）
+    content_blob_gc_interval_hours: float = Field(default=24.0, ge=0, le=720)
     # Fernet 密钥（url-safe base64）或任意口令；用于加密模型 api_key
+    # 生产必须设置；未设置且未允许 insecure 时启动/加密会失败
     secrets_encryption_key: str | None = None
+    # 轮转用旧密钥：逗号分隔，解密时在主密钥失败后依次尝试
+    secrets_encryption_previous_keys: str = ""
+    # True：允许在未配置 SECRETS_ENCRYPTION_KEY 时使用固定开发密钥（仅本地）
+    secrets_allow_insecure_dev_key: bool = False
+    # /health 探活结果短缓存（秒）；0=每次实时探测；仅缓存成功结果
+    health_cache_ttl_seconds: float = Field(default=2.0, ge=0, le=60)
 
     @field_validator(
         "workspace_dir",
@@ -106,10 +143,8 @@ class Settings(BaseSettings):
         return path.resolve()
 
     def ensure_directories(self) -> None:
-        """创建运行时必需的目录（幂等）。"""
+        """创建运行时必需的目录（幂等）。真实用户目录在 workspace/users/<hash>/。"""
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        (self.workspace_dir / "documents").mkdir(parents=True, exist_ok=True)
-        (self.workspace_dir / "notes").mkdir(parents=True, exist_ok=True)
 
     def cors_origin_list(self) -> list[str]:
         """解析 ``cors_origins`` 为前端源列表。"""

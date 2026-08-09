@@ -7,44 +7,51 @@ Middleware API（只读）
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.auth import get_current_user_id as require_user
+from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
+    cursor_query,
     limit_query,
     offset_query,
+    set_next_cursor,
     set_total_count,
 )
 from deepagents_app.api.schemas import MiddlewareOut
-from deepagents_app.db.session import get_db
+from deepagents_app.db.session import get_async_db
 from deepagents_app.services import middlewares as mw_svc
 
 router = APIRouter(tags=["middlewares"])
 
 
 @router.get("/middleware/list", response_model=list[MiddlewareOut])
-def list_middlewares(
+async def list_middlewares(
     response: Response,
     limit: int = Depends(limit_query),
     offset: int = Depends(offset_query),
-    db: Session = Depends(get_db),
+    cursor: str | None = Depends(cursor_query),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    rows, total = mw_svc.list_middlewares(
-        db, owner_user_id=user_id, limit=limit, offset=offset
+    rows, total, next_cursor = await mw_svc.list_middlewares(
+        db,
+        owner_user_id=user_id,
+        limit=limit,
+        offset=offset,
+        cursor=cursor,
     )
     set_total_count(response, total)
+    set_next_cursor(response, next_cursor)
     return rows
 
 
 @router.get("/middleware/{middleware_id}", response_model=MiddlewareOut)
-def get_middleware(
+async def get_middleware(
     middleware_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    row = mw_svc.get_middleware(db, middleware_id, owner_user_id=user_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="中间件不存在")
-    return row
+    row = await mw_svc.get_middleware(db, middleware_id, owner_user_id=user_id)
+    return require_entity(row, "中间件不存在")

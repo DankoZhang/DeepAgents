@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -138,18 +139,22 @@ def list_knowledge_topics() -> str:
 
 
 @tool(args_schema=SaveQaNoteArgs)
-def save_qa_note(question: str, answer: str, tags: str = "") -> str:
+async def save_qa_note(question: str, answer: str, tags: str = "") -> str:
     """将一对高质量问答沉淀为笔记，便于后续复用。"""
-    notes = _notes_dir()
-    notes.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = notes / f"qa_{stamp}.md"
-    body = (
-        f"# Q&A Note\n\n"
-        f"- time: {stamp}\n"
-        f"- tags: {tags or 'general'}\n\n"
-        f"## Question\n\n{question.strip()}\n\n"
-        f"## Answer\n\n{answer.strip()}\n"
-    )
-    path.write_text(body, encoding="utf-8")
-    return f"问答笔记已保存：{path}"
+
+    def _write() -> str:
+        notes = _notes_dir()
+        notes.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = notes / f"qa_{stamp}.md"
+        body = (
+            f"# Q&A Note\n\n"
+            f"- time: {stamp}\n"
+            f"- tags: {tags or 'general'}\n\n"
+            f"## Question\n\n{question.strip()}\n\n"
+            f"## Answer\n\n{answer.strip()}\n"
+        )
+        path.write_text(body, encoding="utf-8")
+        return f"问答笔记已保存：{path}"
+
+    return await asyncio.to_thread(_write)

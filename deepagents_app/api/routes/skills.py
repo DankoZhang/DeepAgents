@@ -8,61 +8,65 @@ CRUD：前端可新增 / 编辑 / 删除 Skill（完整 SKILL.md 存库）。
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, Query, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.auth import get_current_user_id as require_user
+from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
+    cursor_query,
     limit_query,
     offset_query,
+    set_next_cursor,
     set_total_count,
 )
 from deepagents_app.api.schemas import SkillCreate, SkillOut, SkillUpdate
-from deepagents_app.db.session import get_db
+from deepagents_app.db.session import get_async_db
 from deepagents_app.services import skills as skills_svc
 
 router = APIRouter(tags=["skills"])
 
 
 @router.get("/skill/list", response_model=list[SkillOut])
-def list_skills(
+async def list_skills(
     response: Response,
     status: str | None = Query(None, description="active | disabled"),
     limit: int = Depends(limit_query),
     offset: int = Depends(offset_query),
-    db: Session = Depends(get_db),
+    cursor: str | None = Depends(cursor_query),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    rows, total = skills_svc.list_skills(
+    rows, total, next_cursor = await skills_svc.list_skills(
         db,
         owner_user_id=user_id,
         status=status,
         limit=limit,
         offset=offset,
+        cursor=cursor,
     )
     set_total_count(response, total)
+    set_next_cursor(response, next_cursor)
     return rows
 
 
 @router.get("/skill/{skill_id}", response_model=SkillOut)
-def get_skill(
+async def get_skill(
     skill_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    row = skills_svc.get_skill(db, skill_id, owner_user_id=user_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Skill 不存在")
-    return row
+    row = await skills_svc.get_skill(db, skill_id, owner_user_id=user_id)
+    return require_entity(row, "Skill 不存在")
 
 
 @router.post("/skill", response_model=SkillOut)
-def create_skill(
+async def create_skill(
     body: SkillCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return skills_svc.create_skill(
+    return await skills_svc.create_skill(
         db,
         owner_user_id=user_id,
         name=body.name,
@@ -75,13 +79,13 @@ def create_skill(
 
 
 @router.patch("/skill/{skill_id}", response_model=SkillOut)
-def update_skill(
+async def update_skill(
     skill_id: str,
     body: SkillUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return skills_svc.update_skill(
+    return await skills_svc.update_skill(
         db,
         skill_id,
         owner_user_id=user_id,
@@ -94,10 +98,10 @@ def update_skill(
 
 
 @router.delete("/skill/{skill_id}")
-def delete_skill(
+async def delete_skill(
     skill_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    skills_svc.delete_skill(db, skill_id, owner_user_id=user_id)
+    await skills_svc.delete_skill(db, skill_id, owner_user_id=user_id)
     return {"ok": True}

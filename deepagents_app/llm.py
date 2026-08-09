@@ -117,10 +117,17 @@ def model_spec_from_row(row: Any) -> dict[str, Any]:
     """ORM ModelDefinition → build_chat_model 可用的参数字典（含解密后密钥）。"""
     from deepagents_app.crypto import decrypt_secret
 
+    try:
+        api_key = decrypt_secret(row.api_key)
+    except ValueError as exc:
+        raise BusinessError(
+            f"模型 {getattr(row, 'id', '?')} 的 api_key 解密失败：{exc}"
+        ) from exc
+
     return {
         "provider": row.provider,
         "model_name": row.model_name,
-        "api_key": decrypt_secret(row.api_key),
+        "api_key": api_key,
         "base_url": row.base_url,
         "temperature": row.temperature,
         "top_p": row.top_p,

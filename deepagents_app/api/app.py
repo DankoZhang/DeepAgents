@@ -3,7 +3,7 @@ FastAPI 应用工厂
 ================
 
 职责：
-- 应用启动时初始化日志、全局 workspace memory（兼容旧路径）
+- 应用启动时初始化日志、引擎、可选 Skills / content_blob GC 后台
 - 挂载 CORS 与各业务路由
 
 HarnessProfile / general-purpose 子 Agent 在组装时按方法论显式注入，
@@ -13,6 +13,8 @@ HarnessProfile / general-purpose 子 Agent 在组装时按方法论显式注入�
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -32,11 +34,29 @@ from deepagents_app.api.routes import (
     skills,
     tools,
 )
+from deepagents_app.auth import close_auth_http_client
 from deepagents_app.config import get_settings
-from deepagents_app.db.session import get_session_factory
-from deepagents_app.factory import sync_memory_into_workspace
+from deepagents_app.db.session import get_async_engine, get_async_session_factory
+from deepagents_app.factory import close_checkpointer, init_checkpointer
+from deepagents_app.services.cache_pubsub import (
+    start_cache_invalidation_listener,
+    stop_cache_invalidation_listener,
+)
+from deepagents_app.services.chat import close_redis_stream_slots_client
+from deepagents_app.services.content_blobs_gc_scheduler import (
+    start_content_blob_gc_scheduler,
+    stop_content_blob_gc_scheduler,
+)
+from deepagents_app.services.skills_gc_scheduler import (
+    start_skills_gc_scheduler,
+    stop_skills_gc_scheduler,
+)
 
 logger = logging.getLogger(__name__)
+
+_health_lock = threading.Lock()
+# (monotonic_ts, body, http_status) — 仅缓存成功探活
+_health_cache: tuple[float, dict[str, Any], int] | None = None
 
 
 @asynccontextmanager
@@ -44,8 +64,9 @@ async def lifespan(_app: FastAPI):
     """
     应用生命周期钩子。
 
-    启动：日志、引擎、兼容旧路径的 AGENTS.md 同步。
-    用户种子由 ``POST /api/bootstrap``（及 CLI）按用户幂等灌入，不在此预灌。
+    启动：日志、引擎、AsyncRedisSaver、鉴权配置校验、GC 后台（可选）。
+    用户种子由 ``POST /api/bootstrap`` 按用户幂等灌入，不在此预灌。
+    Memory 随方法论快照版本化；组装时按 version 物化。
     """
     settings = get_settings()
     logging.basicConfig(
@@ -54,42 +75,61 @@ async def lifespan(_app: FastAPI):
         datefmt="%H:%M:%S",
     )
 
-    get_session_factory()
-    sync_memory_into_workspace(settings)
+    if settings.auth_disabled:
+        logger.warning(
+            "AUTH_DISABLED=true：跳过外部鉴权（仅限本地/测试）；生产必须设为 false"
+        )
+    elif not (settings.auth_introspect_url or "").strip():
+        raise RuntimeError(
+            "AUTH_DISABLED=false 时必须配置 AUTH_INTROSPECT_URL"
+        )
+
+    get_async_session_factory()
+    await init_checkpointer(settings)
+    await start_cache_invalidation_listener()
+    start_skills_gc_scheduler(settings)
+    start_content_blob_gc_scheduler(settings)
 
     logger.info(
-        "DeepAgents API 已就绪（db=%s, auth_disabled=%s, cors=%s）",
+        "DeepAgents API 已就绪（db=%s, auth_disabled=%s, cors=%s, workers=%s）",
         settings.database_url.split("@")[-1],
         settings.auth_disabled,
         settings.cors_origin_list(),
+        settings.api_workers,
     )
-    yield
-
-
-def _check_db() -> str:
     try:
-        db = get_session_factory()()
-        try:
-            db.execute(text("SELECT 1"))
-            return "ok"
-        finally:
-            db.close()
+        yield
+    finally:
+        await stop_content_blob_gc_scheduler()
+        await stop_skills_gc_scheduler()
+        await stop_cache_invalidation_listener()
+        await close_redis_stream_slots_client()
+        await close_checkpointer()
+        await close_auth_http_client()
+
+
+async def _check_db() -> str:
+    try:
+        engine = get_async_engine()
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return "ok"
     except Exception as exc:  # noqa: BLE001
         logger.warning("health db check failed: %s", exc)
         return "error"
 
 
-def _check_redis(redis_url: str) -> str:
+async def _check_redis(redis_url: str) -> str:
     try:
-        import redis
+        import redis.asyncio as aioredis
 
-        client = redis.Redis.from_url(redis_url, socket_connect_timeout=1.5)
+        client = aioredis.from_url(redis_url, socket_connect_timeout=1.5)
         try:
-            if client.ping():
+            if await client.ping():
                 return "ok"
             return "error"
         finally:
-            client.close()
+            await client.aclose()
     except Exception as exc:  # noqa: BLE001
         logger.warning("health redis check failed: %s", exc)
         return "error"
@@ -122,6 +162,8 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # 前端 cursor 翻页依赖这两个响应头（跨域时必须 expose）
+        expose_headers=["X-Total-Count", "X-Next-Cursor"],
     )
 
     app.include_router(bootstrap.router, prefix="/api")
@@ -135,36 +177,48 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api")
 
     @app.get("/health")
-    def health(response: Response) -> dict[str, Any]:
+    async def health(response: Response) -> dict[str, Any]:
         """
-        探活：检查进程 + DB + Redis。
+        探活：检查进程 + DB + Redis（成功结果短 TTL 缓存）。
 
-        - db 失败 → 503 / status=error
-        - redis 失败且 REQUIRE_REDIS_CHECKPOINTER=true → 503
-        - redis 失败但未强制 → 200 / status=degraded
+        - db / redis 失败 → 503 / status=error（失败不缓存，便于快速恢复）
         """
+        global _health_cache
+
         cfg = get_settings()
-        db_status = _check_db()
-        redis_status = _check_redis(cfg.redis_url)
+        ttl = float(cfg.health_cache_ttl_seconds or 0)
+        now = time.monotonic()
+        if ttl > 0:
+            with _health_lock:
+                if _health_cache is not None:
+                    cached_at, body, code = _health_cache
+                    if now - cached_at < ttl:
+                        response.status_code = code
+                        return body
+
+        db_status = await _check_db()
+        redis_status = await _check_redis(cfg.redis_url)
 
         overall = "ok"
-        if db_status != "ok":
+        if db_status != "ok" or redis_status != "ok":
             overall = "error"
-        elif redis_status != "ok" and cfg.require_redis_checkpointer:
-            overall = "error"
-        elif redis_status != "ok":
-            overall = "degraded"
 
-        if overall == "error":
-            response.status_code = 503
-
-        return {
+        code = 503 if overall == "error" else 200
+        body = {
             "status": overall,
             "checks": {
                 "db": db_status,
                 "redis": redis_status,
             },
         }
+        response.status_code = code
+
+        # 只缓存成功探活，失败实时重试
+        if ttl > 0 and overall == "ok":
+            with _health_lock:
+                _health_cache = (now, body, code)
+
+        return body
 
     return app
 

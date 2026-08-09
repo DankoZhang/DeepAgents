@@ -6,7 +6,7 @@
 - 把 live 方法论（含 Agent / Tool / Middleware / Skill / LLM）序列化进
   ``MethodologyRevision``，旧会话可按创建时 version 重建 Agent
 - 配置变更时统一 ``bump_methodology``：
-  - draft：不升版，覆盖当前 version 快照（草稿累积）
+  - draft：不升版、不写快照（draft 无人读）；仅刷新时间戳并失效缓存
   - published：升版 + 新快照，并按保留策略裁剪历史
 - Agent / 模型 / 工具 / Skill 变更时，级联 bump 所有引用它们的方法论
 """
@@ -18,7 +18,8 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import NotFoundError
 from deepagents_app.config import get_settings
@@ -31,92 +32,43 @@ from deepagents_app.db.models import (
     Methodology,
     MethodologyAgent,
     MethodologyRevision,
-    MiddlewareDefinition,
-    SkillDefinition,
-    ToolDefinition,
 )
-from deepagents_app.services.llm_models import serialize_model_for_snapshot
+from deepagents_app.services.snapshots import serialize_agent_for_snapshot
 
 logger = logging.getLogger(__name__)
 
-
-# ── 快照序列化：live ORM → 可持久化 JSON ──────────────────────────────
-
-
-def serialize_tool_for_snapshot(row: ToolDefinition) -> dict[str, Any]:
-    """钉死工具元信息（含 MCP 连接 config），旧会话不随目录修改漂移。"""
-    return {
-        "id": row.id,
-        "name": row.name,
-        "description": row.description,
-        "tool_type": row.tool_type,
-        "class_path": row.class_path,
-        "requires_hitl": bool(row.requires_hitl),
-        "config": dict(row.config or {}),
-        "status": row.status,
-    }
-
-
-def serialize_middleware_for_snapshot(row: MiddlewareDefinition) -> dict[str, Any]:
-    """钉死中间件 class_path + 构造 config。"""
-    return {
-        "id": row.id,
-        "name": row.name,
-        "class_path": row.class_path,
-        "config": dict(row.config or {}),
-    }
+__all__ = [
+    "serialize_methodology",
+    "snapshot_methodology",
+    "get_revision",
+    "list_revisions",
+    "schedule_cache_invalidation",
+    "flush_cache_invalidations",
+    "schedule_cache_invalidation_for_agent_ids",
+    "prune_methodology_revisions",
+    "bump_methodology",
+    "bump_methodologies_for_agent_ids",
+    "bump_methodologies_using_resource",
+    "bump_methodologies_using_agent",
+    "bump_methodologies_using_model",
+    "bump_methodologies_using_tool",
+    "bump_methodologies_using_skill",
+]
 
 
-def serialize_skill_for_snapshot(row: SkillDefinition) -> dict[str, Any]:
-    """钉死 Skill 正文与元信息，旧会话不随目录修改漂移。"""
-    return {
-        "id": row.id,
-        "name": row.name,
-        "description": row.description,
-        "content": row.content,
-        "config": dict(row.config or {}),
-        "status": row.status,
-    }
-
-
-def serialize_agent_for_snapshot(
-    agent: AgentDefinition,
-    *,
-    include_llm: bool = True,
-) -> dict[str, Any]:
-    """live Agent ORM → 快照 / 组装共用的 dict（唯一序列化入口）。"""
-    payload: dict[str, Any] = {
-        "id": agent.id,
-        "name": agent.name,
-        "system_prompt": agent.system_prompt,
-        "model_id": agent.model_id,
-        "config": dict(agent.config or {}),
-        "tool_ids": [t.id for t in agent.tools],
-        "tools": [serialize_tool_for_snapshot(t) for t in agent.tools],
-        "middleware_ids": [m.id for m in agent.middlewares],
-        "middlewares": [
-            serialize_middleware_for_snapshot(m) for m in agent.middlewares
-        ],
-        "skill_ids": [s.id for s in agent.skills],
-        "skills": [serialize_skill_for_snapshot(s) for s in agent.skills],
-    }
-    if include_llm:
-        payload["llm"] = serialize_model_for_snapshot(agent.llm_model)
-    else:
-        payload["llm"] = None
-    return payload
-
-
-def serialize_methodology(db: Session, methodology_id: str) -> dict[str, Any]:
-    """把当前方法论完整配置序列化为可重建的 JSON。"""
+async def serialize_methodology(db: AsyncSession, methodology_id: str) -> dict[str, Any]:
+    """把当前方法论完整配置序列化为可重建的 JSON（含版本化 Memory）。"""
     methodology = (
-        db.query(Methodology)
-        .options(*methodology_with_agents_options())
-        .filter(Methodology.id == methodology_id)
-        .one_or_none()
-    )
+        await db.scalars(
+            select(Methodology)
+            .options(*methodology_with_agents_options())
+            .where(Methodology.id == methodology_id)
+        )
+    ).one_or_none()
     if methodology is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
+
+    from deepagents_app.services.memory import memory_payload_for_snapshot_async
 
     return {
         "id": methodology.id,
@@ -124,33 +76,34 @@ def serialize_methodology(db: Session, methodology_id: str) -> dict[str, Any]:
         "description": methodology.description,
         "version": methodology.version,
         "status": methodology.status,
+        "memory": await memory_payload_for_snapshot_async(db, get_settings()),
         "agents": [
-            serialize_agent_for_snapshot(agent, include_llm=True)
+            await serialize_agent_for_snapshot(db, agent)
             for agent in methodology.agents
         ],
     }
 
 
-def snapshot_methodology(db: Session, methodology_id: str) -> MethodologyRevision:
+async def snapshot_methodology(db: AsyncSession, methodology_id: str) -> MethodologyRevision:
     """按当前 ``methodology.version`` 写入/覆盖快照（同 version 重复调用会覆盖）。"""
-    methodology = db.get(Methodology, methodology_id)
+    methodology = await db.get(Methodology, methodology_id)
     if methodology is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
 
-    payload = serialize_methodology(db, methodology_id)
+    payload = await serialize_methodology(db, methodology_id)
     existing = (
-        db.query(MethodologyRevision)
-        .filter(
-            MethodologyRevision.methodology_id == methodology_id,
-            MethodologyRevision.version == methodology.version,
+        await db.scalars(
+            select(MethodologyRevision).where(
+                MethodologyRevision.methodology_id == methodology_id,
+                MethodologyRevision.version == methodology.version,
+            )
         )
-        .one_or_none()
-    )
+    ).one_or_none()
     if existing is not None:
         # 同 version 覆盖：例如发布时再钉一次，避免多插一行
         existing.snapshot = payload
         existing.created_time = datetime.now(timezone.utc)
-        db.flush()
+        await db.flush()
         return existing
 
     row = MethodologyRevision(
@@ -160,33 +113,34 @@ def snapshot_methodology(db: Session, methodology_id: str) -> MethodologyRevisio
         snapshot=payload,
     )
     db.add(row)
-    db.flush()
+    await db.flush()
     return row
 
 
-def get_revision(
-    db: Session,
+async def get_revision(
+    db: AsyncSession,
     methodology_id: str,
     version: int,
 ) -> MethodologyRevision | None:
     """按方法论 + 版本取快照行（Agent Factory 重建旧会话时用）。"""
     return (
-        db.query(MethodologyRevision)
-        .filter(
-            MethodologyRevision.methodology_id == methodology_id,
-            MethodologyRevision.version == version,
+        await db.scalars(
+            select(MethodologyRevision).where(
+                MethodologyRevision.methodology_id == methodology_id,
+                MethodologyRevision.version == version,
+            )
         )
-        .one_or_none()
-    )
+    ).one_or_none()
 
 
-def list_revisions(db: Session, methodology_id: str) -> list[MethodologyRevision]:
+async def list_revisions(db: AsyncSession, methodology_id: str) -> list[MethodologyRevision]:
     """列出方法论全部历史快照，版本号降序。"""
-    return (
-        db.query(MethodologyRevision)
-        .filter(MethodologyRevision.methodology_id == methodology_id)
-        .order_by(MethodologyRevision.version.desc())
-        .all()
+    return list(
+        await db.scalars(
+            select(MethodologyRevision)
+            .where(MethodologyRevision.methodology_id == methodology_id)
+            .order_by(MethodologyRevision.version.desc())
+        )
     )
 
 
@@ -194,7 +148,7 @@ def list_revisions(db: Session, methodology_id: str) -> list[MethodologyRevision
 
 
 def schedule_cache_invalidation(
-    db: Session,
+    db: AsyncSession,
     methodology_id: str | None = None,
     *,
     all_keys: bool = False,
@@ -213,8 +167,8 @@ def schedule_cache_invalidation(
     pending.add(methodology_id)
 
 
-def flush_cache_invalidations(db: Session) -> None:
-    """在 Session commit 成功后调用：按登记清空 Agent 缓存。"""
+def flush_cache_invalidations(db: AsyncSession) -> None:
+    """在 Session commit 成功后调用：按登记清空 Agent 缓存并广播。"""
     from deepagents_app.services.agent_factory import invalidate_agent_cache
 
     info = db.info
@@ -227,8 +181,8 @@ def flush_cache_invalidations(db: Session) -> None:
         invalidate_agent_cache(mid)
 
 
-def schedule_cache_invalidation_for_agent_ids(
-    db: Session, agent_ids: Iterable[str]
+async def schedule_cache_invalidation_for_agent_ids(
+    db: AsyncSession, agent_ids: Iterable[str]
 ) -> bool:
     """
     不升版，仅登记引用给定 Agent 的方法论缓存失效。
@@ -240,9 +194,9 @@ def schedule_cache_invalidation_for_agent_ids(
         return False
     meth_ids = {
         link.methodology_id
-        for link in db.query(MethodologyAgent)
-        .filter(MethodologyAgent.agent_id.in_(ids))
-        .all()
+        for link in await db.scalars(
+            select(MethodologyAgent).where(MethodologyAgent.agent_id.in_(ids))
+        )
     }
     if not meth_ids:
         return False
@@ -254,8 +208,8 @@ def schedule_cache_invalidation_for_agent_ids(
 # ── 升版：方法论配置变更的统一收尾 ────────────────────────────────────
 
 
-def prune_methodology_revisions(
-    db: Session,
+async def prune_methodology_revisions(
+    db: AsyncSession,
     methodology_id: str,
     *,
     keep: int | None = None,
@@ -264,26 +218,27 @@ def prune_methodology_revisions(
     裁剪方法论历史快照。
 
     保留最近 ``keep`` 条，以及仍被 Conversation 引用 / 等于 live.version 的版本。
-    被删版本会顺带清掉进程内缓存条目与物化 Skills 目录。
+    被删版本会顺带清掉进程内缓存条目（物化 Skills 按内容寻址保留）。
     """
     keep_n = keep if keep is not None else get_settings().methodology_revision_keep
-    methodology = db.get(Methodology, methodology_id)
+    methodology = await db.get(Methodology, methodology_id)
     if methodology is None:
         return 0
 
     protected = {
         c.methodology_version
-        for c in db.query(Conversation)
-        .filter(Conversation.methodology_id == methodology_id)
-        .all()
+        for c in await db.scalars(
+            select(Conversation).where(Conversation.methodology_id == methodology_id)
+        )
     }
     protected.add(methodology.version)
 
-    rows = (
-        db.query(MethodologyRevision)
-        .filter(MethodologyRevision.methodology_id == methodology_id)
-        .order_by(MethodologyRevision.version.desc())
-        .all()
+    rows = list(
+        await db.scalars(
+            select(MethodologyRevision)
+            .where(MethodologyRevision.methodology_id == methodology_id)
+            .order_by(MethodologyRevision.version.desc())
+        )
     )
     kept_recent = 0
     deleted = 0
@@ -293,41 +248,13 @@ def prune_methodology_revisions(
         if kept_recent < keep_n:
             kept_recent += 1
             continue
-        version = row.version
-        db.delete(row)
+        await db.delete(row)
         deleted += 1
-        from deepagents_app.services.agent_factory import (
-            invalidate_agent_cache,
-            skills_scope,
-        )
-        from deepagents_app.services.skills import clear_materialized_skills
-
-        invalidate_agent_cache(
-            methodology_id,
-            version,
-            owner_user_id=methodology.owner_user_id,
-        )
-        try:
-            from deepagents_app.workspace import user_workspace_dir
-
-            ws = user_workspace_dir(
-                get_settings(), methodology.owner_user_id, ensure=False
-            )
-            clear_materialized_skills(
-                get_settings(),
-                scope=skills_scope(methodology_id, version),
-                workspace_root=ws,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "裁剪快照后清理物化 Skills 失败 %s v%s: %s",
-                methodology_id,
-                version,
-                exc,
-            )
 
     if deleted:
-        db.flush()
+        schedule_cache_invalidation(db, methodology_id)
+        await db.flush()
+        # 孤儿 content_blob 由后台 / CLI GC 清理，不阻塞写路径
         logger.info(
             "已裁剪方法论快照 methodology=%s deleted=%s keep=%s",
             methodology_id,
@@ -337,8 +264,8 @@ def prune_methodology_revisions(
     return deleted
 
 
-def bump_methodology(
-    db: Session,
+async def bump_methodology(
+    db: AsyncSession,
     methodology: Methodology,
     *,
     force: bool = False,
@@ -346,25 +273,39 @@ def bump_methodology(
     """
     配置变更收尾。
 
-    - ``draft`` 且非 ``force``：不升版，覆盖当前 version 快照并失效缓存（草稿累积）
+    - ``draft`` 且非 ``force``：不升版、不写快照；刷新时间戳并失效缓存
+      （draft 无人读快照；publish 时再钉）
     - ``published`` 或 ``force=True``：升版 → 登记缓存失效 → 写新快照 → 裁剪历史
     """
-    if methodology.status == "draft" and not force:
-        methodology.updated_time = datetime.now(timezone.utc)
-        schedule_cache_invalidation(db, methodology.id)
-        db.flush()
-        snapshot_methodology(db, methodology.id)
+    # 行锁：避免并发 bump 读到同一 version 后双写冲突 / 丢版
+    locked = await db.scalar(
+        select(Methodology)
+        .where(Methodology.id == methodology.id)
+        .with_for_update()
+    )
+    if locked is None:
+        return
+    if locked.status == "draft" and not force:
+        locked.updated_time = datetime.now(timezone.utc)
+        schedule_cache_invalidation(db, locked.id)
+        await db.flush()
+        # 保持调用方手上的对象与 DB 一致
+        methodology.updated_time = locked.updated_time
         return
 
-    methodology.version += 1
-    methodology.updated_time = datetime.now(timezone.utc)
-    schedule_cache_invalidation(db, methodology.id)
-    db.flush()
-    snapshot_methodology(db, methodology.id)
-    prune_methodology_revisions(db, methodology.id)
+    locked.version += 1
+    locked.updated_time = datetime.now(timezone.utc)
+    methodology.version = locked.version
+    methodology.updated_time = locked.updated_time
+    schedule_cache_invalidation(db, locked.id)
+    await db.flush()
+    await snapshot_methodology(db, locked.id)
+    await prune_methodology_revisions(db, locked.id)
 
 
-def bump_methodologies_for_agent_ids(db: Session, agent_ids: Iterable[str]) -> bool:
+async def bump_methodologies_for_agent_ids(
+    db: AsyncSession, agent_ids: Iterable[str]
+) -> bool:
     """
     升版引用给定 Agent 的全部方法论；返回是否命中至少一个方法论。
 
@@ -376,53 +317,88 @@ def bump_methodologies_for_agent_ids(db: Session, agent_ids: Iterable[str]) -> b
 
     meth_ids = {
         link.methodology_id
-        for link in db.query(MethodologyAgent)
-        .filter(MethodologyAgent.agent_id.in_(ids))
-        .all()
+        for link in await db.scalars(
+            select(MethodologyAgent).where(MethodologyAgent.agent_id.in_(ids))
+        )
     }
     if not meth_ids:
         return False
 
     for mid in meth_ids:
-        methodology = db.get(Methodology, mid)
+        methodology = await db.get(Methodology, mid)
         if methodology is not None:
-            bump_methodology(db, methodology)
+            await bump_methodology(db, methodology)
     return True
 
 
-def bump_methodologies_using_agent(db: Session, agent_id: str) -> None:
+async def bump_methodologies_using_resource(
+    db: AsyncSession,
+    *,
+    kind: str,
+    resource_id: str,
+) -> bool:
+    """
+    按资源类型解析引用该资源的 Agent，再级联 bump 相关方法论。
+
+    ``kind``：``agent`` / ``model`` / ``tool`` / ``skill``。
+    返回是否命中至少一个方法论（agent/model）或至少一个关联 Agent（tool/skill）。
+    """
+    if kind == "agent":
+        return await bump_methodologies_for_agent_ids(db, [resource_id])
+
+    if kind == "model":
+        agent_ids = [
+            a.id
+            for a in await db.scalars(
+                select(AgentDefinition).where(AgentDefinition.model_id == resource_id)
+            )
+        ]
+        return await bump_methodologies_for_agent_ids(db, agent_ids)
+
+    if kind == "tool":
+        agent_ids = [
+            link.agent_id
+            for link in await db.scalars(
+                select(AgentTool).where(AgentTool.tool_id == resource_id)
+            )
+        ]
+        if not agent_ids:
+            return False
+        return await bump_methodologies_for_agent_ids(db, agent_ids)
+
+    if kind == "skill":
+        agent_ids = [
+            link.agent_id
+            for link in await db.scalars(
+                select(AgentSkill).where(AgentSkill.skill_id == resource_id)
+            )
+        ]
+        if not agent_ids:
+            return False
+        return await bump_methodologies_for_agent_ids(db, agent_ids)
+
+    raise ValueError(f"未知 bump 资源类型：{kind}")
+
+
+async def bump_methodologies_using_agent(db: AsyncSession, agent_id: str) -> None:
     """找出勾选了该全局 Agent 的全部方法论，逐个升版并快照。"""
-    bump_methodologies_for_agent_ids(db, [agent_id])
+    await bump_methodologies_using_resource(db, kind="agent", resource_id=agent_id)
 
 
-def bump_methodologies_using_model(db: Session, model_id: str) -> None:
+async def bump_methodologies_using_model(db: AsyncSession, model_id: str) -> None:
     """模型超参数变更：bump 所有引用该模型的 Agent 所在方法论。"""
-    agent_ids = [
-        a.id
-        for a in db.query(AgentDefinition)
-        .filter(AgentDefinition.model_id == model_id)
-        .all()
-    ]
-    bump_methodologies_for_agent_ids(db, agent_ids)
+    await bump_methodologies_using_resource(db, kind="model", resource_id=model_id)
 
 
-def bump_methodologies_using_tool(db: Session, tool_id: str) -> bool:
+async def bump_methodologies_using_tool(db: AsyncSession, tool_id: str) -> bool:
     """升版引用该工具的方法论；返回是否命中至少一个 Agent。"""
-    agent_ids = [
-        link.agent_id
-        for link in db.query(AgentTool).filter(AgentTool.tool_id == tool_id).all()
-    ]
-    if not agent_ids:
-        return False
-    return bump_methodologies_for_agent_ids(db, agent_ids)
+    return await bump_methodologies_using_resource(
+        db, kind="tool", resource_id=tool_id
+    )
 
 
-def bump_methodologies_using_skill(db: Session, skill_id: str) -> bool:
+async def bump_methodologies_using_skill(db: AsyncSession, skill_id: str) -> bool:
     """升版引用该 Skill 的方法论；返回是否命中至少一个 Agent。"""
-    agent_ids = [
-        link.agent_id
-        for link in db.query(AgentSkill).filter(AgentSkill.skill_id == skill_id).all()
-    ]
-    if not agent_ids:
-        return False
-    return bump_methodologies_for_agent_ids(db, agent_ids)
+    return await bump_methodologies_using_resource(
+        db, kind="skill", resource_id=skill_id
+    )

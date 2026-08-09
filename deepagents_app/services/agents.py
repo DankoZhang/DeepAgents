@@ -12,9 +12,10 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from deepagents_app.api.errors import BusinessError, NotFoundError
+from deepagents_app.api.errors import BusinessError, ForbiddenError, NotFoundError
 from deepagents_app.constants import DEFAULT_MODEL_ID
 from deepagents_app.db.loading import agent_detail_options
 from deepagents_app.db.models import (
@@ -27,54 +28,65 @@ from deepagents_app.db.models import (
     ToolDefinition,
 )
 from deepagents_app.ownership import default_model_id_for_user, validate_resource_id
+from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
+from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 from deepagents_app.services.revisions import (
     bump_methodologies_using_agent,
     bump_methodology,
 )
 
 
-def list_agents(
-    db: Session,
+async def list_agents(
+    db: AsyncSession,
     *,
     owner_user_id: str,
     methodology_id: str | None = None,
-    limit: int = 200,
+    limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-) -> tuple[list[AgentDefinition], int]:
-    """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。返回 (rows, total)。"""
-    from deepagents_app.api.pagination import paginate_query
+    cursor: str | None = None,
+) -> tuple[list[AgentDefinition], int, str | None]:
+    """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。返回 (rows, total, next_cursor)。"""
 
-    q = (
-        db.query(AgentDefinition)
+    stmt = (
+        select(AgentDefinition)
         .options(*agent_detail_options())
-        .filter(AgentDefinition.owner_user_id == owner_user_id)
+        .where(AgentDefinition.owner_user_id == owner_user_id)
     )
     if methodology_id:
-        q = q.join(MethodologyAgent).filter(
+        stmt = stmt.join(MethodologyAgent).where(
             MethodologyAgent.methodology_id == methodology_id
         )
-    q = q.order_by(AgentDefinition.name)
-    return paginate_query(q, limit=limit, offset=offset)
+    stmt = stmt.order_by(AgentDefinition.name, AgentDefinition.id)
+    return await page_rows(
+        db,
+        stmt,
+        limit=limit,
+        offset=offset,
+        cursor=cursor,
+        sort_column=AgentDefinition.name,
+        id_column=AgentDefinition.id,
+        sort_attr="name",
+    )
 
 
-def get_agent(
-    db: Session, agent_id: str, *, owner_user_id: str
+async def get_agent(
+    db: AsyncSession, agent_id: str, *, owner_user_id: str
 ) -> AgentDefinition | None:
     """按主键取单个全局 Agent，并带上 tools / middlewares / skills / llm_model。"""
-    row = (
-        db.query(AgentDefinition)
-        .options(*agent_detail_options())
-        .filter(
-            AgentDefinition.id == agent_id,
-            AgentDefinition.owner_user_id == owner_user_id,
+    return (
+        await db.scalars(
+            select(AgentDefinition)
+            .options(*agent_detail_options())
+            .where(
+                AgentDefinition.id == agent_id,
+                AgentDefinition.owner_user_id == owner_user_id,
+            )
         )
-        .one_or_none()
-    )
-    return row
+    ).one_or_none()
 
 
-def create_agent(
-    db: Session,
+async def create_agent(
+    db: AsyncSession,
     *,
     owner_user_id: str,
     name: str,
@@ -88,9 +100,8 @@ def create_agent(
     bump_related: bool = True,
 ) -> AgentDefinition:
     """创建全局 Agent（不隶属单一方法论；由方法论另行勾选）。"""
-    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 
-    ensure_unique_owned_name(
+    await ensure_unique_owned_name(
         db,
         AgentDefinition,
         owner_user_id=owner_user_id,
@@ -98,7 +109,7 @@ def create_agent(
         label="Agent",
     )
 
-    resolved_model_id = _resolve_model_id_for_user(
+    resolved_model_id = await _resolve_model_id_for_user(
         db, model_id, owner_user_id=owner_user_id
     )
 
@@ -116,24 +127,47 @@ def create_agent(
         config=cfg,
     )
     db.add(row)
-    db.flush()
+    await db.flush()
 
     if tool_ids:
-        _set_agent_tools(db, row, tool_ids, owner_user_id=owner_user_id)
+        await _set_agent_relations(
+            db,
+            row,
+            tool_ids,
+            owner_user_id=owner_user_id,
+            model=ToolDefinition,
+            attr="tools",
+            label="工具",
+        )
     if middleware_ids:
-        _set_agent_middlewares(
-            db, row, middleware_ids, owner_user_id=owner_user_id
+        await _set_agent_relations(
+            db,
+            row,
+            middleware_ids,
+            owner_user_id=owner_user_id,
+            model=MiddlewareDefinition,
+            attr="middlewares",
+            label="中间件",
         )
     if skill_ids:
-        _set_agent_skills(db, row, skill_ids, owner_user_id=owner_user_id)
+        await _set_agent_relations(
+            db,
+            row,
+            skill_ids,
+            owner_user_id=owner_user_id,
+            model=SkillDefinition,
+            attr="skills",
+            label="Skill",
+            require_active=True,
+        )
 
     if bump_related:
-        bump_methodologies_using_agent(db, row.id)
-    return get_agent(db, row.id, owner_user_id=owner_user_id)  # type: ignore[return-value]
+        await bump_methodologies_using_agent(db, row.id)
+    return await get_agent(db, row.id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
-def update_agent(
-    db: Session,
+async def update_agent(
+    db: AsyncSession,
     agent_id: str,
     *,
     owner_user_id: str,
@@ -147,14 +181,13 @@ def update_agent(
     bump_related: bool = True,
 ) -> AgentDefinition:
     """更新全局 Agent；字段为 None 表示不改。改完可级联 bump 引用方法论。"""
-    row = get_agent(db, agent_id, owner_user_id=owner_user_id)
+    row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
 
     if name is not None and name != row.name:
-        from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 
-        ensure_unique_owned_name(
+        await ensure_unique_owned_name(
             db,
             AgentDefinition,
             owner_user_id=owner_user_id,
@@ -166,7 +199,7 @@ def update_agent(
     if system_prompt is not None:
         row.system_prompt = system_prompt
     if model_id is not None:
-        row.model_id = _resolve_model_id_for_user(
+        row.model_id = await _resolve_model_id_for_user(
             db, model_id, owner_user_id=owner_user_id
         )
     if config is not None:
@@ -174,22 +207,45 @@ def update_agent(
         merged.update(config)
         row.config = merged
     if tool_ids is not None:
-        _set_agent_tools(db, row, tool_ids, owner_user_id=owner_user_id)
+        await _set_agent_relations(
+            db,
+            row,
+            tool_ids,
+            owner_user_id=owner_user_id,
+            model=ToolDefinition,
+            attr="tools",
+            label="工具",
+        )
     if middleware_ids is not None:
-        _set_agent_middlewares(
-            db, row, middleware_ids, owner_user_id=owner_user_id
+        await _set_agent_relations(
+            db,
+            row,
+            middleware_ids,
+            owner_user_id=owner_user_id,
+            model=MiddlewareDefinition,
+            attr="middlewares",
+            label="中间件",
         )
     if skill_ids is not None:
-        _set_agent_skills(db, row, skill_ids, owner_user_id=owner_user_id)
+        await _set_agent_relations(
+            db,
+            row,
+            skill_ids,
+            owner_user_id=owner_user_id,
+            model=SkillDefinition,
+            attr="skills",
+            label="Skill",
+            require_active=True,
+        )
 
-    db.flush()
+    await db.flush()
     if bump_related:
-        bump_methodologies_using_agent(db, agent_id)
-    return get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
+        await bump_methodologies_using_agent(db, agent_id)
+    return await get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
-def delete_agent(
-    db: Session,
+async def delete_agent(
+    db: AsyncSession,
     agent_id: str,
     *,
     owner_user_id: str,
@@ -200,27 +256,27 @@ def delete_agent(
 
     删除前先记下引用该方法论；关联行级联消失后，再对那些方法论升版打快照。
     """
-    row = get_agent(db, agent_id, owner_user_id=owner_user_id)
+    row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
     # 删除后 MethodologyAgent 会级联没掉，必须先收集
     methodology_ids = [
         r.methodology_id
-        for r in db.query(MethodologyAgent)
-        .filter(MethodologyAgent.agent_id == agent_id)
-        .all()
+        for r in await db.scalars(
+            select(MethodologyAgent).where(MethodologyAgent.agent_id == agent_id)
+        )
     ]
-    db.delete(row)
-    db.flush()
+    await db.delete(row)
+    await db.flush()
     if bump_related:
         for mid in methodology_ids:
-            methodology = db.get(Methodology, mid)
+            methodology = await db.get(Methodology, mid)
             if methodology:
-                bump_methodology(db, methodology)
+                await bump_methodology(db, methodology)
 
 
-def bind_agent_tools(
-    db: Session,
+async def bind_agent_tools(
+    db: AsyncSession,
     agent_id: str,
     tool_ids: list[str],
     *,
@@ -229,7 +285,7 @@ def bind_agent_tools(
     bump_related: bool = True,
 ) -> AgentDefinition:
     """绑定工具：replace=True 全量替换，False 增量追加。"""
-    return _bind_and_reload(
+    return await _bind_and_reload(
         db,
         agent_id,
         tool_ids,
@@ -242,8 +298,8 @@ def bind_agent_tools(
     )
 
 
-def bind_agent_middlewares(
-    db: Session,
+async def bind_agent_middlewares(
+    db: AsyncSession,
     agent_id: str,
     middleware_ids: list[str],
     *,
@@ -252,7 +308,7 @@ def bind_agent_middlewares(
     bump_related: bool = True,
 ) -> AgentDefinition:
     """绑定中间件：replace=True 全量替换，False 增量追加。"""
-    return _bind_and_reload(
+    return await _bind_and_reload(
         db,
         agent_id,
         middleware_ids,
@@ -265,8 +321,8 @@ def bind_agent_middlewares(
     )
 
 
-def bind_agent_skills(
-    db: Session,
+async def bind_agent_skills(
+    db: AsyncSession,
     agent_id: str,
     skill_ids: list[str],
     *,
@@ -275,7 +331,7 @@ def bind_agent_skills(
     bump_related: bool = True,
 ) -> AgentDefinition:
     """绑定 Skill：仅允许 active；replace=True 全量替换，False 增量追加。"""
-    return _bind_and_reload(
+    return await _bind_and_reload(
         db,
         agent_id,
         skill_ids,
@@ -292,8 +348,8 @@ def bind_agent_skills(
 # ── 绑定辅助：工具 / 中间件 / Skill 共用一套 set / merge ───────────────
 
 
-def _bind_and_reload(
-    db: Session,
+async def _bind_and_reload(
+    db: AsyncSession,
     agent_id: str,
     target_ids: list[str],
     *,
@@ -306,11 +362,11 @@ def _bind_and_reload(
     require_active: bool = False,
 ) -> AgentDefinition:
     """写关联 → 可选 bump → 重新加载详情。"""
-    row = get_agent(db, agent_id, owner_user_id=owner_user_id)
+    row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
     if replace:
-        _set_agent_relations(
+        await _set_agent_relations(
             db,
             row,
             target_ids,
@@ -321,7 +377,7 @@ def _bind_and_reload(
             require_active=require_active,
         )
     else:
-        _merge_agent_relations(
+        await _merge_agent_relations(
             db,
             row,
             target_ids,
@@ -331,14 +387,14 @@ def _bind_and_reload(
             label=label,
             require_active=require_active,
         )
-    db.flush()
+    await db.flush()
     if bump_related:
-        bump_methodologies_using_agent(db, agent_id)
-    return get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
+        await bump_methodologies_using_agent(db, agent_id)
+    return await get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
-def _load_owned(
-    db: Session,
+async def _load_owned(
+    db: AsyncSession,
     model: type,
     target_id: str,
     *,
@@ -347,18 +403,18 @@ def _load_owned(
     require_active: bool = False,
 ) -> Any:
     """加载并校验归属：只能绑定当前用户自己的目录资源。"""
-    target = db.get(model, target_id)
+    target = await db.get(model, target_id)
     if target is None:
         raise NotFoundError(f"{missing_label}不存在：{target_id}")
     if target.owner_user_id != owner_user_id:
-        raise BusinessError(f"{missing_label}不属于当前用户：{target_id}")
+        raise ForbiddenError(f"{missing_label}不属于当前用户：{target_id}")
     if require_active and getattr(target, "status", "active") != "active":
         raise BusinessError(f"{missing_label}已禁用：{getattr(target, 'name', target_id)}")
     return target
 
 
-def _set_agent_relations(
-    db: Session,
+async def _set_agent_relations(
+    db: AsyncSession,
     agent: AgentDefinition,
     target_ids: list[str],
     *,
@@ -369,7 +425,7 @@ def _set_agent_relations(
     require_active: bool = False,
 ) -> None:
     rows = [
-        _load_owned(
+        await _load_owned(
             db,
             model,
             tid,
@@ -379,11 +435,13 @@ def _set_agent_relations(
         )
         for tid in target_ids
     ]
+    # AsyncSession 禁止隐式 sync lazyload：先 await 加载再替换集合
+    await getattr(agent.awaitable_attrs, attr)
     setattr(agent, attr, rows)
 
 
-def _merge_agent_relations(
-    db: Session,
+async def _merge_agent_relations(
+    db: AsyncSession,
     agent: AgentDefinition,
     target_ids: list[str],
     *,
@@ -393,13 +451,13 @@ def _merge_agent_relations(
     label: str,
     require_active: bool = False,
 ) -> None:
-    current: list[Any] = getattr(agent, attr)
+    current: list[Any] = list(await getattr(agent.awaitable_attrs, attr))
     existing = {item.id for item in current}
     for tid in target_ids:
         if tid in existing:
             continue
         current.append(
-            _load_owned(
+            await _load_owned(
                 db,
                 model,
                 tid,
@@ -408,68 +466,14 @@ def _merge_agent_relations(
                 require_active=require_active,
             )
         )
-
-
-def _set_agent_tools(
-    db: Session,
-    agent: AgentDefinition,
-    tool_ids: list[str],
-    *,
-    owner_user_id: str,
-) -> None:
-    _set_agent_relations(
-        db,
-        agent,
-        tool_ids,
-        owner_user_id=owner_user_id,
-        model=ToolDefinition,
-        attr="tools",
-        label="工具",
-    )
-
-
-def _set_agent_middlewares(
-    db: Session,
-    agent: AgentDefinition,
-    middleware_ids: list[str],
-    *,
-    owner_user_id: str,
-) -> None:
-    _set_agent_relations(
-        db,
-        agent,
-        middleware_ids,
-        owner_user_id=owner_user_id,
-        model=MiddlewareDefinition,
-        attr="middlewares",
-        label="中间件",
-    )
-
-
-def _set_agent_skills(
-    db: Session,
-    agent: AgentDefinition,
-    skill_ids: list[str],
-    *,
-    owner_user_id: str,
-) -> None:
-    _set_agent_relations(
-        db,
-        agent,
-        skill_ids,
-        owner_user_id=owner_user_id,
-        model=SkillDefinition,
-        attr="skills",
-        label="Skill",
-        require_active=True,
-    )
+    setattr(agent, attr, current)
 
 
 # ── 模型绑定：默认模型映射 + 归属/状态校验 ─────────────────────────────
 
 
-def _resolve_model_id_for_user(
-    db: Session,
+async def _resolve_model_id_for_user(
+    db: AsyncSession,
     model_id: str | None,
     *,
     owner_user_id: str,
@@ -477,16 +481,16 @@ def _resolve_model_id_for_user(
     """解析并校验 model_id；None / 默认 base id 映射为该用户 scoped 默认模型。"""
     if not model_id or model_id == DEFAULT_MODEL_ID:
         model_id = default_model_id_for_user(owner_user_id)
-    return _validate_model_id(db, model_id, owner_user_id=owner_user_id)
+    return await _validate_model_id(db, model_id, owner_user_id=owner_user_id)
 
 
-def _validate_model_id(
-    db: Session, model_id: str | None, *, owner_user_id: str
+async def _validate_model_id(
+    db: AsyncSession, model_id: str | None, *, owner_user_id: str
 ) -> str | None:
     """校验 model_id 存在且可用；None 表示不绑定目录。"""
     if not model_id:
         return None
-    row = db.get(ModelDefinition, model_id)
+    row = await db.get(ModelDefinition, model_id)
     if row is None:
         raise NotFoundError(f"模型不存在：{model_id}")
     if row.owner_user_id != owner_user_id:

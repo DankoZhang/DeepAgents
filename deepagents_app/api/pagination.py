@@ -2,22 +2,26 @@
 列表分页约定
 ============
 
-统一 ``limit`` / ``offset``；响应仍返回数组以兼容现有前端，
-总条数通过 ``X-Total-Count`` 响应头暴露。
+统一 ``limit`` / ``offset`` / 可选 ``cursor``；响应仍返回数组以兼容现有前端，
+总条数通过 ``X-Total-Count``，下一页游标通过 ``X-Next-Cursor``。
+
+服务层请从 ``deepagents_app.db.pagination`` 导入 ``paginate`` /
+``page_rows`` 与 ``DEFAULT_LIMIT``；本模块只保留 FastAPI Query 依赖与响应头辅助。
 """
 
 from __future__ import annotations
 
-from typing import TypeVar
-
 from fastapi import Query, Response
-from sqlalchemy.orm import Query as SAQuery
 
-# 默认拉满一页上限，兼容尚未接分页 UI 的前端；真分页时显式传更小 limit
-DEFAULT_LIMIT = 200
-MAX_LIMIT = 200
+from deepagents_app.db.pagination import DEFAULT_LIMIT, MAX_LIMIT
 
-T = TypeVar("T")
+__all__ = [
+    "limit_query",
+    "offset_query",
+    "cursor_query",
+    "set_total_count",
+    "set_next_cursor",
+]
 
 
 def limit_query(
@@ -27,18 +31,28 @@ def limit_query(
 
 
 def offset_query(
-    offset: int = Query(0, ge=0, description="跳过条数"),
+    offset: int = Query(0, ge=0, description="跳过条数（与 cursor 互斥，cursor 优先）"),
 ) -> int:
     return offset
 
 
-def paginate_query(q: SAQuery, *, limit: int, offset: int) -> tuple[list, int]:
-    """对 SQLAlchemy Query 做 count + slice，返回 (rows, total)。"""
-    total = q.count()
-    rows = q.offset(offset).limit(limit).all()
-    return rows, total
+def cursor_query(
+    cursor: str | None = Query(
+        None,
+        description="keyset 游标（上一页最后一条的 X-Next-Cursor）；传入后忽略 offset",
+    ),
+) -> str | None:
+    return cursor
 
 
 def set_total_count(response: Response, total: int) -> None:
     """写入列表总条数，供前端分页控件使用。"""
     response.headers["X-Total-Count"] = str(total)
+
+
+def set_next_cursor(response: Response, cursor: str | None) -> None:
+    """写入下一页游标；无更多结果时删除该头。"""
+    if cursor:
+        response.headers["X-Next-Cursor"] = cursor
+    elif "X-Next-Cursor" in response.headers:
+        del response.headers["X-Next-Cursor"]

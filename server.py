@@ -8,10 +8,12 @@ DeepAgents FastAPI 服务入口
     # 先启动基础设施
     docker compose up -d
 
-    # 启动 API
+    # 启动 API（API_WORKERS / API_SERVER 见 .env）
     python server.py
-    # 或
-    uvicorn deepagents_app.api.app:app --host 0.0.0.0 --port 8001 --reload
+
+    # 等价手写：
+    # uvicorn deepagents_app.api.app:app --host 0.0.0.0 --port 8001 --workers 4
+    # gunicorn deepagents_app.api.app:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8001
 """
 
 from __future__ import annotations
@@ -25,15 +27,51 @@ if str(ROOT) not in sys.path:
 
 
 def main() -> None:
-    import uvicorn
-
     from deepagents_app.config import get_settings
 
     settings = get_settings()
+    workers = int(settings.api_workers)
+    host = settings.api_host
+    port = int(settings.api_port)
+    server = (settings.api_server or "uvicorn").strip().lower()
+
+    if server == "gunicorn":
+        from gunicorn.app.base import BaseApplication
+
+        class _App(BaseApplication):
+            def __init__(self, options: dict) -> None:
+                self.options = options
+                super().__init__()
+
+            def load_config(self) -> None:
+                for key, value in self.options.items():
+                    if key in self.cfg.settings and value is not None:
+                        self.cfg.set(key.lower(), value)
+
+            def load(self):
+                from deepagents_app.api.app import app
+
+                return app
+
+        _App(
+            {
+                "bind": f"{host}:{port}",
+                "workers": workers,
+                "worker_class": "uvicorn.workers.UvicornWorker",
+                "timeout": 120,
+                "graceful_timeout": 30,
+                "keepalive": 5,
+            }
+        ).run()
+        return
+
+    import uvicorn
+
     uvicorn.run(
         "deepagents_app.api.app:app",
-        host=settings.api_host,
-        port=settings.api_port,
+        host=host,
+        port=port,
+        workers=workers,
         reload=False,
     )
 

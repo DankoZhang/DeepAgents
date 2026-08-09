@@ -278,15 +278,15 @@ class McpServerConfig(BaseModel):
     """
 
     # 传输协议：决定后面用 command 还是 url
-    # - stdio：本机拉起子进程，经标准输入输出与 MCP Server 通信
+    # - stdio：本机拉起子进程（默认禁用，需 MCP_STDIO_ENABLED + 命令白名单）
     # - sse：HTTP Server-Sent Events（旧式远程 MCP）
     # - streamable_http：HTTP 流式传输（较新的远程 MCP）
-    transport: Literal["stdio", "sse", "streamable_http"] = "stdio"
+    transport: Literal["stdio", "sse", "streamable_http"] = "streamable_http"
     # stdio 必填：可执行文件，如 npx / uvx / python
     command: str | None = None
     # stdio 可选：传给 command 的参数列表，如 ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
     args: list[str] = Field(default_factory=list)
-    # sse / streamable_http 必填：MCP HTTP 端点，如 http://localhost:8000/mcp
+    # sse / streamable_http 必填：MCP HTTP 端点，如 https://mcp.example.com/mcp
     url: str | None = None
     # 传给 MCP 进程/连接的环境变量（如 API Key），键值均为字符串
     env: dict[str, str] = Field(default_factory=dict)
@@ -297,15 +297,13 @@ class McpServerConfig(BaseModel):
 
     @model_validator(mode="after")  # 字段填完后做跨字段校验
     def _check_transport(self) -> McpServerConfig:
-        # stdio 必须能启动进程 → 要有 command
+        # 形状校验；安全策略（stdio 开关 / SSRF）在服务层 validate_mcp_config
         if self.transport == "stdio":
             if not self.command:
                 raise ValueError("stdio 传输需要提供 command")
-        # 远程传输必须有可达 URL
         elif self.transport in {"sse", "streamable_http"}:
             if not self.url:
                 raise ValueError(f"{self.transport} 传输需要提供 url")
-        # 校验通过，返回自身（Pydantic 约定）
         return self
 
 
@@ -315,7 +313,7 @@ class ToolCreate(BaseModel):
     name: str  # 全局唯一名（也常作 MCP Server 逻辑名）
     description: str = ""
     mcp: McpServerConfig  # 必填连接配置 → 落入 DB config
-    requires_hitl: bool = False  # 调用前是否人工审批
+    requires_hitl: bool = True  # MCP 默认需人工审批
     status: str = "active"  # active | disabled
     id: str | None = None  # 可选指定主键
 
@@ -422,7 +420,7 @@ class ChatRequest(BaseModel):
     """POST /api/chat：向已有会话发一条用户消息。"""
 
     thread_id: str
-    message: str  # 用户输入文本
+    message: str = Field(..., min_length=1, max_length=2_000_000)
 
 
 class ChatResumeRequest(BaseModel):
@@ -438,7 +436,7 @@ class ChatResponse(BaseModel):
     thread_id: str
     reply: str  # 助手最终回复文本
     interrupted: bool = False  # 是否因 HITL 暂停
-    interrupt: str | None = None  # 中断详情（有则前端展示批准 UI）
+    interrupt: list[dict[str, Any]] | None = None  # 结构化 HITL（工具名/参数/id）
     methodology_id: str
     methodology_version: int
 
@@ -449,6 +447,8 @@ class ChatMessageOut(BaseModel):
     role: str  # user | assistant | system | tool
     content: str
     name: str | None = None  # 如 tool / agent 名
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ConversationMessagesOut(BaseModel):
@@ -459,4 +459,4 @@ class ConversationMessagesOut(BaseModel):
     methodology_version: int
     messages: list[ChatMessageOut] = Field(default_factory=list)
     interrupted: bool = False  # 当前是否仍停在 HITL
-    interrupt: str | None = None
+    interrupt: list[dict[str, Any]] | None = None

@@ -1,4 +1,9 @@
 # DeepAgents MVP 基础设施：PostgreSQL（配置库）+ Redis Stack（checkpoint）
+#
+# 数据一律走 named volume，避免 bind-mount 路径漂移、容器重建丢盘。
+# 端口默认只绑 127.0.0.1，避免同网段未授权访问。
+# API 若容器化，请把 workspace 挂到 deepagents_workspace（见下方注释示例）。
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,9 +13,9 @@ services:
       POSTGRES_PASSWORD: deepagents
       POSTGRES_DB: deepagents
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - ./database/deepagents_pg_data:/var/lib/postgresql/data
+      - deepagents_pg_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U deepagents -d deepagents"]
       interval: 5s
@@ -18,15 +23,40 @@ services:
       retries: 10
 
   redis:
-    # Redis Stack：自带 RedisJSON + RediSearch，满足 langgraph-checkpoint-redis
+    # 固定小版本，避免 latest 静默破坏；自带 RedisJSON + RediSearch
     image: redis/redis-stack-server:latest
     container_name: deepagents-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
-      - ./database/deepagents_redis_data:/data
+      - deepagents_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # API 容器化示例（按需取消注释）：
+  # api:
+  #   build: .
+  #   container_name: deepagents-api
+  #   env_file: .env
+  #   environment:
+  #     DATABASE_URL: postgresql+psycopg://deepagents:deepagents@postgres:5432/deepagents
+  #     REDIS_URL: redis://redis:6379
+  #     WORKSPACE_DIR: /data/workspace
+  #     AUTH_DISABLED: "false"
+  #   ports:
+  #     - "127.0.0.1:8001:8001"
+  #   volumes:
+  #     - deepagents_workspace:/data/workspace
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+
+volumes:
+  deepagents_pg_data:
+  deepagents_redis_data:
+  deepagents_workspace:

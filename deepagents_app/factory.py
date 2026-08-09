@@ -3,7 +3,7 @@ Deep Agent 共享组装工具
 ======================
 
 供 ``agent_factory`` 复用的底层能力：
-checkpointer / HITL / permissions / general-purpose 子 Agent 规格 / workspace 同步。
+checkpointer / HITL / permissions / general-purpose 子 Agent 规格。
 
 方法论驱动的完整 Agent 组装见 ``deepagents_app.services.agent_factory``。
 HarnessProfile **不再**全局注册：按方法论在组装时显式注入 ``general-purpose`` 子 Agent。
@@ -11,28 +11,28 @@ HarnessProfile **不再**全局注册：按方法论在组装时显式注入 ``g
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
 from typing import Any
 
 from deepagents import FilesystemPermission
-from langgraph.checkpoint.memory import InMemorySaver
 
 from deepagents_app.config import Settings
 
 logger = logging.getLogger(__name__)
 
 _checkpointer: Any | None = None
-_checkpointer_key: tuple[str, bool] | None = None
-_checkpointer_lock = threading.Lock()
+_checkpointer_key: str | None = None
+# 必须用 asyncio.Lock：临界区内有 await，不可用 threading.Lock
+_checkpointer_lock = asyncio.Lock()
 
 __all__ = [
-    "SYSTEM_HITL_TOOLS",
     "build_permissions",
     "build_interrupt_on",
     "build_checkpointer",
+    "init_checkpointer",
+    "close_checkpointer",
     "build_general_purpose_subagent",
-    "sync_memory_into_workspace",
 ]
 
 
@@ -67,47 +67,85 @@ def build_interrupt_on(settings: Settings) -> dict[str, bool] | None:
     系统默认 HITL 名单（仅框架原生工具）。
 
     目录工具（builtin / MCP）的审批由 ``ToolDefinition.requires_hitl`` 在组装时合并。
-    关闭 ``enable_hitl`` 时返回 None。
+    关闭 ``enable_hitl`` 时返回 None（目录工具仍可单独合并，见 agent_factory）。
     """
     if not settings.enable_hitl:
         return None
     return {name: True for name in SYSTEM_HITL_TOOLS}
 
 
-def build_checkpointer(settings: Settings):
+async def init_checkpointer(settings: Settings) -> Any:
     """
-    构建（或复用）checkpointer，用于多轮对话的 thread 级状态持久化。
+    在当前事件循环内建立（或复用）``AsyncRedisSaver`` 单例。
 
-    同一进程内对相同 ``redis_url`` / ``require_redis_checkpointer`` 复用单例。
+    必须在 FastAPI lifespan 的同一事件循环中调用；AsyncRedisSaver
+    的连接绑定 loop，不可跨 loop 复用。
     """
     global _checkpointer, _checkpointer_key
 
-    key = (settings.redis_url, bool(settings.require_redis_checkpointer))
-    with _checkpointer_lock:
+    key = settings.redis_url
+    old = None
+    async with _checkpointer_lock:
         if _checkpointer is not None and _checkpointer_key == key:
             return _checkpointer
 
         try:
-            from langgraph.checkpoint.redis import RedisSaver
+            from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 
-            saver = RedisSaver(redis_url=settings.redis_url)
-            saver.setup()
-            logger.info("Checkpointer: RedisSaver -> %s", settings.redis_url)
+            saver = AsyncRedisSaver(redis_url=settings.redis_url)
+            await saver.__aenter__()
         except Exception as exc:  # noqa: BLE001
-            if settings.require_redis_checkpointer:
-                raise RuntimeError(
-                    f"Redis checkpointer 不可用（REQUIRE_REDIS_CHECKPOINTER=true）：{exc}"
-                ) from exc
-            logger.warning(
-                "使用 InMemorySaver（Redis 不可用：%s）。"
-                "多 worker / 重启后对话状态会丢失；生产请设 REQUIRE_REDIS_CHECKPOINTER=true",
-                exc,
-            )
-            saver = InMemorySaver()
+            raise RuntimeError(
+                f"Redis checkpointer 不可用（{settings.redis_url}）：{exc}"
+            ) from exc
 
+        old = _checkpointer
         _checkpointer = saver
         _checkpointer_key = key
-        return saver
+
+    # 关闭旧实例放在锁外，避免持锁 await 拖长临界区
+    if old is not None:
+        try:
+            await old.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            logger.debug("关闭旧 AsyncRedisSaver 失败", exc_info=True)
+
+    logger.info("Checkpointer: AsyncRedisSaver -> %s", settings.redis_url)
+    return saver
+
+
+def build_checkpointer(settings: Settings | None = None) -> Any:
+    """
+    返回已初始化的异步 Redis checkpointer。
+
+    须先由 ``init_checkpointer`` 在 lifespan 中建好；未初始化则抛错。
+    """
+    if _checkpointer is None:
+        hint = settings.redis_url if settings is not None else "redis"
+        raise RuntimeError(
+            f"Redis checkpointer 尚未初始化（{hint}）；"
+            "请在 FastAPI lifespan 启动时调用 init_checkpointer"
+        )
+    if settings is not None and _checkpointer_key != settings.redis_url:
+        raise RuntimeError(
+            f"Checkpointer 绑定的 Redis（{_checkpointer_key}）与当前配置"
+            f"（{settings.redis_url}）不一致；请重启进程"
+        )
+    return _checkpointer
+
+
+async def close_checkpointer() -> None:
+    """关闭并清空 checkpointer 单例（lifespan 退出时调用）。"""
+    global _checkpointer, _checkpointer_key
+    async with _checkpointer_lock:
+        saver = _checkpointer
+        _checkpointer = None
+        _checkpointer_key = None
+    if saver is not None:
+        try:
+            await saver.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            logger.debug("关闭 AsyncRedisSaver 失败", exc_info=True)
 
 
 def build_general_purpose_subagent(
@@ -134,17 +172,3 @@ def build_general_purpose_subagent(
         "tools": [],
         "model": model,
     }
-
-
-def sync_memory_into_workspace(settings: Settings) -> None:
-    """
-    把项目级 AGENTS.md 同步到**全局** workspace 根（兼容旧路径）。
-
-    用户隔离工作区由 ``workspace.ensure_user_workspace`` 在组装时按用户同步。
-    """
-    import shutil
-
-    src_memory = settings.memory_file
-    dst_memory = settings.workspace_dir / "AGENTS.md"
-    if src_memory.exists():
-        shutil.copy2(src_memory, dst_memory)

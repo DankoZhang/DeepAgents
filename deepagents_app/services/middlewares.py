@@ -11,43 +11,54 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.db.models import MiddlewareDefinition
+from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.ownership import validate_resource_id
+from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
 
 
-def list_middlewares(
-    db: Session,
+async def list_middlewares(
+    db: AsyncSession,
     *,
     owner_user_id: str,
-    limit: int = 200,
+    limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-) -> tuple[list[MiddlewareDefinition], int]:
-    """列出当前用户已注册的中间件。返回 (rows, total)。"""
-    from deepagents_app.api.pagination import paginate_query
+    cursor: str | None = None,
+) -> tuple[list[MiddlewareDefinition], int, str | None]:
+    """列出当前用户已注册的中间件。返回 (rows, total, next_cursor)。"""
 
-    q = (
-        db.query(MiddlewareDefinition)
-        .filter(MiddlewareDefinition.owner_user_id == owner_user_id)
-        .order_by(MiddlewareDefinition.name)
+    stmt = (
+        select(MiddlewareDefinition)
+        .where(MiddlewareDefinition.owner_user_id == owner_user_id)
+        .order_by(MiddlewareDefinition.name, MiddlewareDefinition.id)
     )
-    return paginate_query(q, limit=limit, offset=offset)
+    return await page_rows(
+        db,
+        stmt,
+        limit=limit,
+        offset=offset,
+        cursor=cursor,
+        sort_column=MiddlewareDefinition.name,
+        id_column=MiddlewareDefinition.id,
+        sort_attr="name",
+    )
 
 
-def get_middleware(
-    db: Session, middleware_id: str, *, owner_user_id: str
+async def get_middleware(
+    db: AsyncSession, middleware_id: str, *, owner_user_id: str
 ) -> MiddlewareDefinition | None:
     """按主键取中间件；不属于当前用户则视为不存在。"""
-    from deepagents_app.services.crud_helpers import get_owned
 
-    return get_owned(
+    return await get_owned(
         db, MiddlewareDefinition, middleware_id, owner_user_id=owner_user_id
     )
 
 
-def create_middleware(
-    db: Session,
+async def create_middleware(
+    db: AsyncSession,
     *,
     owner_user_id: str,
     name: str,
@@ -60,9 +71,8 @@ def create_middleware(
 
     ``class_path`` 指向可 import 的中间件类；``config`` 作为构造参数。
     """
-    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 
-    ensure_unique_owned_name(
+    await ensure_unique_owned_name(
         db,
         MiddlewareDefinition,
         owner_user_id=owner_user_id,
@@ -78,7 +88,7 @@ def create_middleware(
         config=config or {},
     )
     db.add(row)
-    db.flush()
+    await db.flush()
     return row
 
 

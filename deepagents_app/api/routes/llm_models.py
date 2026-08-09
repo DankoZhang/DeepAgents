@@ -9,12 +9,15 @@ Agent 通过 model_id 绑定目录中的模型（方案 B）。
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.auth import get_current_user_id as require_user
+from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
+    cursor_query,
     limit_query,
     offset_query,
+    set_next_cursor,
     set_total_count,
 )
 from deepagents_app.api.schemas import (
@@ -24,51 +27,52 @@ from deepagents_app.api.schemas import (
     ModelTestResult,
     ModelUpdate,
 )
-from deepagents_app.db.session import get_db
+from deepagents_app.db.session import get_async_db
 from deepagents_app.services import llm_models as models_svc
 
 router = APIRouter(tags=["models"])
 
 
 @router.get("/model/list", response_model=list[ModelOut])
-def list_models(
+async def list_models(
     response: Response,
     status: str | None = Query(None, description="active | disabled"),
     limit: int = Depends(limit_query),
     offset: int = Depends(offset_query),
-    db: Session = Depends(get_db),
+    cursor: str | None = Depends(cursor_query),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    rows, total = models_svc.list_models(
+    rows, total, next_cursor = await models_svc.list_models(
         db,
         owner_user_id=user_id,
         status=status,
         limit=limit,
         offset=offset,
+        cursor=cursor,
     )
     set_total_count(response, total)
+    set_next_cursor(response, next_cursor)
     return rows
 
 
 @router.get("/model/{model_id}", response_model=ModelOut)
-def get_model(
+async def get_model(
     model_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    row = models_svc.get_model(db, model_id, owner_user_id=user_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="模型不存在")
-    return row
+    row = await models_svc.get_model(db, model_id, owner_user_id=user_id)
+    return require_entity(row, "模型不存在")
 
 
 @router.post("/model", response_model=ModelOut)
-def create_model(
+async def create_model(
     body: ModelCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return models_svc.create_model(
+    return await models_svc.create_model(
         db,
         owner_user_id=user_id,
         name=body.name,
@@ -87,13 +91,13 @@ def create_model(
 
 
 @router.patch("/model/{model_id}", response_model=ModelOut)
-def update_model(
+async def update_model(
     model_id: str,
     body: ModelUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return models_svc.update_model(
+    return await models_svc.update_model(
         db,
         model_id,
         owner_user_id=user_id,
@@ -113,19 +117,19 @@ def update_model(
 
 
 @router.delete("/model/{model_id}")
-def delete_model(
+async def delete_model(
     model_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    models_svc.delete_model(db, model_id, owner_user_id=user_id)
+    await models_svc.delete_model(db, model_id, owner_user_id=user_id)
     return {"ok": True}
 
 
 @router.post("/model/test", response_model=ModelTestResult)
-def test_model_inline(
+async def test_model_inline(
     body: ModelTestRequest,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
     """
@@ -135,7 +139,7 @@ def test_model_inline(
     - 否则用 body 内联字段（保存前试连）
     """
     if body.model_id:
-        return models_svc.test_model_by_id(
+        return await models_svc.test_model_by_id(
             db, body.model_id, owner_user_id=user_id
         )
     if not body.provider or not body.model_name:
@@ -143,7 +147,7 @@ def test_model_inline(
             status_code=400,
             detail="未传 model_id 时必须提供 provider 与 model_name",
         )
-    return models_svc.test_model_connectivity(
+    return await models_svc.test_model_connectivity(
         provider=body.provider,
         model_name=body.model_name,
         api_key=body.api_key,
@@ -157,9 +161,9 @@ def test_model_inline(
 
 
 @router.post("/model/{model_id}/test", response_model=ModelTestResult)
-def test_model(
+async def test_model(
     model_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return models_svc.test_model_by_id(db, model_id, owner_user_id=user_id)
+    return await models_svc.test_model_by_id(db, model_id, owner_user_id=user_id)

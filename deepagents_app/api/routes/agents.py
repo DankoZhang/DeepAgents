@@ -7,13 +7,16 @@ CRUD + Tool / Middleware / Skill 绑定。变更会 bump 所有勾选了该 Agen
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, Query, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.auth import get_current_user_id as require_user
+from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
+    cursor_query,
     limit_query,
     offset_query,
+    set_next_cursor,
     set_total_count,
 )
 from deepagents_app.api.schemas import (
@@ -24,54 +27,55 @@ from deepagents_app.api.schemas import (
     AgentOut,
     AgentUpdate,
 )
-from deepagents_app.db.session import get_db
+from deepagents_app.db.session import get_async_db
 from deepagents_app.services import agents as agents_svc
 
 router = APIRouter(tags=["agents"])
 
 
 @router.get("/agent/list", response_model=list[AgentOut])
-def list_agents(
+async def list_agents(
     response: Response,
     methodology_id: str | None = Query(
         None, description="若指定则只返回该方法论已勾选的 Agent"
     ),
     limit: int = Depends(limit_query),
     offset: int = Depends(offset_query),
-    db: Session = Depends(get_db),
+    cursor: str | None = Depends(cursor_query),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    rows, total = agents_svc.list_agents(
+    rows, total, next_cursor = await agents_svc.list_agents(
         db,
         owner_user_id=user_id,
         methodology_id=methodology_id,
         limit=limit,
         offset=offset,
+        cursor=cursor,
     )
     set_total_count(response, total)
+    set_next_cursor(response, next_cursor)
     return rows
 
 
 @router.get("/agent/{agent_id}", response_model=AgentOut)
-def get_agent(
+async def get_agent(
     agent_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    row = agents_svc.get_agent(db, agent_id, owner_user_id=user_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Agent 不存在")
-    return row
+    row = await agents_svc.get_agent(db, agent_id, owner_user_id=user_id)
+    return require_entity(row, "Agent 不存在")
 
 
 @router.post("/agent", response_model=AgentOut)
-def create_agent(
+async def create_agent(
     body: AgentCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
     """创建全局 Agent；``config.role`` 取 supervisor / subagent。"""
-    return agents_svc.create_agent(
+    return await agents_svc.create_agent(
         db,
         owner_user_id=user_id,
         name=body.name,
@@ -86,13 +90,13 @@ def create_agent(
 
 
 @router.patch("/agent/{agent_id}", response_model=AgentOut)
-def update_agent(
+async def update_agent(
     agent_id: str,
     body: AgentUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return agents_svc.update_agent(
+    return await agents_svc.update_agent(
         db,
         agent_id,
         owner_user_id=user_id,
@@ -107,23 +111,23 @@ def update_agent(
 
 
 @router.delete("/agent/{agent_id}")
-def delete_agent(
+async def delete_agent(
     agent_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    agents_svc.delete_agent(db, agent_id, owner_user_id=user_id)
+    await agents_svc.delete_agent(db, agent_id, owner_user_id=user_id)
     return {"ok": True}
 
 
 @router.post("/agent/{agent_id}/tools", response_model=AgentOut)
-def bind_tools(
+async def bind_tools(
     agent_id: str,
     body: AgentBindTools,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return agents_svc.bind_agent_tools(
+    return await agents_svc.bind_agent_tools(
         db,
         agent_id,
         body.tool_ids,
@@ -133,13 +137,13 @@ def bind_tools(
 
 
 @router.post("/agent/{agent_id}/middlewares", response_model=AgentOut)
-def bind_middlewares(
+async def bind_middlewares(
     agent_id: str,
     body: AgentBindMiddlewares,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return agents_svc.bind_agent_middlewares(
+    return await agents_svc.bind_agent_middlewares(
         db,
         agent_id,
         body.middleware_ids,
@@ -149,13 +153,13 @@ def bind_middlewares(
 
 
 @router.post("/agent/{agent_id}/skills", response_model=AgentOut)
-def bind_skills(
+async def bind_skills(
     agent_id: str,
     body: AgentBindSkills,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    return agents_svc.bind_agent_skills(
+    return await agents_svc.bind_agent_skills(
         db,
         agent_id,
         body.skill_ids,

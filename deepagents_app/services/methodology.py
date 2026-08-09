@@ -3,10 +3,10 @@
 ================================
 
 版本语义：
-- 草稿态改 Agent 勾选 / 被引用 Agent 变更 → 不升版，覆盖当前 version 快照
+- 草稿态改 Agent 勾选 / 被引用 Agent 变更 → 不升版、不写快照（draft 无人读快照）
 - 已发布方法论的配置变更 → 升版并写新快照，并按保留策略裁剪历史
 - 仅改名称/描述 → 不升版
-- 创建时先绑 Agent（不升版），再统一打 v1 快照
+- 创建草稿时不写快照；发布时钉死当前 version 快照
 - 发布时钉死当前 version 快照（不额外升版）
 """
 
@@ -15,12 +15,15 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from deepagents_app.api.errors import BusinessError, NotFoundError
+from deepagents_app.api.errors import BusinessError, ForbiddenError, NotFoundError
 from deepagents_app.db.loading import methodology_with_agents_options
 from deepagents_app.db.models import AgentDefinition, Conversation, Methodology
 from deepagents_app.ownership import validate_resource_id
+from deepagents_app.db.pagination import DEFAULT_LIMIT, coerce_datetime, page_rows
+from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 from deepagents_app.services.revisions import (
     bump_methodology,
     list_revisions,
@@ -29,45 +32,56 @@ from deepagents_app.services.revisions import (
 )
 
 
-def list_methodologies(
-    db: Session,
+async def list_methodologies(
+    db: AsyncSession,
     *,
     owner_user_id: str,
     status: str | None = None,
-    # 服务层默认与 API 一致
-limit: int = 200,
+    limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-) -> tuple[list[Methodology], int]:
-    """按所有者列出方法论；可按 draft/published 过滤。返回 (rows, total)。"""
-    from deepagents_app.api.pagination import paginate_query
+    cursor: str | None = None,
+) -> tuple[list[Methodology], int, str | None]:
+    """按所有者列出方法论；可按 draft/published 过滤。返回 (rows, total, next_cursor)。"""
 
-    q = (
-        db.query(Methodology)
-        .filter(Methodology.owner_user_id == owner_user_id)
-        .order_by(Methodology.updated_time.desc())
+    stmt = (
+        select(Methodology)
+        .where(Methodology.owner_user_id == owner_user_id)
+        .order_by(Methodology.updated_time.desc(), Methodology.id.desc())
     )
     if status:
-        q = q.filter(Methodology.status == status)
-    return paginate_query(q, limit=limit, offset=offset)
+        stmt = stmt.where(Methodology.status == status)
+    return await page_rows(
+        db,
+        stmt,
+        limit=limit,
+        offset=offset,
+        cursor=cursor,
+        sort_column=Methodology.updated_time,
+        id_column=Methodology.id,
+        sort_attr="updated_time",
+        descending=True,
+        coerce_sort=coerce_datetime,
+    )
 
 
-def get_methodology(
-    db: Session, methodology_id: str, *, owner_user_id: str
+async def get_methodology(
+    db: AsyncSession, methodology_id: str, *, owner_user_id: str
 ) -> Methodology | None:
     """取单个方法论（含已勾选 Agent 及其 tools/middlewares/skills/llm）。"""
     return (
-        db.query(Methodology)
-        .options(*methodology_with_agents_options())
-        .filter(
-            Methodology.id == methodology_id,
-            Methodology.owner_user_id == owner_user_id,
+        await db.scalars(
+            select(Methodology)
+            .options(*methodology_with_agents_options())
+            .where(
+                Methodology.id == methodology_id,
+                Methodology.owner_user_id == owner_user_id,
+            )
         )
-        .one_or_none()
-    )
+    ).one_or_none()
 
 
-def create_methodology(
-    db: Session,
+async def create_methodology(
+    db: AsyncSession,
     *,
     owner_user_id: str,
     name: str,
@@ -75,10 +89,9 @@ def create_methodology(
     methodology_id: str | None = None,
     agent_ids: list[str] | None = None,
 ) -> Methodology:
-    """创建草稿方法论，可选立即勾选全局 Agent，并写入 v1 快照。"""
-    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
+    """创建草稿方法论，可选立即勾选全局 Agent（不写快照；发布时再钉）。"""
 
-    ensure_unique_owned_name(
+    await ensure_unique_owned_name(
         db,
         Methodology,
         owner_user_id=owner_user_id,
@@ -88,7 +101,7 @@ def create_methodology(
 
     mid = methodology_id or _slug_id(name)
     mid = validate_resource_id(mid, label="methodology id")
-    if db.get(Methodology, mid) is not None:
+    if await db.get(Methodology, mid) is not None:
         raise BusinessError(f"方法论已存在：{mid}")
     row = Methodology(
         id=mid,
@@ -99,10 +112,10 @@ def create_methodology(
         status="draft",
     )
     db.add(row)
-    db.flush()
-    # 创建阶段不升版：后面统一 snapshot 成 v1，避免绑 Agent 时 version 变成 2
+    await db.flush()
+    # 创建阶段不升版、不写快照：draft 无人读快照；publish 时再钉 v1
     if agent_ids:
-        bind_methodology_agents(
+        await bind_methodology_agents(
             db,
             mid,
             agent_ids,
@@ -110,12 +123,11 @@ def create_methodology(
             replace=True,
             bump_version=False,
         )
-    snapshot_methodology(db, mid)
-    return get_methodology(db, mid, owner_user_id=owner_user_id) or row
+    return await get_methodology(db, mid, owner_user_id=owner_user_id) or row
 
 
-def update_methodology(
-    db: Session,
+async def update_methodology(
+    db: AsyncSession,
     methodology_id: str,
     *,
     owner_user_id: str,
@@ -123,13 +135,12 @@ def update_methodology(
     description: str | None = None,
 ) -> Methodology:
     """仅更新元信息（名称/描述）；不影响 Agent 组装，不升版。"""
-    row = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
+    row = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
     if name is not None and name != row.name:
-        from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 
-        ensure_unique_owned_name(
+        await ensure_unique_owned_name(
             db,
             Methodology,
             owner_user_id=owner_user_id,
@@ -141,22 +152,22 @@ def update_methodology(
     if description is not None:
         row.description = description
     row.updated_time = datetime.now(timezone.utc)
-    db.flush()
+    await db.flush()
     return row
 
 
-def delete_methodology(
-    db: Session, methodology_id: str, *, owner_user_id: str
+async def delete_methodology(
+    db: AsyncSession, methodology_id: str, *, owner_user_id: str
 ) -> None:
     """删除方法论；仍有会话引用时拒绝，避免孤儿 Conversation。"""
-    row = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
+    row = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
 
-    conv_count = (
-        db.query(Conversation)
-        .filter(Conversation.methodology_id == methodology_id)
-        .count()
+    conv_count = await db.scalar(
+        select(func.count())
+        .select_from(Conversation)
+        .where(Conversation.methodology_id == methodology_id)
     )
     if conv_count:
         raise BusinessError(
@@ -164,12 +175,12 @@ def delete_methodology(
         )
 
     schedule_cache_invalidation(db, methodology_id)
-    db.delete(row)
-    db.flush()
+    await db.delete(row)
+    await db.flush()
 
 
-def bind_methodology_agents(
-    db: Session,
+async def bind_methodology_agents(
+    db: AsyncSession,
     methodology_id: str,
     agent_ids: list[str],
     *,
@@ -184,21 +195,22 @@ def bind_methodology_agents(
     draft 覆盖当前快照；published 升版 + 快照 + 失效缓存。
     ``bump_version=False``：仅改关联，留给调用方自行 snapshot（如创建流程）。
     """
-    methodology = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
+    methodology = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if methodology is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
 
     # 只能勾选当前用户自己的全局 Agent
     agents: list[AgentDefinition] = []
     for aid in agent_ids:
-        agent = db.get(AgentDefinition, aid)
+        agent = await db.get(AgentDefinition, aid)
         if agent is None:
             raise NotFoundError(f"Agent 不存在：{aid}")
         if agent.owner_user_id != owner_user_id:
-            raise BusinessError(f"Agent 不属于当前用户：{aid}")
+            raise ForbiddenError(f"Agent 不属于当前用户：{aid}")
         agents.append(agent)
 
     if replace:
+        await getattr(methodology.awaitable_attrs, "agents")
         methodology.agents = agents
     else:
         # 增量追加：已有的不重复加入
@@ -208,38 +220,41 @@ def bind_methodology_agents(
                 methodology.agents.append(agent)
 
     if bump_version:
-        bump_methodology(db, methodology)
+        await bump_methodology(db, methodology)
     else:
-        db.flush()
-    return get_methodology(db, methodology_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
+        await db.flush()
+    return await get_methodology(db, methodology_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
-def publish_methodology(
-    db: Session, methodology_id: str, *, owner_user_id: str
+async def publish_methodology(
+    db: AsyncSession, methodology_id: str, *, owner_user_id: str
 ) -> Methodology:
-    """发布：勾选的 Agent 中须至少有一个 Supervisor；发布后才能建会话。"""
-    row = get_methodology(db, methodology_id, owner_user_id=owner_user_id)
+    """发布：勾选的 Agent 中须恰好一个 Supervisor；发布后才能建会话。"""
+    from deepagents_app.services.roles import require_single_supervisor
+
+    row = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
-    has_supervisor = any(
-        (a.config or {}).get("role") == "supervisor" for a in row.agents
+    require_single_supervisor(
+        list(row.agents),
+        context="发布失败",
+        role_of=lambda a: str((a.config or {}).get("role") or "subagent").lower(),
+        name_of=lambda a: a.name,
     )
-    if not has_supervisor:
-        raise BusinessError("发布失败：请先勾选至少一个 Supervisor Agent")
     row.status = "published"
     row.updated_time = datetime.now(timezone.utc)
     schedule_cache_invalidation(db, methodology_id)
-    db.flush()
+    await db.flush()
     # 发布瞬间再钉一版快照，保证旧会话可按该 version 重建
-    snapshot_methodology(db, methodology_id)
+    await snapshot_methodology(db, methodology_id)
     return row
 
 
-def get_methodology_versions(
-    db: Session, methodology_id: str, *, owner_user_id: str
+async def get_methodology_versions(
+    db: AsyncSession, methodology_id: str, *, owner_user_id: str
 ) -> list[dict]:
     """列出该方法论历史快照版本（供前端/调试查看）。"""
-    if get_methodology(db, methodology_id, owner_user_id=owner_user_id) is None:
+    if await get_methodology(db, methodology_id, owner_user_id=owner_user_id) is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
     return [
         {
@@ -247,7 +262,7 @@ def get_methodology_versions(
             "version": r.version,
             "created_time": r.created_time.isoformat(),
         }
-        for r in list_revisions(db, methodology_id)
+        for r in await list_revisions(db, methodology_id)
     ]
 
 

@@ -8,9 +8,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 
-from sqlalchemy.orm import Session
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.config import PROJECT_ROOT, get_settings
 from deepagents_app.db.models import AgentDefinition, Methodology, MiddlewareDefinition, ToolDefinition
@@ -24,6 +28,7 @@ from deepagents_app.services.methodology import (
 from deepagents_app.services.middlewares import create_middleware
 from deepagents_app.services.skills import import_skill_from_file
 from deepagents_app.services.tools import create_builtin_tool
+from deepagents_app.workspace import user_workspace_dir
 from deepagents_app.supervisor.prompts import SUPERVISOR_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -32,56 +37,6 @@ PROMPTS_DIR = PROJECT_ROOT / "deepagents_app" / "prompts"
 SKILLS_DIR = PROJECT_ROOT / "deepagents_app" / "skills"
 
 DEFAULT_TOOLS: list[dict] = [
-    {
-        "id": "tool_create_document",
-        "name": "create_document",
-        "description": "创建 Markdown 文档",
-        "class_path": "deepagents_app.tools.document_tools:create_document",
-    },
-    {
-        "id": "tool_append_document_section",
-        "name": "append_document_section",
-        "description": "向文档追加章节",
-        "class_path": "deepagents_app.tools.document_tools:append_document_section",
-    },
-    {
-        "id": "tool_list_documents",
-        "name": "list_documents",
-        "description": "列出文档",
-        "class_path": "deepagents_app.tools.document_tools:list_documents",
-    },
-    {
-        "id": "tool_read_document",
-        "name": "read_document",
-        "description": "读取文档",
-        "class_path": "deepagents_app.tools.document_tools:read_document",
-    },
-    {
-        "id": "tool_list_workspace",
-        "name": "list_workspace",
-        "description": "列出工作区目录",
-        "class_path": "deepagents_app.tools.computer_tools:list_workspace",
-    },
-    {
-        "id": "tool_read_workspace_file",
-        "name": "read_workspace_file",
-        "description": "读取工作区文件",
-        "class_path": "deepagents_app.tools.computer_tools:read_workspace_file",
-    },
-    {
-        "id": "tool_write_workspace_file",
-        "name": "write_workspace_file",
-        "description": "写入工作区文件",
-        "class_path": "deepagents_app.tools.computer_tools:write_workspace_file",
-        "requires_hitl": True,
-    },
-    {
-        "id": "tool_run_shell_command",
-        "name": "run_shell_command",
-        "description": "执行白名单 shell 命令",
-        "class_path": "deepagents_app.tools.computer_tools:run_shell_command",
-        "requires_hitl": True,
-    },
     {
         "id": "tool_search_knowledge",
         "name": "search_knowledge",
@@ -122,14 +77,6 @@ DEFAULT_MIDDLEWARES: list[dict] = [
 
 DEFAULT_SKILLS: list[dict] = [
     {
-        "id": "skill_document_writing",
-        "path": SKILLS_DIR / "document-writer" / "document-writing" / "SKILL.md",
-    },
-    {
-        "id": "skill_computer_ops",
-        "path": SKILLS_DIR / "computer-operator" / "computer-ops" / "SKILL.md",
-    },
-    {
         "id": "skill_qa_answering",
         "path": SKILLS_DIR / "qa-expert" / "qa-answering" / "SKILL.md",
     },
@@ -137,16 +84,38 @@ DEFAULT_SKILLS: list[dict] = [
 
 DEMO_AGENT_BASE_IDS = [
     "agent_demo_supervisor",
-    "agent_demo_document_writer",
-    "agent_demo_computer_operator",
     "agent_demo_qa_expert",
 ]
 
 _bootstrapped_users: set[str] = set()
+_bootstrap_locks: dict[str, asyncio.Lock] = {}
 
 
 def _sid(owner_user_id: str, base_id: str) -> str:
     return scoped_id(owner_user_id, base_id)
+
+
+def _user_bootstrap_lock(owner_user_id: str) -> asyncio.Lock:
+    """同进程内按用户串行 bootstrap（asyncio.Lock，避免包住 await 时挂死事件循环）。"""
+    lock = _bootstrap_locks.get(owner_user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _bootstrap_locks[owner_user_id] = lock
+    return lock
+
+
+async def _pg_advisory_xact_lock(db: AsyncSession, owner_user_id: str) -> None:
+    """多 worker 下用事务级 advisory lock 串行同一用户的 bootstrap。"""
+    bind = db.bind
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    digest = hashlib.sha256(f"deepagents:bootstrap:{owner_user_id}".encode()).digest()
+    k1 = int.from_bytes(digest[0:4], "big", signed=True)
+    k2 = int.from_bytes(digest[4:8], "big", signed=True)
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:k1, :k2)"),
+        {"k1": k1, "k2": k2},
+    )
 
 
 def _read_prompt(name: str) -> str:
@@ -156,11 +125,11 @@ def _read_prompt(name: str) -> str:
     return f"你是 {name} 子 Agent。"
 
 
-def seed_tools_and_middlewares(db: Session, *, owner_user_id: str) -> None:
+async def seed_tools_and_middlewares(db: AsyncSession, *, owner_user_id: str) -> None:
     for item in DEFAULT_TOOLS:
         tool_id = _sid(owner_user_id, item["id"])
-        if db.get(ToolDefinition, tool_id) is None:
-            create_builtin_tool(
+        if await db.get(ToolDefinition, tool_id) is None:
+            await create_builtin_tool(
                 db,
                 owner_user_id=owner_user_id,
                 tool_id=tool_id,
@@ -172,8 +141,8 @@ def seed_tools_and_middlewares(db: Session, *, owner_user_id: str) -> None:
             logger.info("种子工具[%s]：%s", owner_user_id, item["name"])
     for item in DEFAULT_MIDDLEWARES:
         mw_id = _sid(owner_user_id, item["id"])
-        if db.get(MiddlewareDefinition, mw_id) is None:
-            create_middleware(
+        if await db.get(MiddlewareDefinition, mw_id) is None:
+            await create_middleware(
                 db,
                 owner_user_id=owner_user_id,
                 middleware_id=mw_id,
@@ -183,9 +152,9 @@ def seed_tools_and_middlewares(db: Session, *, owner_user_id: str) -> None:
             logger.info("种子中间件[%s]：%s", owner_user_id, item["name"])
 
 
-def seed_skills(db: Session, *, owner_user_id: str) -> None:
+async def seed_skills(db: AsyncSession, *, owner_user_id: str) -> None:
     for item in DEFAULT_SKILLS:
-        row = import_skill_from_file(
+        row = await import_skill_from_file(
             db,
             item["path"],
             owner_user_id=owner_user_id,
@@ -195,7 +164,7 @@ def seed_skills(db: Session, *, owner_user_id: str) -> None:
             logger.info("种子 Skill[%s]：%s (%s)", owner_user_id, row.name, row.id)
 
 
-def seed_demo_agents(db: Session, *, owner_user_id: str) -> None:
+async def seed_demo_agents(db: AsyncSession, *, owner_user_id: str) -> None:
     def tools(*base_ids: str) -> list[str]:
         return [_sid(owner_user_id, i) for i in base_ids]
 
@@ -220,42 +189,6 @@ def seed_demo_agents(db: Session, *, owner_user_id: str) -> None:
             "skill_ids": [],
         },
         {
-            "agent_id": _sid(owner_user_id, "agent_demo_document_writer"),
-            "name": "document-writer",
-            "system_prompt": _read_prompt("document-writer.md"),
-            "config": {
-                "role": "subagent",
-                "enabled": True,
-                "description": "文档撰写专家。适用于撰写/改写 Markdown 文档。",
-            },
-            "tool_ids": tools(
-                "tool_create_document",
-                "tool_append_document_section",
-                "tool_list_documents",
-                "tool_read_document",
-            ),
-            "middleware_ids": mws("mw_logging", "mw_timing"),
-            "skill_ids": skills("skill_document_writing"),
-        },
-        {
-            "agent_id": _sid(owner_user_id, "agent_demo_computer_operator"),
-            "name": "computer-operator",
-            "system_prompt": _read_prompt("computer-operator.md"),
-            "config": {
-                "role": "subagent",
-                "enabled": True,
-                "description": "计算机操作专家。适用于浏览 workspace、执行白名单 shell。",
-            },
-            "tool_ids": tools(
-                "tool_list_workspace",
-                "tool_read_workspace_file",
-                "tool_write_workspace_file",
-                "tool_run_shell_command",
-            ),
-            "middleware_ids": mws("mw_logging", "mw_timing", "mw_audit"),
-            "skill_ids": skills("skill_computer_ops"),
-        },
-        {
             "agent_id": _sid(owner_user_id, "agent_demo_qa_expert"),
             "name": "qa-expert",
             "system_prompt": _read_prompt("qa-expert.md"),
@@ -275,9 +208,9 @@ def seed_demo_agents(db: Session, *, owner_user_id: str) -> None:
     ]
 
     for spec in specs:
-        if db.get(AgentDefinition, spec["agent_id"]) is not None:
+        if await db.get(AgentDefinition, spec["agent_id"]) is not None:
             continue
-        create_agent(
+        await create_agent(
             db,
             owner_user_id=owner_user_id,
             agent_id=spec["agent_id"],
@@ -293,38 +226,62 @@ def seed_demo_agents(db: Session, *, owner_user_id: str) -> None:
         logger.info("种子 Agent[%s]：%s", owner_user_id, spec["name"])
 
 
-def seed_demo_methodology(db: Session, *, owner_user_id: str) -> str:
+async def seed_demo_methodology(db: AsyncSession, *, owner_user_id: str) -> str:
     methodology_id = demo_methodology_id_for_user(owner_user_id)
-    if db.get(Methodology, methodology_id) is not None:
+    if await db.get(Methodology, methodology_id) is not None:
         return methodology_id
 
     agent_ids = [_sid(owner_user_id, base) for base in DEMO_AGENT_BASE_IDS]
-    create_methodology(
+    await create_methodology(
         db,
         owner_user_id=owner_user_id,
         name="DeepAgents 演示方法论",
-        description="Supervisor + document-writer / computer-operator / qa-expert",
+        description="Supervisor + qa-expert",
         methodology_id=methodology_id,
         agent_ids=agent_ids,
     )
-    publish_methodology(db, methodology_id, owner_user_id=owner_user_id)
+    await publish_methodology(db, methodology_id, owner_user_id=owner_user_id)
     logger.info("已种子化演示方法论[%s]：%s", owner_user_id, methodology_id)
     return methodology_id
 
 
-def ensure_user_bootstrap(db: Session, owner_user_id: str) -> None:
-    """幂等：为当前用户准备默认配置（进程内短缓存，避免每请求重复查）。"""
-    if owner_user_id in _bootstrapped_users:
-        # 仍以方法论是否存在为准，防止进程缓存跨库测试脏读
-        if db.get(Methodology, demo_methodology_id_for_user(owner_user_id)) is not None:
+async def ensure_user_bootstrap(db: AsyncSession, owner_user_id: str) -> None:
+    """
+    幂等：为当前用户准备默认配置。
+
+    - 进程内短缓存 + 按用户锁：同进程并发安全
+    - PostgreSQL advisory lock：多 worker 并发安全
+    - IntegrityError + 再读：兜底竞态（如 SQLite 测试）
+    """
+    demo_id = demo_methodology_id_for_user(owner_user_id)
+    async with _user_bootstrap_lock(owner_user_id):
+        if owner_user_id in _bootstrapped_users:
+            if await db.get(Methodology, demo_id) is not None:
+                return
+
+        await _pg_advisory_xact_lock(db, owner_user_id)
+        if await db.get(Methodology, demo_id) is not None:
+            _bootstrapped_users.add(owner_user_id)
             return
 
-    ensure_default_model_from_settings(db, get_settings(), owner_user_id=owner_user_id)
-    seed_tools_and_middlewares(db, owner_user_id=owner_user_id)
-    seed_skills(db, owner_user_id=owner_user_id)
-    seed_demo_agents(db, owner_user_id=owner_user_id)
-    seed_demo_methodology(db, owner_user_id=owner_user_id)
-    _bootstrapped_users.add(owner_user_id)
+        try:
+            async with db.begin_nested():
+                await ensure_default_model_from_settings(
+                    db, get_settings(), owner_user_id=owner_user_id
+                )
+                await seed_tools_and_middlewares(db, owner_user_id=owner_user_id)
+                await seed_skills(db, owner_user_id=owner_user_id)
+                await seed_demo_agents(db, owner_user_id=owner_user_id)
+                await seed_demo_methodology(db, owner_user_id=owner_user_id)
+                # 工作区目录只在 bootstrap / 组装 miss 时创建，聊天热路径不再 mkdir
+                user_workspace_dir(get_settings(), owner_user_id, ensure=True)
+        except IntegrityError:
+            logger.warning(
+                "bootstrap 遇唯一约束冲突，按已存在数据处理：%s", owner_user_id
+            )
+            if await db.get(Methodology, demo_id) is None:
+                raise
+        _bootstrapped_users.add(owner_user_id)
 
 
 def clear_bootstrap_cache() -> None:

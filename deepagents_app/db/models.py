@@ -16,6 +16,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -71,6 +72,7 @@ class Methodology(Base):
     __tablename__ = "methodology"
     __table_args__ = (
         UniqueConstraint("owner_user_id", "name", name="uq_methodology_owner_name"),
+        Index("ix_methodology_owner_updated_id", "owner_user_id", "updated_time", "id"),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -180,6 +182,7 @@ class SkillDefinition(Base):
     Skill 目录：完整 SKILL.md 存 content，运行时物化到 workspace。
 
     ``name`` 同时作为物化子目录名（须为安全 slug）。
+    方法论快照不内嵌正文，只存 content_blob.hash 引用。
     """
 
     __tablename__ = "skill_definition"
@@ -204,6 +207,22 @@ class SkillDefinition(Base):
     agents: Mapped[list[AgentDefinition]] = relationship(
         secondary="agent_skill",
         back_populates="skills",
+    )
+
+
+class ContentBlob(Base):
+    """
+    按内容哈希寻址的不可变正文库。
+
+    快照通过 sha256 hex 引用；无任何 revision 引用时可 GC。
+    """
+
+    __tablename__ = "content_blob"
+
+    hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
 
@@ -320,11 +339,13 @@ class Conversation(Base):
     """会话：绑定方法论版本。"""
 
     __tablename__ = "conversation"
+    __table_args__ = (
+        UniqueConstraint("user_id", "thread_id", name="uq_conversation_user_thread"),
+        Index("ix_conversation_user_created_id", "user_id", "created_time", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    thread_id: Mapped[str] = mapped_column(
-        String(128), unique=True, nullable=False, index=True
-    )
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     methodology_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("methodology.id"), nullable=False, index=True

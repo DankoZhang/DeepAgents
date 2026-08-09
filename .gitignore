@@ -16,17 +16,10 @@ venv/
 # 密钥与本地配置
 .env
 
-# 运行时数据
-data/
-workspace/documents/*
-workspace/notes/*
-workspace/audit/*
-workspace/skills/
-workspace/AGENTS.md
-!workspace/README.md
-!workspace/documents/.gitkeep
-!workspace/notes/.gitkeep
-database/
+# 运行时工作区：用户沙箱在 workspace/users/<scope>/
+# （documents / notes / audit / skills / memory 等均在其下生成）
+/workspace/*
+!/workspace/.gitkeep
 
 # 系统杂项
 .DS_Store

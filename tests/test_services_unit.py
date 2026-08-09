@@ -8,55 +8,9 @@ services 层单测（不依赖 LLM / 不经 HTTP）。
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
-TEST_USER = "svc-test-user"
-
-
-@pytest.fixture()
-def db_session(tmp_path, monkeypatch):
-    from deepagents_app import config
-    from deepagents_app.auth import clear_auth_cache
-    from deepagents_app.db.seed import clear_bootstrap_cache, ensure_user_bootstrap
-    from deepagents_app.db.session import get_session_factory, migrate_db, reset_engine
-    from deepagents_app.services.agent_factory import invalidate_agent_cache
-    from deepagents_app.services.revisions import flush_cache_invalidations
-
-    db_path = tmp_path / "svc.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+pysqlite:///{db_path}")
-    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
-    monkeypatch.setenv("REQUIRE_REDIS_CHECKPOINTER", "false")
-    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspace"))
-    monkeypatch.setenv("AUTH_DISABLED", "true")
-    monkeypatch.setenv("AUTH_DEV_USER_ID", TEST_USER)
-    monkeypatch.setenv("AGENT_CACHE_MAX_SIZE", "2")
-    config.get_settings.cache_clear()
-    clear_auth_cache()
-    clear_bootstrap_cache()
-    reset_engine()
-    invalidate_agent_cache()
-    migrate_db()
-
-    factory = get_session_factory()
-    db = factory()
-    try:
-        ensure_user_bootstrap(db, TEST_USER)
-        db.commit()
-        flush_cache_invalidations(db)
-        yield db
-    finally:
-        db.close()
-        reset_engine()
-        invalidate_agent_cache()
-        clear_bootstrap_cache()
-        clear_auth_cache()
-        config.get_settings.cache_clear()
+from tests.conftest import SVC_TEST_USER as TEST_USER
 
 
 def test_validate_resource_id_rejects_path_traversal():
@@ -70,29 +24,44 @@ def test_validate_resource_id_rejects_path_traversal():
     validate_resource_id("ok_agent-1")
 
 
-def test_list_methodologies_pagination(db_session):
+async def test_list_methodologies_pagination(db_session):
     from deepagents_app.services import methodology as methodology_svc
 
-    rows, total = methodology_svc.list_methodologies(
+    rows, total, next_cursor = await methodology_svc.list_methodologies(
         db_session, owner_user_id=TEST_USER, limit=1, offset=0
     )
     assert total >= 1
     assert len(rows) == 1
 
-    rows2, total2 = methodology_svc.list_methodologies(
+    rows2, total2, _ = await methodology_svc.list_methodologies(
         db_session, owner_user_id=TEST_USER, limit=1, offset=1
     )
     assert total2 == total
     if total > 1:
         assert rows[0].id != rows2[0].id
+        assert next_cursor is not None
+        rows3, total3, _ = await methodology_svc.list_methodologies(
+            db_session, owner_user_id=TEST_USER, limit=1, cursor=next_cursor
+        )
+        assert total3 == total
+        assert rows3[0].id == rows2[0].id
 
 
-def test_create_methodology_rejects_bad_id(db_session):
+async def test_pagination_cursor_roundtrip():
+    from deepagents_app.db.pagination import decode_cursor, encode_cursor
+
+    token = encode_cursor(sort="2026-01-01T00:00:00+00:00", id="abc")
+    sort, item_id = decode_cursor(token)
+    assert sort == "2026-01-01T00:00:00+00:00"
+    assert item_id == "abc"
+
+
+async def test_create_methodology_rejects_bad_id(db_session):
     from deepagents_app.api.errors import BusinessError
     from deepagents_app.services import methodology as methodology_svc
 
     with pytest.raises(BusinessError):
-        methodology_svc.create_methodology(
+        await methodology_svc.create_methodology(
             db_session,
             owner_user_id=TEST_USER,
             name="evil",
@@ -100,7 +69,7 @@ def test_create_methodology_rejects_bad_id(db_session):
         )
 
 
-def test_agent_cache_lru_eviction(db_session, monkeypatch, tmp_path):
+async def test_agent_cache_lru_eviction(db_session, monkeypatch, tmp_path):
     from deepagents_app import config
     from deepagents_app.ownership import demo_methodology_id_for_user
     from deepagents_app.services import agent_factory as af
@@ -128,16 +97,16 @@ def test_agent_cache_lru_eviction(db_session, monkeypatch, tmp_path):
     assert mid
 
 
-def test_bind_agents_returns_detail(db_session):
+async def test_bind_agents_returns_detail(db_session):
     from deepagents_app.ownership import demo_methodology_id_for_user
     from deepagents_app.services import agents as agents_svc
     from deepagents_app.services import methodology as methodology_svc
 
     mid = demo_methodology_id_for_user(TEST_USER)
-    agents, _ = agents_svc.list_agents(db_session, owner_user_id=TEST_USER, limit=10)
+    agents, _, _ = await agents_svc.list_agents(db_session, owner_user_id=TEST_USER, limit=10)
     assert agents
     # 草稿方法论：绑定不升版
-    draft = methodology_svc.create_methodology(
+    draft = await methodology_svc.create_methodology(
         db_session,
         owner_user_id=TEST_USER,
         name="svc-draft-m",
@@ -157,9 +126,10 @@ def test_settings_frozen_and_settings_with():
     with pytest.raises(ValidationError):
         base.enable_hitl = True  # type: ignore[misc]
 
-    overridden = settings_with(enable_hitl=True)
-    assert overridden.enable_hitl is True
-    assert get_settings().enable_hitl is False
+    original = get_settings().enable_hitl
+    overridden = settings_with(enable_hitl=not original)
+    assert overridden.enable_hitl is (not original)
+    assert get_settings().enable_hitl is original
     assert overridden is not get_settings()
 
 
@@ -180,7 +150,7 @@ def test_cors_origins_default_explicit(monkeypatch):
     config.get_settings.cache_clear()
 
 
-def test_mcp_tools_cache_hit(monkeypatch):
+async def test_mcp_tools_cache_hit(monkeypatch):
     from deepagents_app.db.models import ToolDefinition
     from deepagents_app.registries import tools as tools_reg
 
@@ -202,32 +172,38 @@ def test_mcp_tools_cache_hit(monkeypatch):
         config={"transport": "stdio", "command": "echo", "args": []},
         status="active",
     )
-    a = tools_reg.load_mcp_tools(row)
-    b = tools_reg.load_mcp_tools(row)
+    a = await tools_reg.load_mcp_tools(row)
+    b = await tools_reg.load_mcp_tools(row)
     assert calls["n"] == 1
     assert len(a) == 1 and len(b) == 1
     tools_reg.clear_mcp_tools_cache(tool_id=row.id)
 
 
-def test_seed_dangerous_tools_require_hitl(db_session):
+async def test_seed_qa_tools_exist(db_session):
     from deepagents_app.db.models import ToolDefinition
 
-    rows = (
-        db_session.query(ToolDefinition)
-        .filter(ToolDefinition.owner_user_id == TEST_USER)
-        .filter(
-            ToolDefinition.name.in_(("run_shell_command", "write_workspace_file"))
+    from sqlalchemy import select
+
+    rows = list(
+        await db_session.scalars(
+            select(ToolDefinition)
+            .where(ToolDefinition.owner_user_id == TEST_USER)
+            .where(
+                ToolDefinition.name.in_(
+                    ("search_knowledge", "list_knowledge_topics", "save_qa_note")
+                )
+            )
         )
-        .all()
     )
-    assert len(rows) == 2
-    assert all(r.requires_hitl for r in rows)
+    assert len(rows) == 3
+    # 种子 QA 工具默认不强制 HITL；框架原生 write_file/edit_file/execute 仍受 enable_hitl 控制
+    assert all(not r.requires_hitl for r in rows)
 
 
-def test_interrupt_tool_names_from_payloads():
+async def test_interrupt_tool_names_from_payloads():
     from deepagents_app.registries.tools import interrupt_tool_names_from_payloads
 
-    names = interrupt_tool_names_from_payloads(
+    names = await interrupt_tool_names_from_payloads(
         [
             {
                 "name": "run_shell_command",
@@ -278,12 +254,210 @@ def test_resolve_interrupt_on_merges_system_and_catalog(monkeypatch):
     monkeypatch.setenv("ENABLE_HITL", "false")
     config.get_settings.cache_clear()
     settings = config.get_settings()
-    assert (
-        _resolve_interrupt_on(
-            settings,
-            supervisor_config={},
-            catalog_interrupt_on={"run_shell_command": True},
-        )
-        is None
+    catalog_only = _resolve_interrupt_on(
+        settings,
+        supervisor_config={},
+        catalog_interrupt_on={"run_shell_command": True},
     )
+    assert catalog_only == {"run_shell_command": True}
+    assert "write_file" not in catalog_only
     config.get_settings.cache_clear()
+
+
+async def test_memory_versioned_in_snapshot_and_materialize(db_session, tmp_path):
+    from deepagents_app.config import Settings
+    from deepagents_app.ownership import demo_methodology_id_for_user
+    from deepagents_app.services import memory as memory_mod
+    from deepagents_app.services.content_blobs import get_content_blob
+    from deepagents_app.services.memory import materialize_versioned_memory
+    from deepagents_app.services.revisions import serialize_methodology
+    from deepagents_app.workspace import user_workspace_dir
+
+    pinned = "# pinned memory v-test\n"
+    mid = demo_methodology_id_for_user(TEST_USER)
+
+    original = memory_mod.read_project_memory
+    memory_mod.read_project_memory = lambda _settings=None: pinned
+    try:
+        payload = await serialize_methodology(db_session, mid)
+    finally:
+        memory_mod.read_project_memory = original
+
+    assert "content_hash" in payload["memory"]
+    body = await get_content_blob(db_session, payload["memory"]["content_hash"])
+    assert body == pinned
+
+    settings = Settings(workspace_dir=tmp_path / "workspace")
+    root = user_workspace_dir(settings, TEST_USER, ensure=True)
+    virtual = materialize_versioned_memory(
+        root,
+        methodology_id=mid,
+        version=int(payload["version"]),
+        content=body,
+    )
+    assert virtual is not None
+    assert virtual.startswith("/memory/")
+    disk = root / virtual.lstrip("/")
+    assert disk.is_file()
+    assert disk.read_text(encoding="utf-8") == pinned
+
+    v2 = materialize_versioned_memory(
+        root,
+        methodology_id=mid,
+        version=int(payload["version"]) + 1,
+        content="# memory v2\n",
+    )
+    assert (root / v2.lstrip("/")).read_text(encoding="utf-8") == "# memory v2\n"
+    assert disk.read_text(encoding="utf-8") == pinned
+
+
+def test_secrets_previous_keys_decrypt(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    from deepagents_app import config
+    from deepagents_app.crypto import (
+        clear_fernet_cache,
+        decrypt_secret,
+        encrypt_secret,
+    )
+
+    old_key = Fernet.generate_key().decode()
+    new_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("SECRETS_ENCRYPTION_KEY", old_key)
+    monkeypatch.delenv("SECRETS_ENCRYPTION_PREVIOUS_KEYS", raising=False)
+    config.get_settings.cache_clear()
+    clear_fernet_cache()
+    ciphertext = encrypt_secret("sk-rotate-me")
+
+    monkeypatch.setenv("SECRETS_ENCRYPTION_KEY", new_key)
+    monkeypatch.setenv("SECRETS_ENCRYPTION_PREVIOUS_KEYS", old_key)
+    config.get_settings.cache_clear()
+    clear_fernet_cache()
+    assert decrypt_secret(ciphertext) == "sk-rotate-me"
+
+    monkeypatch.delenv("SECRETS_ENCRYPTION_PREVIOUS_KEYS", raising=False)
+    config.get_settings.cache_clear()
+    clear_fernet_cache()
+    with pytest.raises(ValueError, match="解密失败"):
+        decrypt_secret(ciphertext)
+
+    clear_fernet_cache()
+    config.get_settings.cache_clear()
+
+
+async def test_checkpointer_requires_redis():
+    import deepagents_app.factory as factory
+    from deepagents_app.config import Settings
+
+    await factory.close_checkpointer()
+    settings = Settings(redis_url="redis://127.0.0.1:1")
+    with pytest.raises(RuntimeError, match="Redis checkpointer 不可用"):
+        await factory.init_checkpointer(settings)
+    with pytest.raises(RuntimeError, match="尚未初始化"):
+        factory.build_checkpointer(settings)
+    await factory.close_checkpointer()
+
+
+async def test_publish_rejects_multiple_supervisors(db_session):
+    from deepagents_app.api.errors import BusinessError
+    from deepagents_app.ownership import scoped_id
+    from deepagents_app.services import agents as agents_svc
+    from deepagents_app.services import methodology as methodology_svc
+
+    a1 = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="sup-a",
+        system_prompt="a",
+        config={"role": "supervisor"},
+        bump_related=False,
+    )
+    a2 = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="sup-b",
+        system_prompt="b",
+        config={"role": "supervisor"},
+        bump_related=False,
+    )
+    meth = await methodology_svc.create_methodology(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="multi-sup",
+        agent_ids=[a1.id, a2.id],
+        methodology_id=scoped_id(TEST_USER, "meth_multi_sup"),
+    )
+    with pytest.raises(BusinessError, match="只能有一个 Supervisor"):
+        await methodology_svc.publish_methodology(
+            db_session, meth.id, owner_user_id=TEST_USER
+        )
+
+
+async def test_bind_foreign_tool_returns_forbidden(db_session):
+    from deepagents_app.api.errors import ForbiddenError
+    from deepagents_app.db.seed import ensure_user_bootstrap
+    from deepagents_app.ownership import scoped_id
+    from deepagents_app.services import agents as agents_svc
+    from deepagents_app.services import tools as tools_svc
+
+    other = "other-owner"
+    await ensure_user_bootstrap(db_session, other)
+    foreign_tool = await tools_svc.get_tool(
+        db_session,
+        scoped_id(other, "tool_search_knowledge"),
+        owner_user_id=other,
+    )
+    assert foreign_tool is not None
+
+    agent = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="own-agent",
+        system_prompt="x",
+        config={"role": "subagent"},
+        bump_related=False,
+    )
+    with pytest.raises(ForbiddenError, match="不属于当前用户"):
+        await agents_svc.bind_agent_tools(
+            db_session,
+            agent.id,
+            [foreign_tool.id],
+            owner_user_id=TEST_USER,
+        )
+
+
+
+async def test_content_blob_dedup_and_gc(db_session):
+    from deepagents_app.services.content_blobs import (
+        ensure_content_blob,
+        gc_orphan_content_blobs,
+        get_content_blob,
+    )
+
+    h1 = await ensure_content_blob(db_session, "hello-blob")
+    h2 = await ensure_content_blob(db_session, "hello-blob")
+    assert h1 == h2
+    assert await get_content_blob(db_session, h1) == "hello-blob"
+    # 无快照引用 → GC 可删
+    deleted = await gc_orphan_content_blobs(db_session)
+    assert deleted >= 1
+    assert await get_content_blob(db_session, h1) is None
+
+
+def test_serialize_interrupts_structured():
+    from types import SimpleNamespace
+
+    from deepagents_app.services.chat import serialize_interrupts
+
+    interrupt = SimpleNamespace(
+        id="irq-1",
+        value={
+            "action_requests": [
+                {"name": "run_shell_command", "args": {"command": "ls"}, "description": "shell"}
+            ]
+        },
+    )
+    packed = serialize_interrupts([interrupt])
+    assert packed is not None
+    assert packed[0]["id"] == "irq-1"
+    assert packed[0]["actions"][0]["name"] == "run_shell_command"

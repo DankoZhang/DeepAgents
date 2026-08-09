@@ -14,10 +14,6 @@ Middleware 是 deepagents / LangChain Agent 的横切扩展点。
 
 自定义 middleware 的 ``.name`` 若不与默认栈重名，会插入到核心中间件之后；
 若 ``.name`` 与默认中间件相同，则会**原地替换**该默认实例。
+
+运行时按种子 ``class_path`` 直接加载子模块，勿依赖本包再导出。
 """
-
-from deepagents_app.middleware.audit_middleware import AuditMiddleware
-from deepagents_app.middleware.logging_middleware import LoggingMiddleware
-from deepagents_app.middleware.timing_middleware import TimingMiddleware
-
-__all__ = ["AuditMiddleware", "LoggingMiddleware", "TimingMiddleware"]

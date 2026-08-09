@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -32,12 +33,12 @@ logger = logging.getLogger("deepagents_app.middleware.audit")
 # 需要审计的工具名集合（可按业务扩展）
 SENSITIVE_TOOLS = frozenset(
     {
-        "run_shell_command",
-        "write_workspace_file",
-        "create_document",
+        # deepagents 框架原生文件系统 / 执行工具
         "write_file",
         "edit_file",
         "execute",
+        # qa-expert：笔记落盘
+        "save_qa_note",
     }
 )
 
@@ -111,8 +112,12 @@ class AuditMiddleware(AgentMiddleware):
     ) -> Any:
         try:
             result = await handler(request)
-            self._maybe_audit(request, success=True, error=None)
+            await asyncio.to_thread(
+                self._maybe_audit, request, success=True, error=None
+            )
             return result
         except Exception as exc:  # noqa: BLE001
-            self._maybe_audit(request, success=False, error=str(exc))
+            await asyncio.to_thread(
+                self._maybe_audit, request, success=False, error=str(exc)
+            )
             raise

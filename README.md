@@ -1,54 +1,44 @@
 # DeepAgents 方法论平台（后端）
 
-基于 [LangChain Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview) 的**可配置方法论驱动多 Agent 平台**后端。
+基于 [LangChain Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview) 的**可配置方法论驱动多 Agent** 后端。
 
-支持：
+能力概览：
 
-- FastAPI 配置与会话 API（含 SSE 流式聊天）
-- PostgreSQL 方法论 / Agent / Tool / Skill / Middleware / 模型目录（按用户隔离）
-- Redis（LangGraph checkpoint）多轮会话隔离
-- 按方法论动态 `create_deep_agent()` + 进程内 LRU 缓存
+- FastAPI 配置与会话 API（同步聊天 + SSE）
+- PostgreSQL：方法论 / Agent / Tool / Skill / Middleware / 模型目录（按用户隔离）
+- Redis Stack：LangGraph checkpoint、Agent 缓存跨 worker 失效、多 worker 下 SSE 全局限流
+- 按方法论动态 `create_deep_agent()` + 进程内 LRU；多进程经 Redis pub/sub 失效
 - 方法论版本快照（旧会话锁定创建时版本）
-- Skills 存数据库，组装时物化到 `workspace/users/<scope>/`
+- Skills 入库，组装时按内容指纹物化到 `workspace/users/<scope>/skills/`
 
-前端仓库：[`../DeepAgents-frontend`](../DeepAgents-frontend)
+前端：[`../DeepAgents-frontend`](../DeepAgents-frontend)
 
 ---
 
-## 平台模式（推荐）
+## 快速启动（本地推荐）
 
 ```bash
 cd Agents-Project/DeepAgents
 
-python -m venv .venv
+# 依赖（Python 3.13；以 pyproject.toml / uv.lock 为准）
+uv sync --group dev
 source .venv/bin/activate
-pip install -r requirements.txt
-# 或：uv sync   （开发工具：uv sync --group dev）
 
 cp .env.example .env
-# 编辑 .env，填入 API Key
+# 至少填写：OPENAI_API_KEY / OPENAI_BASE_URL（或 Anthropic）
+# 本地可保持 AUTH_DISABLED=true、SECRETS_ALLOW_INSECURE_DEV_KEY=true
 
-# 启动 PostgreSQL + Redis
+# 1) PostgreSQL + Redis Stack
 docker compose up -d
 
-# 迁移 schema（部署步骤；API 启动不会自动执行）
+# 2) Schema 迁移（API 启动不会自动 migrate）
 python -m deepagents_app.db.migrate
 
-# 启动 FastAPI（默认 http://0.0.0.0:8001）
-# 需配置 AUTH_INTROSPECT_URL，或本地设 AUTH_DISABLED=true
+# 3) 启动 API（默认 http://0.0.0.0:8001）
 python server.py
 ```
 
-鉴权：请求头带 `Authorization: Bearer <token>`，服务端调用外部 `AUTH_INTROSPECT_URL` 解析出 `user_id`；所有配置与会话按用户隔离。前端进入布局时会调 `POST /api/bootstrap`，幂等写入该用户的默认 Tool / demo 方法论。
-
-Schema 变更请用 Alembic（见 `migrations/README`）。脚本目录是 `migrations/`（由 `alembic.ini` 的 `script_location` 指定）；勿在仓库根再建 `alembic/`，会遮蔽 PyPI 包：
-
-```bash
-alembic revision --autogenerate -m "your change"
-python -m deepagents_app.db.migrate
-```
-
-另开终端启动前端：
+另开终端起前端：
 
 ```bash
 cd Agents-Project/DeepAgents-frontend
@@ -57,15 +47,90 @@ npm run dev
 # http://localhost:5173
 ```
 
-API 文档：http://localhost:8001/docs
+首次进入前端布局会调 `POST /api/bootstrap`，按当前用户幂等写入默认 Tool / demo 方法论。也可手动：
 
-主要接口：
+```bash
+curl -X POST http://127.0.0.1:8001/api/bootstrap \
+  -H "Authorization: Bearer <token>"   # AUTH_DISABLED=true 时可省略
+```
+
+API 文档：http://localhost:8001/docs · 探活：`GET /health`
+
+---
+
+## 进程模型（uvicorn / gunicorn）
+
+入口统一为 `python server.py`，由 `.env` 控制：
+
+| 变量 | 含义 |
+|------|------|
+| `API_HOST` / `API_PORT` | 监听地址（默认 `0.0.0.0:8001`） |
+| `API_WORKERS` | 进程数；`1` 单进程，`>1` 多 worker |
+| `API_SERVER` | `uvicorn` 或 `gunicorn`（后者使用 `UvicornWorker`） |
+| `CHAT_STREAM_LIMITER` | `auto`：多 worker 时 SSE 用 Redis 全局限流；可强制 `local` / `redis` |
+
+示例：
+
+```env
+# 本地调试（单进程）
+API_WORKERS=1
+API_SERVER=uvicorn
+
+# 多 worker（生产/压测）
+API_WORKERS=4
+API_SERVER=gunicorn
+```
+
+等价手写：
+
+```bash
+uvicorn deepagents_app.api.app:app --host 0.0.0.0 --port 8001 --workers 4
+gunicorn deepagents_app.api.app:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8001
+```
+
+多 worker 依赖可用的 Redis：缓存失效 pub/sub +（默认）SSE 全局槽位。Dockerfile 默认 `API_WORKERS=2`、`API_SERVER=gunicorn`。
+
+---
+
+## 鉴权与密钥
+
+- 生产：`AUTH_DISABLED=false`，配置 `AUTH_INTROSPECT_URL`；请求头 `Authorization: Bearer <token>`，服务端解析 `user_id`，配置与会话按用户隔离。
+- 本地：`AUTH_DISABLED=true` 时固定 `AUTH_DEV_USER_ID`。
+- 模型 `api_key` 入库加密：生产设置 `SECRETS_ENCRYPTION_KEY`；仅本地可 `SECRETS_ALLOW_INSECURE_DEV_KEY=true`。
+
+兼容 OpenAI 兼容接口（如 DeepSeek）：
+
+```env
+MODEL_PROVIDER=openai_compatible
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+MODEL_NAME=deepseek-chat
+OPENAI_API_KEY=sk-...
+```
+
+说明：`.env` 中的模型项主要用于 **bootstrap 种子默认模型**；已灌库后改 `.env` 不会自动改库里的模型行。
+
+---
+
+## Schema 迁移
+
+单一基线迁移在 `migrations/versions/`。变更请用 Alembic（`alembic.ini` → `migrations/`；勿在仓库根再建 `alembic/` 目录，会遮蔽 PyPI 包）：
+
+```bash
+alembic revision --autogenerate -m "your change"
+python -m deepagents_app.db.migrate
+```
+
+空库或换 volume 后：先 `migrate`，再 `bootstrap`。
+
+---
+
+## 主要接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/bootstrap` | 按用户幂等灌种子 |
 | POST | `/api/methodology` | 创建方法论 |
-| GET | `/api/methodology/list` | 列表（`limit`/`offset`，`X-Total-Count`） |
+| GET | `/api/methodology/list` | 列表（分页头 `X-Total-Count` / `X-Next-Cursor`） |
 | POST | `/api/methodology/{id}/publish` | 发布 |
 | POST | `/api/agent` | 创建 Agent |
 | GET | `/api/tool/list` | 工具注册表 |
@@ -76,69 +141,71 @@ API 文档：http://localhost:8001/docs
 | POST | `/api/chat/stream` | 聊天（SSE） |
 | POST | `/api/chat/resume` | HITL 恢复 |
 
-测试：
+流式并发受 `CHAT_STREAM_MAX_CONCURRENT` 限制；抢不到槽返回 **429**。
+
+---
+
+## 测试
+
+需本机 Redis（`docker compose up -d`）。测试使用用户 `test-user` / `svc-test-user`，fixture 会清理其 checkpoint，且聊天 e2e 使用唯一 `thread_id`，避免污染开发会话。
 
 ```bash
+uv sync --group dev
 python -m pytest tests/ -q
 ```
 
 ---
 
-## CLI（方法论驱动）
+## 运行时维护
 
-需 PostgreSQL（`docker compose up -d`）。默认使用当前用户的 demo 方法论：
+Skills / content_blob 物化与快照正文按内容寻址，可手动或后台 GC：
 
 ```bash
-python main.py
-python main.py --methodology <methodology_id>
-python main.py -q "什么是 Deep Agents 的 Middleware？"
+python -m deepagents_app.services.skills_gc
+python -m deepagents_app.services.skills_gc --max-age-days 7
+python -m deepagents_app.services.content_blobs_gc
 ```
 
-兼容第三方 OpenAI API（如 DeepSeek）：
+`SKILLS_GC_INTERVAL_HOURS` / `CONTENT_BLOB_GC_INTERVAL_HOURS`（默认 24）控制 API 进程内后台任务；`0` 表示仅手动。
 
-```env
-MODEL_PROVIDER=openai_compatible
-OPENAI_BASE_URL=https://api.deepseek.com/v1
-MODEL_NAME=deepseek-chat
-OPENAI_API_KEY=sk-...
-```
+---
 
 ## 已演示的 Deep Agents 能力
 
-1. **主从调度**：Supervisor + `task` 委派多个 SubAgent
+1. **主从调度**：Supervisor + `task` 委派 SubAgent（种子：`qa-expert`）
 2. **自定义 Middleware**：日志、计时、审计（种子内置，Agent 勾选）
-3. **Filesystem Backend**：按用户隔离的 `workspace/users/<scope>/` 沙箱
-4. **Permissions**：路径级读写控制（`factory.build_permissions`）
-5. **Memory / Skills**：项目级 `AGENTS.md` + 数据库 Skills（组装时物化）
-6. **Checkpointer**：Redis Stack 多轮 `thread_id` 隔离（按用户前缀）
-7. **HITL**：危险工具前暂停（`ENABLE_HITL=true`；当前主要挂在 Supervisor）
-8. **方法论驱动**：DB 配置 → Agent Factory → 版本缓存；支持 MCP 工具
+3. **Filesystem Backend**：按用户隔离的 `workspace/users/<scope>/`
+4. **Permissions**：路径级读写控制
+5. **Memory / Skills**：`AGENTS.md` + 数据库 Skills（内容指纹物化）
+6. **Checkpointer**：Redis Stack，按用户前缀隔离 `thread_id`
+7. **HITL**：`ENABLE_HITL=true`；工具可单独 `requires_hitl`
+8. **方法论驱动**：DB → Agent Factory → 版本缓存；支持 MCP 工具
+
+---
 
 ## 目录结构
 
 ```
 DeepAgents/
-├── main.py                 # CLI 入口（方法论组装）
-├── server.py               # FastAPI 入口
-├── alembic.ini             # Alembic 配置（script_location → migrations/）
-├── migrations/             # Schema 迁移脚本
-├── docker-compose.yml      # PostgreSQL + Redis Stack
+├── server.py               # 入口（uvicorn / gunicorn + UvicornWorker）
+├── alembic.ini
+├── migrations/             # Schema 迁移（单一 initial 基线）
+├── docker-compose.yml      # PostgreSQL + Redis Stack（named volume）
+├── Dockerfile              # 默认 gunicorn 多 worker；依赖以 uv.lock 为准
+├── pyproject.toml / uv.lock
 ├── deepagents_app/
-│   ├── api/                # FastAPI 路由与 schemas
-│   ├── auth.py             # Bearer introspect / 本地 AUTH_DISABLED
-│   ├── db/                 # ORM / session / seed / bootstrap_session
-│   ├── services/           # 业务服务与 Agent Factory
-│   ├── registries/         # Tool（builtin/MCP）/ Middleware 加载
-│   ├── workspace.py        # 用户工作区 ContextVar
-│   ├── llm.py              # Chat Model 工厂
-│   ├── factory.py          # checkpointer / permissions / GP 子 Agent
-│   ├── utils/              # 路径安全 / 文本归一化
-│   ├── tools/              # 内置工具实现
-│   ├── middleware/
-│   └── prompts/            # 种子子 Agent 系统提示（bootstrap 读入）
-└── workspace/              # 运行时沙箱（users/<scope>/…）
+│   ├── api/                # 路由与 schemas
+│   ├── auth.py
+│   ├── db/                 # ORM / session / seed / migrate
+│   ├── services/           # 业务、Agent Factory、cache pub/sub、GC
+│   ├── registries/         # Tool / Middleware 加载
+│   ├── tools/ · middleware/ · prompts/
+│   └── factory.py          # checkpointer / permissions / GP 子 Agent
+└── workspace/              # 运行时沙箱
 ```
+
+---
 
 ## 说明
 
-本仓库含教学与脚手架性质配置。生产环境请加强密钥脱敏、审计与 HITL 策略，并按需收紧 CORS。
+本仓库含教学与脚手架配置。生产请关闭 `AUTH_DISABLED`、配置真实 introspect 与 `SECRETS_ENCRYPTION_KEY`，收紧 CORS / MCP stdio，并按负载设置 `API_WORKERS` 与 DB 连接池。

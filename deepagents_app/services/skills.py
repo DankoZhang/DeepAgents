@@ -3,28 +3,38 @@ Skill 目录与物化
 ================
 
 - 目录 CRUD：用户可维护 SKILL.md 正文（含 YAML frontmatter）
-- 组装时物化到 ``workspace/skills/<scope>/<agent_id>/``，供 deepagents 加载
+- 组装时按内容哈希物化到 ``workspace/skills/<fingerprint>/<agent_id>/``
+  （只写不删；已发布目录可跨缓存生命周期复用）
 - 变更后默认 bump 引用该方法论；旧会话靠快照内嵌 content 重建
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
 import shutil
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.config import Settings
 from deepagents_app.db.models import AgentSkill, SkillDefinition
+from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.ownership import validate_resource_id
+from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
 from deepagents_app.services.revisions import (
+    bump_methodologies_for_agent_ids,
     bump_methodologies_using_skill,
+    schedule_cache_invalidation_for_agent_ids,
 )
 from deepagents_app.utils.paths import resolve_under_root
 from deepagents_app.workspace import get_workspace_root
@@ -33,40 +43,49 @@ logger = logging.getLogger(__name__)
 
 # name 同时用作物化目录名，故限制字符集
 _SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
+_COMPLETE_MARKER = ".complete"
 
 
-def list_skills(
-    db: Session,
+async def list_skills(
+    db: AsyncSession,
     *,
     owner_user_id: str,
     status: str | None = None,
-    limit: int = 200,
+    limit: int = DEFAULT_LIMIT,
     offset: int = 0,
-) -> tuple[list[SkillDefinition], int]:
-    """列出当前用户的 Skill 目录；可按 status 过滤。返回 (rows, total)。"""
-    from deepagents_app.api.pagination import paginate_query
+    cursor: str | None = None,
+) -> tuple[list[SkillDefinition], int, str | None]:
+    """列出当前用户的 Skill 目录；可按 status 过滤。返回 (rows, total, next_cursor)。"""
 
-    q = (
-        db.query(SkillDefinition)
-        .filter(SkillDefinition.owner_user_id == owner_user_id)
-        .order_by(SkillDefinition.name)
+    stmt = (
+        select(SkillDefinition)
+        .where(SkillDefinition.owner_user_id == owner_user_id)
+        .order_by(SkillDefinition.name, SkillDefinition.id)
     )
     if status:
-        q = q.filter(SkillDefinition.status == status)
-    return paginate_query(q, limit=limit, offset=offset)
+        stmt = stmt.where(SkillDefinition.status == status)
+    return await page_rows(
+        db,
+        stmt,
+        limit=limit,
+        offset=offset,
+        cursor=cursor,
+        sort_column=SkillDefinition.name,
+        id_column=SkillDefinition.id,
+        sort_attr="name",
+    )
 
 
-def get_skill(
-    db: Session, skill_id: str, *, owner_user_id: str
+async def get_skill(
+    db: AsyncSession, skill_id: str, *, owner_user_id: str
 ) -> SkillDefinition | None:
     """按主键取 Skill；不属于当前用户则视为不存在。"""
-    from deepagents_app.services.crud_helpers import get_owned
 
-    return get_owned(db, SkillDefinition, skill_id, owner_user_id=owner_user_id)
+    return await get_owned(db, SkillDefinition, skill_id, owner_user_id=owner_user_id)
 
 
-def create_skill(
-    db: Session,
+async def create_skill(
+    db: AsyncSession,
     *,
     owner_user_id: str,
     name: str,
@@ -83,9 +102,8 @@ def create_skill(
     """
     name = name.strip()
     _validate_skill_name(name)
-    from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 
-    ensure_unique_owned_name(
+    await ensure_unique_owned_name(
         db,
         SkillDefinition,
         owner_user_id=owner_user_id,
@@ -110,12 +128,12 @@ def create_skill(
         status=status,
     )
     db.add(row)
-    db.flush()
+    await db.flush()
     return row
 
 
-def update_skill(
-    db: Session,
+async def update_skill(
+    db: AsyncSession,
     skill_id: str,
     *,
     owner_user_id: str,
@@ -127,16 +145,15 @@ def update_skill(
     bump_related: bool = True,
 ) -> SkillDefinition:
     """更新 Skill；``bump_related=True`` 时升版所有引用该方法论。"""
-    row = get_skill(db, skill_id, owner_user_id=owner_user_id)
+    row = await get_skill(db, skill_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Skill 不存在：{skill_id}")
 
     if name is not None and name.strip() != row.name:
         new_name = name.strip()
         _validate_skill_name(new_name)
-        from deepagents_app.services.crud_helpers import ensure_unique_owned_name
 
-        ensure_unique_owned_name(
+        await ensure_unique_owned_name(
             db,
             SkillDefinition,
             owner_user_id=owner_user_id,
@@ -167,52 +184,49 @@ def update_skill(
         row.status = status
 
     row.updated_time = datetime.now(timezone.utc)
-    db.flush()
+    await db.flush()
     if bump_related:
-        bump_methodologies_using_skill(db, skill_id)
+        await bump_methodologies_using_skill(db, skill_id)
     else:
-        from deepagents_app.services.revisions import (
-            schedule_cache_invalidation_for_agent_ids,
-        )
 
         agent_ids = [
             r.agent_id
-            for r in db.query(AgentSkill).filter(AgentSkill.skill_id == skill_id).all()
+            for r in await db.scalars(
+                select(AgentSkill).where(AgentSkill.skill_id == skill_id)
+            )
         ]
-        schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+        await schedule_cache_invalidation_for_agent_ids(db, agent_ids)
     return row
 
 
-def delete_skill(
-    db: Session,
+async def delete_skill(
+    db: AsyncSession,
     skill_id: str,
     *,
     owner_user_id: str,
     bump_related: bool = True,
 ) -> None:
     """删除 Skill；若仍被 Agent 引用且 bump_related，则级联升版那些方法论。"""
-    row = get_skill(db, skill_id, owner_user_id=owner_user_id)
+    row = await get_skill(db, skill_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Skill 不存在：{skill_id}")
 
     # 删除前记下引用：AgentSkill 会随 Skill 行级联消失
     agent_ids = [
         r.agent_id
-        for r in db.query(AgentSkill).filter(AgentSkill.skill_id == skill_id).all()
+        for r in await db.scalars(
+            select(AgentSkill).where(AgentSkill.skill_id == skill_id)
+        )
     ]
-    db.delete(row)
-    db.flush()
+    await db.delete(row)
+    await db.flush()
     if bump_related:
         if agent_ids:
-            from deepagents_app.services.revisions import bump_methodologies_for_agent_ids
 
-            bump_methodologies_for_agent_ids(db, agent_ids)
+            await bump_methodologies_for_agent_ids(db, agent_ids)
     elif agent_ids:
-        from deepagents_app.services.revisions import (
-            schedule_cache_invalidation_for_agent_ids,
-        )
 
-        schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+        await schedule_cache_invalidation_for_agent_ids(db, agent_ids)
 
 
 # ── 快照还原与磁盘物化（Agent Factory 组装时调用）──────────────────────
@@ -242,55 +256,107 @@ def load_skills_from_snapshots(payloads: list[dict[str, Any]]) -> list[SkillDefi
     return result
 
 
+def skills_fingerprint(skills: Sequence[SkillDefinition]) -> str:
+    """
+    同一组 active Skill 内容 → 稳定目录名（sha256 前 16 位）。
+
+    路径与内容一一对应，物化目录可只写不删。
+    """
+    active = [s for s in skills if (s.status or "active") == "active"]
+    payload = [
+        {
+            "name": s.name,
+            "content": s.content or "",
+            "status": s.status or "active",
+        }
+        for s in sorted(active, key=lambda row: row.name)
+    ]
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def materialize_agent_skills(
     settings: Settings,
     agent_id: str,
     skills: list[SkillDefinition],
     *,
-    scope: str,
     workspace_root: Path | None = None,
 ) -> str | None:
     """
     把 Agent 已绑 Skills 物化到
-    ``<workspace_root>/skills/<scope>/<agent_id>/<name>/SKILL.md``。
+    ``<workspace_root>/skills/<fingerprint>/<agent_id>/<name>/SKILL.md``。
+
+    内容寻址 + 原子发布：已有 ``.complete`` 则复用；否则写临时目录再 rename。
+    缓存淘汰 / 版本裁剪不再删除这些目录。
 
     Returns:
         供 ``skills=`` 使用的源目录虚拟路径；无可用 skill 返回 None。
     """
+    _assert_safe_path_segment(agent_id, label="agent id")
     active = [s for s in skills if (s.status or "active") == "active"]
-    root = _safe_materialize_root(
-        settings, scope=scope, agent_id=agent_id, workspace_root=workspace_root
-    )
-    # 每次组装前清空，避免残留旧版 SKILL.md
-    if root.exists():
-        shutil.rmtree(root)
     if not active:
         return None
 
-    root.mkdir(parents=True, exist_ok=True)
-    for skill in active:
+    scope = skills_fingerprint(active)
+    root = _safe_materialize_root(
+        settings, scope=scope, agent_id=agent_id, workspace_root=workspace_root
+    )
+    virtual = f"/skills/{scope}/{agent_id}/"
+
+    if (root / _COMPLETE_MARKER).exists():
+        # 刷新完成标记 mtime，供 GC 判断「近期仍在用」
+        try:
+            (root / _COMPLETE_MARKER).touch()
+        except OSError as exc:
+            logger.debug("刷新 Skills .complete mtime 失败：%s", exc)
+        return virtual
+
+    # 崩溃留下的半成品目录：清掉后再发布（完整目录不会走这里）
+    if root.exists():
+        shutil.rmtree(root)
+
+    tmp = root.with_name(f"{root.name}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        _write_skills_tree(tmp, active)
+        try:
+            os.rename(tmp, root)
+        except OSError:
+            # 目标已是目录（他进程抢先发布，或残留半成品）
+            shutil.rmtree(tmp, ignore_errors=True)
+            if (root / _COMPLETE_MARKER).exists():
+                return virtual
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
+            # 清掉半成品后再试一次
+            tmp = root.with_name(f"{root.name}.tmp-{uuid.uuid4().hex[:8]}")
+            _write_skills_tree(tmp, active)
+            try:
+                os.rename(tmp, root)
+            except OSError:
+                shutil.rmtree(tmp, ignore_errors=True)
+                if (root / _COMPLETE_MARKER).exists():
+                    return virtual
+                raise BusinessError(
+                    f"Skills 物化发布冲突，请重试：{scope}/{agent_id}"
+                )
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+    return virtual
+
+
+def _write_skills_tree(root: Path, skills: Sequence[SkillDefinition]) -> None:
+    """写入临时目录：各 Skill 子目录 + 完成标记。"""
+    root.mkdir(parents=True, exist_ok=False)
+    for skill in skills:
         try:
             skill_dir = resolve_under_root(root, skill.name, basename_only=True)
         except ValueError as exc:
             raise BusinessError(f"Skill 物化路径非法：{skill.name}") from exc
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(skill.content or "", encoding="utf-8")
-    return f"/skills/{scope}/{agent_id}/"
-
-
-def clear_materialized_skills(
-    settings: Settings,
-    *,
-    scope: str,
-    workspace_root: Path | None = None,
-) -> None:
-    """清空指定 scope 下的物化 Skills（组装前调用）。"""
-    dst = _safe_materialize_root(
-        settings, scope=scope, workspace_root=workspace_root
-    )
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.mkdir(parents=True, exist_ok=True)
+    (root / _COMPLETE_MARKER).touch()
 
 
 def _skills_workspace_root(
@@ -325,7 +391,7 @@ def _safe_materialize_root(
     """
     解析物化目录，强制落在 ``<workspace_root>/skills`` 内。
 
-    ``scope`` 形如 ``<methodology_id>/v<version>``；任一段含穿越都会被拦截。
+    ``scope`` 为内容指纹（单段）；任一段含穿越都会被拦截。
     """
     scope_parts = Path(scope).parts
     if not scope_parts:
@@ -343,6 +409,116 @@ def _safe_materialize_root(
         )
     except ValueError as exc:
         raise BusinessError(f"Skills 物化路径越界：{relative}") from exc
+
+
+def gc_materialized_skills(
+    settings: Settings,
+    *,
+    max_age_days: float | None = None,
+    tmp_max_age_hours: float | None = None,
+    now: float | None = None,
+) -> dict[str, int]:
+    """
+    清理过期的内容寻址 Skills 目录。
+
+    策略（与组装解耦，不碰「仍在用」的路径）：
+    - 复用物化时会 touch ``.complete``；超过 ``max_age_days`` 未刷新的 agent 目录删除
+    - 清理残留 ``*.tmp-*`` 临时目录（超过 ``tmp_max_age_hours``）
+    - 删空后的 fingerprint 父目录一并去掉
+
+    Returns:
+        ``{"removed_agents": n, "removed_tmp": n, "removed_empty_scopes": n}``
+    """
+    import time
+
+    age_days = (
+        float(settings.skills_gc_max_age_days)
+        if max_age_days is None
+        else float(max_age_days)
+    )
+    tmp_hours = (
+        float(settings.skills_gc_tmp_max_age_hours)
+        if tmp_max_age_hours is None
+        else float(tmp_max_age_hours)
+    )
+    if age_days <= 0:
+        return {
+            "removed_agents": 0,
+            "removed_tmp": 0,
+            "removed_empty_scopes": 0,
+        }
+
+    cutoff_complete = (now if now is not None else time.time()) - age_days * 86400
+    cutoff_tmp = (now if now is not None else time.time()) - tmp_hours * 3600
+    users_root = (settings.workspace_dir / "users").resolve()
+    stats = {"removed_agents": 0, "removed_tmp": 0, "removed_empty_scopes": 0}
+    if not users_root.is_dir():
+        return stats
+
+    for user_dir in users_root.iterdir():
+        if not user_dir.is_dir():
+            continue
+        skills_root = user_dir / "skills"
+        if not skills_root.is_dir():
+            continue
+        try:
+            skills_root.resolve().relative_to(user_dir.resolve())
+        except ValueError:
+            continue
+
+        for scope_dir in list(skills_root.iterdir()):
+            if not scope_dir.is_dir():
+                continue
+            # fingerprint 级临时目录（少见，防御性清理）
+            if ".tmp-" in scope_dir.name:
+                mtime = _mtime_or_none(scope_dir)
+                if mtime is not None and mtime < cutoff_tmp:
+                    shutil.rmtree(scope_dir, ignore_errors=True)
+                    stats["removed_tmp"] += 1
+                continue
+
+            for child in list(scope_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                if ".tmp-" in child.name:
+                    mtime = _mtime_or_none(child)
+                    if mtime is not None and mtime < cutoff_tmp:
+                        shutil.rmtree(child, ignore_errors=True)
+                        stats["removed_tmp"] += 1
+                    continue
+
+                marker = child / _COMPLETE_MARKER
+                if marker.exists():
+                    mtime = _mtime_or_none(marker)
+                else:
+                    mtime = _mtime_or_none(child)
+                if mtime is not None and mtime < cutoff_complete:
+                    shutil.rmtree(child, ignore_errors=True)
+                    stats["removed_agents"] += 1
+
+            try:
+                if scope_dir.is_dir() and not any(scope_dir.iterdir()):
+                    scope_dir.rmdir()
+                    stats["removed_empty_scopes"] += 1
+            except OSError:
+                pass
+
+    logger.info(
+        "Skills GC 完成 removed_agents=%s removed_tmp=%s removed_empty_scopes=%s "
+        "max_age_days=%s",
+        stats["removed_agents"],
+        stats["removed_tmp"],
+        stats["removed_empty_scopes"],
+        age_days,
+    )
+    return stats
+
+
+def _mtime_or_none(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def build_skill_markdown(*, name: str, description: str, body: str) -> str:
@@ -403,8 +579,8 @@ def parse_skill_markdown(content: str) -> tuple[str | None, str | None]:
     return name, description
 
 
-def import_skill_from_file(
-    db: Session,
+async def import_skill_from_file(
+    db: AsyncSession,
     path: Path,
     *,
     owner_user_id: str,
@@ -418,20 +594,20 @@ def import_skill_from_file(
     fm_name, fm_desc = parse_skill_markdown(content)
     name = (name_override or fm_name or path.parent.name).strip()
     if skill_id:
-        existing_by_id = get_skill(db, skill_id, owner_user_id=owner_user_id)
+        existing_by_id = await get_skill(db, skill_id, owner_user_id=owner_user_id)
         if existing_by_id is not None:
             return existing_by_id
     existing = (
-        db.query(SkillDefinition)
-        .filter(
-            SkillDefinition.owner_user_id == owner_user_id,
-            SkillDefinition.name == name,
+        await db.scalars(
+            select(SkillDefinition).where(
+                SkillDefinition.owner_user_id == owner_user_id,
+                SkillDefinition.name == name,
+            )
         )
-        .one_or_none()
-    )
+    ).one_or_none()
     if existing is not None:
         return existing
-    return create_skill(
+    return await create_skill(
         db,
         owner_user_id=owner_user_id,
         name=name,
