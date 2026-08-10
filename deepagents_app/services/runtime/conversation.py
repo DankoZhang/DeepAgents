@@ -118,16 +118,20 @@ async def list_conversations(
 
 
 async def delete_conversation(db: AsyncSession, thread_id: str, *, user_id: str) -> None:
-    """删除会话元数据，并清理 checkpointer 中对应 thread 状态。"""
+    """
+    删除会话元数据，并清理 checkpointer 中对应 thread 状态。
+
+    先 ``commit`` 元数据删除，再删 checkpoint：避免 commit 失败回滚后
+    会话行恢复、历史却已永久丢失。checkpoint 清理失败只打日志（残留可接受）。
+    """
     row = await get_conversation_by_thread(db, thread_id, user_id=user_id)
     if row is None:
         raise NotFoundError(f"会话不存在：thread_id={thread_id}")
     cp_thread = checkpoint_thread_id(user_id, thread_id)
     await db.delete(row)
-    await db.flush()
+    await db.commit()
     try:
         checkpointer = build_checkpointer(get_settings())
         await checkpointer.adelete_thread(cp_thread)
     except Exception as exc:  # noqa: BLE001
-        # 元数据已删；checkpointer 残留不影响正确性，只影响磁盘占用
         logger.warning("清理 checkpointer 失败 thread=%s: %s", cp_thread, exc)

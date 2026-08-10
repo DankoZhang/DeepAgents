@@ -49,7 +49,7 @@ def client(tmp_path, monkeypatch):
     from deepagents_app.auth import clear_auth_cache
     from deepagents_app.db.seed import clear_bootstrap_cache
     from deepagents_app.db.session import migrate_db, reset_engine
-    from deepagents_app.services.agent_factory import invalidate_agent_cache
+    from deepagents_app.services.runtime.agent_factory import invalidate_agent_cache
 
     db_path = tmp_path / "test.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+pysqlite:///{db_path}")
@@ -101,8 +101,8 @@ async def db_session(tmp_path, monkeypatch):
         migrate_db,
         reset_engine,
     )
-    from deepagents_app.services.agent_factory import invalidate_agent_cache
-    from deepagents_app.services.revisions import flush_cache_invalidations
+    from deepagents_app.services.runtime.agent_factory import invalidate_agent_cache
+    from deepagents_app.services.versioning.revisions import flush_cache_invalidations
 
     db_path = tmp_path / "svc.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+pysqlite:///{db_path}")

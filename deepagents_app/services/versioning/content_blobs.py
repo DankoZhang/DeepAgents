@@ -6,23 +6,27 @@ Skill / system_prompt / Memory 等大段正文按 sha256 去重存储。
 方法论快照只存 ``content_hash``，旧会话按 hash 取回不可变正文。
 
 GC：删除未被任何 ``MethodologyRevision.snapshot`` 引用的孤儿 blob
-（写路径不调用；由后台调度 / CLI 执行）。
+（写路径不调用；由 ``services.gc`` 后台 / CLI 执行）。
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from deepagents_app.api.errors import NotFoundError
 from deepagents_app.db.models import ContentBlob, MethodologyRevision
 
 logger = logging.getLogger(__name__)
+
+# 新建 blob 宽限期：降低「刚写入尚未挂引用」与「孤儿判定后立即被复用」误删概率
+_DEFAULT_GC_MIN_AGE_SECONDS = 60.0
 
 
 def content_hash(text: str) -> str:
@@ -115,6 +119,16 @@ async def collect_referenced_content_hashes(db: AsyncSession) -> set[str]:
     return referenced
 
 
+def _require_blob_body(
+    bodies: dict[str, str], digest: str, *, label: str
+) -> str:
+    """快照引用的 hash 必须能取回正文；禁止静默填空串。"""
+    if digest not in bodies:
+        short = digest[:12] if len(digest) > 12 else digest
+        raise NotFoundError(f"快照引用的 {label} 正文缺失：hash={short}…")
+    return bodies[digest]
+
+
 async def hydrate_snapshot_content(
     db: AsyncSession, snapshot: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -123,6 +137,7 @@ async def hydrate_snapshot_content(
 
     兼容旧快照：若已有 ``content`` / ``system_prompt`` 明文则保留。
     一次 IN 查询批量取回所需 blob，避免 N+1。
+    引用 hash 在库中不存在时抛 ``NotFoundError``（避免空 prompt 静默跑飞）。
     """
     if not isinstance(snapshot, dict):
         return {}
@@ -148,7 +163,9 @@ async def hydrate_snapshot_content(
     if isinstance(mem, dict):
         mem = dict(mem)
         if "content" not in mem and mem.get("content_hash"):
-            mem["content"] = bodies.get(str(mem["content_hash"]), "")
+            mem["content"] = _require_blob_body(
+                bodies, str(mem["content_hash"]), label="Memory"
+            )
         out["memory"] = mem
 
     agents: list[dict[str, Any]] = []
@@ -157,14 +174,18 @@ async def hydrate_snapshot_content(
             continue
         a = dict(agent)
         if not a.get("system_prompt") and a.get("system_prompt_hash"):
-            a["system_prompt"] = bodies.get(str(a["system_prompt_hash"]), "")
+            a["system_prompt"] = _require_blob_body(
+                bodies, str(a["system_prompt_hash"]), label="system_prompt"
+            )
         skills: list[dict[str, Any]] = []
         for skill in a.get("skills") or []:
             if not isinstance(skill, dict):
                 continue
             s = dict(skill)
             if not s.get("content") and s.get("content_hash"):
-                s["content"] = bodies.get(str(s["content_hash"]), "")
+                s["content"] = _require_blob_body(
+                    bodies, str(s["content_hash"]), label="Skill"
+                )
             skills.append(s)
         a["skills"] = skills
         agents.append(a)
@@ -172,24 +193,44 @@ async def hydrate_snapshot_content(
     return out
 
 
-async def gc_orphan_content_blobs(db: AsyncSession) -> int:
+async def gc_orphan_content_blobs(
+    db: AsyncSession,
+    *,
+    min_age_seconds: float = _DEFAULT_GC_MIN_AGE_SECONDS,
+) -> int:
     """
     删除未被任何 revision 快照引用的 content_blob。
 
     仅应由后台调度 / CLI 调用，不要挂在草稿保存等写路径上。
 
-    先快照候选 hash，再收集引用，避免「新写入的 blob 落在两次查询缝隙」被误删。
+    防护：
+    - 先固定候选 hash（新建 blob 不在候选集中，不会被误删）
+    - ``min_age_seconds`` 宽限期：过新的 blob 跳过
+    - 删除前二次扫引用，缩小「判定孤儿 → 新 revision 复用同 hash」窗口
 
     Returns:
         删除行数。
     """
-    # 1) 先固定候选集合
-    hashes = list(await db.scalars(select(ContentBlob.hash)))
+    # 1) 先固定候选集合（可选宽限期）
+    if min_age_seconds > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=float(min_age_seconds))
+        hashes = list(
+            await db.scalars(
+                select(ContentBlob.hash).where(ContentBlob.created_time <= cutoff)
+            )
+        )
+    else:
+        hashes = list(await db.scalars(select(ContentBlob.hash)))
     if not hashes:
         return 0
     # 2) 再扫引用（此间新建的 blob 不在 hashes 中，不会被删）
     referenced = await collect_referenced_content_hashes(db)
     orphans = [h for h in hashes if h not in referenced]
+    if not orphans:
+        return 0
+    # 3) 删除前二次确认，避免窗口内同 hash 被新 revision 重新引用
+    referenced_again = await collect_referenced_content_hashes(db)
+    orphans = [h for h in orphans if h not in referenced_again]
     if not orphans:
         return 0
     result = await db.execute(

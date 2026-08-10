@@ -19,15 +19,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from deepagents_app.config import PROJECT_ROOT, get_settings
 from deepagents_app.db.models import AgentDefinition, Methodology, MiddlewareDefinition, ToolDefinition
 from deepagents_app.ownership import demo_methodology_id_for_user, scoped_id
-from deepagents_app.services.agents import create_agent
-from deepagents_app.services.llm_models import ensure_default_model_from_settings
-from deepagents_app.services.methodology import (
+from deepagents_app.services.catalog.agents import create_agent
+from deepagents_app.services.catalog.llm_models import ensure_default_model_from_settings
+from deepagents_app.services.catalog.methodology import (
     create_methodology,
     publish_methodology,
 )
-from deepagents_app.services.middlewares import create_middleware
-from deepagents_app.services.skills import import_skill_from_file
-from deepagents_app.services.tools import create_builtin_tool
+from deepagents_app.services.catalog.middlewares import create_middleware
+from deepagents_app.services.catalog.skills import import_skill_from_file
+from deepagents_app.services.catalog.tools import create_builtin_tool
 from deepagents_app.workspace import user_workspace_dir
 from deepagents_app.supervisor.prompts import SUPERVISOR_SYSTEM_PROMPT
 

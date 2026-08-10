@@ -3,7 +3,7 @@ FastAPI 应用工厂
 ================
 
 职责：
-- 应用启动时初始化日志、引擎、可选 Skills / content_blob GC 后台
+- 应用启动时初始化日志、引擎、可选统一 GC 后台
 - 挂载 CORS 与各业务路由
 
 HarnessProfile / general-purpose 子 Agent 在组装时按方法论显式注入，
@@ -38,20 +38,13 @@ from deepagents_app.auth import close_auth_http_client
 from deepagents_app.config import get_settings
 from deepagents_app.db.session import get_async_engine, get_async_session_factory
 from deepagents_app.factory import close_checkpointer, init_checkpointer
-from deepagents_app.services.cache_pubsub import (
+from deepagents_app.services.infra.cache_pubsub import (
     start_cache_invalidation_listener,
     stop_cache_invalidation_listener,
 )
-from deepagents_app.services.chat import close_redis_stream_slots_client
-from deepagents_app.services.content_blobs_gc_scheduler import (
-    start_content_blob_gc_scheduler,
-    stop_content_blob_gc_scheduler,
-)
-from deepagents_app.services.redis_conn import close_shared_redis
-from deepagents_app.services.skills_gc_scheduler import (
-    start_skills_gc_scheduler,
-    stop_skills_gc_scheduler,
-)
+from deepagents_app.services.runtime.chat import close_redis_stream_slots_client
+from deepagents_app.services.infra.gc import start_gc_scheduler, stop_gc_scheduler
+from deepagents_app.services.infra.redis_conn import close_shared_redis
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +82,7 @@ async def lifespan(_app: FastAPI):
     get_async_session_factory()
     await init_checkpointer(settings)
     await start_cache_invalidation_listener()
-    start_skills_gc_scheduler(settings)
-    start_content_blob_gc_scheduler(settings)
+    start_gc_scheduler(settings)
 
     logger.info(
         "DeepAgents API 已就绪（db=%s, auth_disabled=%s, cors=%s, workers=%s）",
@@ -102,8 +94,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
-        await stop_content_blob_gc_scheduler()
-        await stop_skills_gc_scheduler()
+        await stop_gc_scheduler()
         await close_shared_redis()
         await stop_cache_invalidation_listener()
         await close_redis_stream_slots_client()

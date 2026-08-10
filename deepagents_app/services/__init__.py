@@ -2,14 +2,15 @@
 业务服务层
 ==========
 
-路由一般 ``from deepagents_app.services import xxx as svc`` 引用子模块。
+按职责分子包，请直接从子包导入，例如::
 
-子模块职责一览：
-- ``methodology``   方法论 CRUD / 发布 / 勾选 Agent
-- ``revisions``      快照序列化、升版、缓存失效登记
-- ``agents``         全局 Agent CRUD 与 Tool/Middleware/Skill 绑定
-- ``tools`` / ``middlewares`` / ``skills`` / ``llm_models``  各类目录资源
-- ``agent_factory``  按方法论（live 或快照）组装 Compiled Agent
-- ``conversation``   会话创建（锁定 version）与查询
-- ``chat``           invoke / resume / 读 checkpointer 历史
+    from deepagents_app.services.catalog import agents, tools
+    from deepagents_app.services.runtime import agent_factory, chat
+    from deepagents_app.services.versioning import revisions, content_blobs
+    from deepagents_app.services.infra import gc, cache_pubsub
+
+- ``catalog``     方法论 / Agent / Tool / Skill / Middleware / LLM 目录 CRUD
+- ``runtime``     Agent 组装、会话、聊天流式
+- ``versioning``  快照、升版、content_blob、Memory
+- ``infra``       Redis、缓存失效广播、GC、周期任务
 """

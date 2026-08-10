@@ -29,8 +29,8 @@ from deepagents_app.db.models import (
 )
 from deepagents_app.ownership import default_model_id_for_user, validate_resource_id
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
-from deepagents_app.services.crud_helpers import ensure_unique_owned_name
-from deepagents_app.services.revisions import (
+from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name
+from deepagents_app.services.versioning.revisions import (
     bump_methodologies_using_agent,
     bump_methodology,
 )

@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from deepagents_app.api.schemas import ChatRequest, ChatResponse, ChatResumeRequest
 from deepagents_app.auth import get_current_user_id as require_user
 from deepagents_app.config import get_settings
-from deepagents_app.services.chat import (
+from deepagents_app.services.runtime.chat import (
     acquire_stream_slot,
     chat as run_chat,
     iter_chat_sse,
@@ -79,6 +79,7 @@ async def chat_stream(
                 thread_id=body.thread_id,
                 message=body.message,
                 prepared=prepared,
+                stream_slot=slot,
             ):
                 yield chunk
         finally:
@@ -127,6 +128,7 @@ async def chat_resume_stream(
                 thread_id=body.thread_id,
                 approve=body.approve,
                 prepared=prepared,
+                stream_slot=slot,
             ):
                 yield chunk
         finally:

@@ -28,8 +28,7 @@ from deepagents_app.api.schemas import (
     ModelUpdate,
 )
 from deepagents_app.db.session import get_async_db
-from deepagents_app.services import llm_models as models_svc
-
+from deepagents_app.services.catalog import llm_models as models_svc
 router = APIRouter(tags=["models"])
 
 

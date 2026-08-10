@@ -16,7 +16,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.config import Settings, get_settings
-from deepagents_app.services.content_blobs import ensure_content_blob
+from deepagents_app.services.versioning.content_blobs import ensure_content_blob
 
 logger = logging.getLogger(__name__)
 

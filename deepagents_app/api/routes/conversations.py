@@ -26,8 +26,8 @@ from deepagents_app.api.schemas import (
     ConversationOut,
 )
 from deepagents_app.db.session import get_async_db
-from deepagents_app.services import conversation as conversation_svc
-from deepagents_app.services.chat import get_conversation_messages as load_conversation_messages
+from deepagents_app.services.runtime import conversation as conversation_svc
+from deepagents_app.services.runtime.chat import get_conversation_messages as load_conversation_messages
 
 router = APIRouter(tags=["conversation"])
 

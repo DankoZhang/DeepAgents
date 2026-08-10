@@ -19,8 +19,8 @@ from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.db.models import AgentTool, ToolDefinition
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.ownership import validate_resource_id
-from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
-from deepagents_app.services.revisions import (
+from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.versioning.revisions import (
     refresh_methodologies_for_agent_ids,
     refresh_methodologies_using_resource,
 )
@@ -28,9 +28,9 @@ from deepagents_app.utils.mcp_safety import validate_mcp_config
 
 
 def _invalidate_mcp_cache(tool_id: str) -> None:
-    from deepagents_app.registries.tools import clear_mcp_tools_cache
+    from deepagents_app.registries.tools import invalidate_mcp_tools_cache
 
-    clear_mcp_tools_cache(tool_id=tool_id)
+    invalidate_mcp_tools_cache(tool_id=tool_id)
 
 
 async def list_tools(

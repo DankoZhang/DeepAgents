@@ -23,8 +23,8 @@ from deepagents_app.db.loading import methodology_with_agents_options
 from deepagents_app.db.models import AgentDefinition, Conversation, Methodology
 from deepagents_app.ownership import validate_resource_id
 from deepagents_app.db.pagination import DEFAULT_LIMIT, coerce_datetime, page_rows
-from deepagents_app.services.crud_helpers import ensure_unique_owned_name
-from deepagents_app.services.revisions import (
+from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name
+from deepagents_app.services.versioning.revisions import (
     bump_methodology,
     list_revisions,
     schedule_cache_invalidation,
@@ -228,8 +228,8 @@ async def bind_methodology_agents(
 async def publish_methodology(
     db: AsyncSession, methodology_id: str, *, owner_user_id: str
 ) -> Methodology:
-    """发布：勾选的 Agent 中须恰好一个 Supervisor；发布后才能建会话。"""
-    from deepagents_app.services.roles import require_single_supervisor
+    """发布：enabled Agent 中须恰好一个 Supervisor（与组装口径一致）；发布后才能建会话。"""
+    from deepagents_app.services.catalog.roles import require_single_supervisor
 
     row = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
@@ -239,6 +239,7 @@ async def publish_methodology(
         context="发布失败",
         role_of=lambda a: str((a.config or {}).get("role") or "subagent").lower(),
         name_of=lambda a: a.name,
+        enabled_of=lambda a: bool((a.config or {}).get("enabled", True)),
     )
     row.status = "published"
     row.updated_time = datetime.now(timezone.utc)

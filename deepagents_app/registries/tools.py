@@ -5,6 +5,7 @@ Tool Registry
 - builtin：按 class_path 动态 import
 - mcp：按 config 连接 MCP Server，展开为 LangChain tools
 - mcp 工具列表按 tool_id+config 指纹进程内缓存，避免每次组装都重连
+- 配置变更经 Redis pub/sub 跨 worker 失效（见 ``invalidate_mcp_tools_cache``）
 - MCP 加载走当前事件循环的 async 路径（不再使用常驻后台 loop）
 """
 
@@ -68,12 +69,26 @@ def _mcp_config_fingerprint(tool_def: ToolDefinition) -> str:
 
 
 def clear_mcp_tools_cache(*, tool_id: str | None = None) -> None:
-    """清除 MCP 工具缓存；``tool_id`` 为空则清空全部。"""
+    """仅清除本进程 MCP 工具缓存；``tool_id`` 为空则清空全部。"""
     with _mcp_tools_lock:
         if tool_id is None:
             _mcp_tools_cache.clear()
             return
         _mcp_tools_cache.pop(tool_id, None)
+
+
+def invalidate_mcp_tools_cache(*, tool_id: str | None = None) -> None:
+    """本进程清除后，经 Redis pub/sub 通知其他 worker。"""
+    clear_mcp_tools_cache(tool_id=tool_id)
+    try:
+        from deepagents_app.services.infra.cache_pubsub import publish_mcp_cache_invalidation
+
+        publish_mcp_cache_invalidation(
+            tool_id=tool_id,
+            all_keys=tool_id is None,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("广播 MCP 缓存失效失败", exc_info=True)
 
 
 async def _aload_mcp_tools(tool_def: ToolDefinition) -> list[Any]:

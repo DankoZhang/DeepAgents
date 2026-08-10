@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from deepagents_app.db.models import MiddlewareDefinition
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.ownership import validate_resource_id
-from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
 
 
 async def list_middlewares(

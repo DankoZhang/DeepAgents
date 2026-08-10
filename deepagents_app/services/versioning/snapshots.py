@@ -21,8 +21,8 @@ from deepagents_app.db.models import (
     SkillDefinition,
     ToolDefinition,
 )
-from deepagents_app.services.content_blobs import ensure_content_blob
-from deepagents_app.services.llm_models import serialize_model_for_snapshot
+from deepagents_app.services.versioning.content_blobs import ensure_content_blob
+from deepagents_app.services.catalog.llm_models import serialize_model_for_snapshot
 
 
 def serialize_tool_for_snapshot(row: ToolDefinition) -> dict[str, Any]:

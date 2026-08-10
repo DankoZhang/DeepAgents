@@ -34,7 +34,7 @@ from deepagents_app.db.models import (
     MethodologyAgent,
     MethodologyRevision,
 )
-from deepagents_app.services.snapshots import serialize_agent_for_snapshot
+from deepagents_app.services.versioning.snapshots import serialize_agent_for_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ async def serialize_methodology(
         if "agents" in state.unloaded:
             methodology = await _load_methodology_for_snapshot(db, methodology.id)
 
-    from deepagents_app.services.memory import memory_payload_for_snapshot_async
+    from deepagents_app.services.versioning.memory import memory_payload_for_snapshot_async
 
     return {
         "id": methodology.id,
@@ -201,7 +201,7 @@ def schedule_cache_invalidation(
 
 def flush_cache_invalidations(db: AsyncSession) -> None:
     """在 Session commit 成功后调用：按登记清空 Agent 缓存并广播。"""
-    from deepagents_app.services.agent_factory import invalidate_agent_cache
+    from deepagents_app.services.runtime.agent_factory import invalidate_agent_cache
 
     info = db.info
     if info.pop("invalidate_agent_cache_all", False):

@@ -21,8 +21,7 @@ from deepagents_app.api.pagination import (
 )
 from deepagents_app.api.schemas import MiddlewareOut
 from deepagents_app.db.session import get_async_db
-from deepagents_app.services import middlewares as mw_svc
-
+from deepagents_app.services.catalog import middlewares as mw_svc
 router = APIRouter(tags=["middlewares"])
 
 

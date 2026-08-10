@@ -6,7 +6,7 @@
 
 - FastAPI 配置与会话 API（同步聊天 + SSE）
 - PostgreSQL：方法论 / Agent / Tool / Skill / Middleware / 模型目录（按用户隔离）
-- Redis Stack：LangGraph checkpoint、Agent 缓存跨 worker 失效、多 worker 下 SSE 全局限流
+- Redis Stack：LangGraph checkpoint、Agent / MCP 缓存跨 worker 失效、多 worker 下 SSE 全局限流
 - 按方法论动态 `create_deep_agent()` + 进程内 LRU；多进程经 Redis pub/sub 失效
 - 方法论版本快照（旧会话锁定创建时版本）
 - Skills 入库，组装时按内容指纹物化到 `workspace/users/<scope>/skills/`
@@ -158,17 +158,17 @@ python -m pytest tests/ -q
 
 ## 运行时维护
 
-Skills / content_blob 物化与快照正文按内容寻址，可手动或后台 GC：
+Skills / content_blob 物化与快照正文按内容寻址，统一经 `services.infra.gc` 手动或后台清理：
 
 ```bash
-python -m deepagents_app.services.skills_gc
-python -m deepagents_app.services.skills_gc --max-age-days 7
-python -m deepagents_app.services.content_blobs_gc
+python -m deepagents_app.services.infra.gc
+python -m deepagents_app.services.infra.gc skills --max-age-days 7
+python -m deepagents_app.services.infra.gc blobs
 ```
 
-`SKILLS_GC_INTERVAL_HOURS` / `CONTENT_BLOB_GC_INTERVAL_HOURS`（默认 24）控制 API 进程内后台任务；`0` 表示仅手动。
+`SKILLS_GC_INTERVAL_HOURS` / `CONTENT_BLOB_GC_INTERVAL_HOURS`（默认 24）控制 API 内**同一个**后台 PeriodicTask；某项为 `0` 则后台跳过该项（仍可 CLI 手动）。
 
-两个间隔都是**全集群**语义。调度器在每个 worker 都会启动，但每轮执行前先用 `SET NX EX` 抢一把 Redis 锁（key 为 `deepagents:gc:skills` / `deepagents:gc:content_blob`，TTL 为间隔的 0.9 倍），同一窗口内只有一个进程真正执行清理，因此 `API_WORKERS` 调大不会让 GC 频率跟着放大。Redis 不可用时本轮直接跳过并记警告。
+间隔是**全集群**语义：每个 worker 都会挂调度器，但 Skills / blob 各用一把 Redis 锁（`deepagents:gc:skills` / `deepagents:gc:content_blob`，TTL 为该项间隔的 0.9 倍），同一窗口内只有一个进程真正执行。Redis 不可用时本轮跳过并记警告。
 
 ---
 
@@ -199,7 +199,11 @@ DeepAgents/
 │   ├── api/                # 路由与 schemas
 │   ├── auth.py
 │   ├── db/                 # ORM / session / seed / migrate
-│   ├── services/           # 业务、Agent Factory、cache pub/sub、GC
+│   ├── services/           # 业务分层：catalog / runtime / versioning / infra
+│   │   ├── catalog/        # 方法论、Agent、Tool、Skill 等目录 CRUD
+│   │   ├── runtime/        # Agent Factory、会话、聊天
+│   │   ├── versioning/     # 快照、升版、content_blob、Memory
+│   │   └── infra/          # Redis、cache pub/sub、GC
 │   ├── registries/         # Tool / Middleware 加载
 │   ├── tools/ · middleware/ · prompts/
 │   └── factory.py          # checkpointer / permissions / GP 子 Agent

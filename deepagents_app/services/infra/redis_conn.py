@@ -5,7 +5,7 @@
 进程内单例的 ``redis.asyncio`` 客户端，供不需要独立连接参数的轻量用途复用
 （当前：GC 调度器的全局单飞锁）。
 
-流式限流（``services.chat``）与缓存失效广播（``services.cache_pubsub``）目前
+流式限流（``services.chat``）与缓存失效广播（``services.cache_pubsub``：Agent / MCP）目前
 各自维护客户端，后续可迁移到本模块统一管理。
 """
 

@@ -30,8 +30,8 @@ from deepagents_app.config import Settings
 from deepagents_app.db.models import AgentSkill, SkillDefinition
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.ownership import validate_resource_id
-from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
-from deepagents_app.services.revisions import (
+from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.versioning.revisions import (
     bump_methodologies_for_agent_ids,
     refresh_methodologies_for_agent_ids,
     refresh_methodologies_using_resource,
@@ -336,6 +336,48 @@ def materialize_agent_skills(
         raise
 
     return virtual
+
+
+def materialized_skills_dir_from_virtual(
+    workspace_root: Path, virtual_path: str
+) -> Path | None:
+    """
+    将 ``/skills/<scope>/<agent_id>/`` 映射为工作区内的物化目录。
+
+    非法或越界路径返回 None（调用方跳过 touch，不影响聊天）。
+    """
+    text = (virtual_path or "").strip().strip("/")
+    parts = [p for p in text.split("/") if p]
+    if len(parts) < 3 or parts[0] != "skills":
+        return None
+    scope, agent_id = parts[1], parts[2]
+    try:
+        _assert_safe_path_segment(scope, label="skills scope")
+        _assert_safe_path_segment(agent_id, label="agent id")
+        base = (workspace_root / "skills").resolve()
+        return resolve_under_root(base, f"{scope}/{agent_id}")
+    except (BusinessError, ValueError, OSError) as exc:
+        logger.debug("解析 Skills 物化路径失败 virtual=%r: %s", virtual_path, exc)
+        return None
+
+
+def touch_materialized_skills_complete(roots: Sequence[Path]) -> int:
+    """
+    刷新物化目录上的 ``.complete`` mtime，供 GC 判断「近期仍在用」。
+
+    Agent LRU 命中时调用，避免长期缓存命中导致目录被误删。
+    """
+    touched = 0
+    for root in roots:
+        marker = Path(root) / _COMPLETE_MARKER
+        if not marker.is_file():
+            continue
+        try:
+            marker.touch()
+            touched += 1
+        except OSError as exc:
+            logger.debug("刷新 Skills .complete mtime 失败：%s", exc)
+    return touched
 
 
 def _write_skills_tree(root: Path, skills: Sequence[SkillDefinition]) -> None:

@@ -1,9 +1,11 @@
 """
-跨 worker Agent 缓存失效广播
-============================
+跨 worker 缓存失效广播
+======================
 
-本进程 ``invalidate_agent_cache`` 后，通过 Redis pub/sub 通知其他 worker
-执行本地失效，避免 draft 同 version 覆盖后他机仍命中旧编译体。
+本进程清缓存后，经 Redis pub/sub 通知其他 worker 执行本地失效：
+
+- Agent 编译 LRU（draft 同 version 覆盖后他机勿命中旧编译体）
+- MCP 工具列表（改连接配置后他机勿复用旧展开结果）
 """
 
 from __future__ import annotations
@@ -16,7 +18,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-CHANNEL = "deepagents:agent_cache_invalidate"
+AGENT_CHANNEL = "deepagents:agent_cache_invalidate"
+MCP_CHANNEL = "deepagents:mcp_cache_invalidate"
+# 旧名兼容（仅文档/外部引用）；逻辑统一用 AGENT_CHANNEL
+CHANNEL = AGENT_CHANNEL
+
 _WORKER_ID = uuid.uuid4().hex
 
 _listener_task: asyncio.Task[None] | None = None
@@ -26,8 +32,8 @@ _publish_lock = asyncio.Lock()
 _publish_tasks: set[asyncio.Task[None]] = set()
 
 
-def _apply_local(payload: dict[str, Any]) -> None:
-    from deepagents_app.services.agent_factory import invalidate_agent_cache_local
+def _apply_agent_local(payload: dict[str, Any]) -> None:
+    from deepagents_app.services.runtime.agent_factory import invalidate_agent_cache_local
 
     if payload.get("all"):
         invalidate_agent_cache_local()
@@ -42,7 +48,25 @@ def _apply_local(payload: dict[str, Any]) -> None:
     )
 
 
-async def _apublish(payload: dict[str, Any]) -> None:
+def _apply_mcp_local(payload: dict[str, Any]) -> None:
+    from deepagents_app.registries.tools import clear_mcp_tools_cache
+
+    if payload.get("all"):
+        clear_mcp_tools_cache()
+        return
+    tool_id = payload.get("tool_id")
+    clear_mcp_tools_cache(tool_id=tool_id if isinstance(tool_id, str) else None)
+
+
+def _apply_message(channel: str, payload: dict[str, Any]) -> None:
+    if channel == MCP_CHANNEL:
+        _apply_mcp_local(payload)
+        return
+    # 默认按 Agent 频道处理（含未知/旧消息）
+    _apply_agent_local(payload)
+
+
+async def _apublish(channel: str, payload: dict[str, Any]) -> None:
     """异步发布；失败只打日志。"""
     global _publish_client
     try:
@@ -58,9 +82,9 @@ async def _apublish(payload: dict[str, Any]) -> None:
                     socket_timeout=1.5,
                 )
             client = _publish_client
-        await client.publish(CHANNEL, json.dumps(payload, ensure_ascii=False))
+        await client.publish(channel, json.dumps(payload, ensure_ascii=False))
     except Exception as exc:  # noqa: BLE001
-        logger.warning("广播 Agent 缓存失效失败: %s", exc)
+        logger.warning("广播缓存失效失败 channel=%s: %s", channel, exc)
 
 
 def _track_publish_task(task: asyncio.Task[None]) -> None:
@@ -68,37 +92,23 @@ def _track_publish_task(task: asyncio.Task[None]) -> None:
     task.add_done_callback(_publish_tasks.discard)
 
 
-def publish_cache_invalidation(
-    *,
-    methodology_id: str | None = None,
-    version: int | None = None,
-    owner_user_id: str | None = None,
-    all_keys: bool = False,
-) -> None:
+def _publish(channel: str, payload: dict[str, Any], *, task_name: str) -> None:
     """
     尽力向 Redis 广播；不阻塞调用方。
 
     有运行中的 loop 时 ``create_task`` 异步发布（登记 in-flight，shutdown 会 join）；
     否则同步尽力发布（测试/CLI）。
     """
-    payload = {
-        "worker_id": _WORKER_ID,
-        "all": bool(all_keys or methodology_id is None),
-        "methodology_id": methodology_id,
-        "version": version,
-        "owner_user_id": owner_user_id,
-    }
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
 
     if loop is not None and loop.is_running():
-        task = loop.create_task(_apublish(payload), name="agent-cache-publish")
+        task = loop.create_task(_apublish(channel, payload), name=task_name)
         _track_publish_task(task)
         return
 
-    # 无事件循环（极少）：同步客户端兜底
     try:
         import redis
 
@@ -110,11 +120,43 @@ def publish_cache_invalidation(
             socket_timeout=1.5,
         )
         try:
-            client.publish(CHANNEL, json.dumps(payload, ensure_ascii=False))
+            client.publish(channel, json.dumps(payload, ensure_ascii=False))
         finally:
             client.close()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("广播 Agent 缓存失效失败: %s", exc)
+        logger.warning("广播缓存失效失败 channel=%s: %s", channel, exc)
+
+
+def publish_cache_invalidation(
+    *,
+    methodology_id: str | None = None,
+    version: int | None = None,
+    owner_user_id: str | None = None,
+    all_keys: bool = False,
+) -> None:
+    """广播 Agent 编译缓存失效。"""
+    payload = {
+        "worker_id": _WORKER_ID,
+        "all": bool(all_keys or methodology_id is None),
+        "methodology_id": methodology_id,
+        "version": version,
+        "owner_user_id": owner_user_id,
+    }
+    _publish(AGENT_CHANNEL, payload, task_name="agent-cache-publish")
+
+
+def publish_mcp_cache_invalidation(
+    *,
+    tool_id: str | None = None,
+    all_keys: bool = False,
+) -> None:
+    """广播 MCP 工具列表缓存失效。"""
+    payload = {
+        "worker_id": _WORKER_ID,
+        "all": bool(all_keys or tool_id is None),
+        "tool_id": tool_id,
+    }
+    _publish(MCP_CHANNEL, payload, task_name="mcp-cache-publish")
 
 
 async def close_cache_invalidation_publisher() -> None:
@@ -132,8 +174,14 @@ async def close_cache_invalidation_publisher() -> None:
             logger.debug("关闭 cache invalidate publisher 失败", exc_info=True)
 
 
+def _decode_channel(raw: Any) -> str:
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw) if raw is not None else ""
+
+
 async def start_cache_invalidation_listener() -> None:
-    """在 lifespan 内启动后台订阅任务。"""
+    """在 lifespan 内启动后台订阅任务（Agent + MCP）。"""
     global _listener_task, _listener_stop
     if _listener_task is not None and not _listener_task.done():
         return
@@ -152,8 +200,10 @@ async def start_cache_invalidation_listener() -> None:
             try:
                 client = aioredis.from_url(url, socket_connect_timeout=1.5)
                 pubsub = client.pubsub()
-                await pubsub.subscribe(CHANNEL)
-                logger.info("已订阅 Agent 缓存失效频道 %s", CHANNEL)
+                await pubsub.subscribe(AGENT_CHANNEL, MCP_CHANNEL)
+                logger.info(
+                    "已订阅缓存失效频道 %s, %s", AGENT_CHANNEL, MCP_CHANNEL
+                )
                 while not stop.is_set():
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True, timeout=1.0
@@ -161,6 +211,7 @@ async def start_cache_invalidation_listener() -> None:
                     if message is None:
                         await asyncio.sleep(0.05)
                         continue
+                    channel = _decode_channel(message.get("channel"))
                     raw = message.get("data")
                     if isinstance(raw, bytes):
                         raw = raw.decode("utf-8", errors="replace")
@@ -174,7 +225,7 @@ async def start_cache_invalidation_listener() -> None:
                         continue
                     if payload.get("worker_id") == _WORKER_ID:
                         continue
-                    _apply_local(payload)
+                    _apply_message(channel, payload)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -183,7 +234,7 @@ async def start_cache_invalidation_listener() -> None:
             finally:
                 if pubsub is not None:
                     try:
-                        await pubsub.unsubscribe(CHANNEL)
+                        await pubsub.unsubscribe(AGENT_CHANNEL, MCP_CHANNEL)
                         await pubsub.aclose()
                     except Exception:  # noqa: BLE001
                         pass
@@ -193,7 +244,7 @@ async def start_cache_invalidation_listener() -> None:
                     except Exception:  # noqa: BLE001
                         pass
 
-    _listener_task = asyncio.create_task(_run(), name="agent-cache-invalidate")
+    _listener_task = asyncio.create_task(_run(), name="cache-invalidate")
 
 
 async def stop_cache_invalidation_listener() -> None:

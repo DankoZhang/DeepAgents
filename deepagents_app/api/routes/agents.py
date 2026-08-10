@@ -28,8 +28,7 @@ from deepagents_app.api.schemas import (
     AgentUpdate,
 )
 from deepagents_app.db.session import get_async_db
-from deepagents_app.services import agents as agents_svc
-
+from deepagents_app.services.catalog import agents as agents_svc
 router = APIRouter(tags=["agents"])
 
 

@@ -116,11 +116,10 @@ class Settings(BaseSettings):
     skills_gc_max_age_days: float = Field(default=14.0, ge=0, le=3650)
     # Skills 物化 GC：残留临时目录超过该小时数则删除
     skills_gc_tmp_max_age_hours: float = Field(default=1.0, ge=0.01, le=720)
-    # Skills GC 后台间隔（小时）；0=不启动后台任务（可用模块 CLI）
-    # 全集群语义：每个 worker 都起调度器，但同一窗口内只有抢到 Redis 锁的进程真跑
+    # Skills GC 间隔（小时）；0=后台不跑 Skills（可用 ``python -m deepagents_app.services.infra.gc``）
+    # 与 content_blob 共用一个 PeriodicTask；各自 Redis 单飞，不随 API_WORKERS 放大
     skills_gc_interval_hours: float = Field(default=24.0, ge=0, le=720)
-    # content_blob 孤儿 GC 后台间隔（小时）；0=不启动（可用模块 CLI）
-    # 同样是全集群语义，不随 API_WORKERS 放大
+    # content_blob 孤儿 GC 间隔（小时）；0=后台不跑 blob
     content_blob_gc_interval_hours: float = Field(default=24.0, ge=0, le=720)
     # Fernet 密钥（url-safe base64）或任意口令；用于加密模型 api_key
     # 生产必须设置；未设置且未允许 insecure 时启动/加密会失败

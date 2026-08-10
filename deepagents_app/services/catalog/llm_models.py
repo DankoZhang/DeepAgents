@@ -27,7 +27,7 @@ from deepagents_app.llm import build_chat_model, model_spec_from_row
 from deepagents_app.ownership import default_model_id_for_user, validate_resource_id
 from deepagents_app.utils.text import normalize_message_content
 from deepagents_app.utils.url_safety import assert_safe_http_url
-from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +203,7 @@ async def update_model(
     await db.flush()
 
     if bump_related:
-        from deepagents_app.services.revisions import bump_methodologies_using_model
+        from deepagents_app.services.versioning.revisions import bump_methodologies_using_model
 
         await bump_methodologies_using_model(db, model_id)
     return row

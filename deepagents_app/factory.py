@@ -5,7 +5,7 @@ Deep Agent 共享组装工具
 供 ``agent_factory`` 复用的底层能力：
 checkpointer / HITL / permissions / general-purpose 子 Agent 规格。
 
-方法论驱动的完整 Agent 组装见 ``deepagents_app.services.agent_factory``。
+方法论驱动的完整 Agent 组装见 ``deepagents_app.services.runtime.agent_factory``。
 HarnessProfile **不再**全局注册：按方法论在组装时显式注入 ``general-purpose`` 子 Agent。
 """
 

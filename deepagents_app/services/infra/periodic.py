@@ -66,7 +66,7 @@ def single_flight(key: str, ttl_s: float, tick: Tick) -> Tick:
     """
 
     async def _guarded() -> None:
-        from deepagents_app.services.redis_conn import get_shared_redis
+        from deepagents_app.services.infra.redis_conn import get_shared_redis
 
         ttl = max(1, int(ttl_s))
         token = f"{_WORKER_ID}:{uuid.uuid4().hex}"

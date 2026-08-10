@@ -31,6 +31,7 @@ import asyncio
 import logging
 import threading
 from collections import OrderedDict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -55,17 +56,19 @@ from deepagents_app.registries.tools import (
     interrupt_tool_names_from_payloads,
     load_tools_from_snapshots,
 )
-from deepagents_app.services.llm_models import resolve_model_spec_for_agent
-from deepagents_app.services.memory import (
+from deepagents_app.services.catalog.llm_models import resolve_model_spec_for_agent
+from deepagents_app.services.versioning.memory import (
     materialize_versioned_memory,
     read_project_memory,
 )
-from deepagents_app.services.revisions import get_revision
-from deepagents_app.services.content_blobs import hydrate_snapshot_content
-from deepagents_app.services.snapshots import serialize_agent_for_live
-from deepagents_app.services.skills import (
+from deepagents_app.services.versioning.revisions import get_revision
+from deepagents_app.services.versioning.content_blobs import hydrate_snapshot_content
+from deepagents_app.services.versioning.snapshots import serialize_agent_for_live
+from deepagents_app.services.catalog.skills import (
     load_skills_from_snapshots,
     materialize_agent_skills,
+    materialized_skills_dir_from_virtual,
+    touch_materialized_skills_complete,
 )
 from deepagents_app.workspace import (
     user_workspace_dir,
@@ -77,6 +80,8 @@ logger = logging.getLogger(__name__)
 # ── 进程内缓存（跨 worker 靠 Redis pub/sub 失效）──────────────────────
 # OrderedDict：命中 move_to_end，满则从头部 pop → LRU
 _cache: OrderedDict[str, Any] = OrderedDict()
+# 与 _cache 同 key：该编译体依赖的 Skills 物化目录（供命中时 touch .complete）
+_cache_skill_roots: dict[str, tuple[Path, ...]] = {}
 _cache_lock = threading.Lock()
 # 同一 cache key 并发 miss 时只组装一次（必须用 asyncio.Lock，不可 threading.Lock 包 await）
 _build_locks: dict[str, asyncio.Lock] = {}
@@ -142,20 +147,50 @@ def _cache_get(key: str) -> Any | None:
         return _cache[key]
 
 
-def _cache_put(key: str, value: Any) -> list[str]:
+def _cache_skill_roots_for(key: str) -> tuple[Path, ...]:
+    with _cache_lock:
+        return _cache_skill_roots.get(key, ())
+
+
+async def _cache_hit(key: str) -> Any | None:
+    """
+    命中缓存则返回编译体，并刷新关联 Skills ``.complete`` mtime。
+
+    长期 LRU 命中若不 touch，GC 会按过期 mtime 删掉仍在用的物化目录。
+    """
+    cached = _cache_get(key)
+    if cached is None:
+        return None
+    roots = _cache_skill_roots_for(key)
+    if roots:
+        await asyncio.to_thread(touch_materialized_skills_complete, roots)
+    logger.info("命中 Agent 缓存：%s", key)
+    return cached
+
+
+def _cache_put(
+    key: str,
+    value: Any,
+    *,
+    skill_roots: Sequence[Path] | None = None,
+) -> list[str]:
     """写入缓存；若超额则按 LRU 淘汰，返回被淘汰的 key 列表。"""
     maxsize = _cache_max_size()
     evicted: list[str] = []
+    roots = tuple(skill_roots or ())
     with _cache_lock:
         if key in _cache:
             _cache.move_to_end(key)
             _cache[key] = value
+            _cache_skill_roots[key] = roots
             return evicted
         # popitem(last=False)：弹出最久未使用的项
         while len(_cache) >= maxsize:
             old_key, _ = _cache.popitem(last=False)
+            _cache_skill_roots.pop(old_key, None)
             evicted.append(old_key)
         _cache[key] = value
+        _cache_skill_roots[key] = roots
     return evicted
 
 
@@ -178,21 +213,25 @@ def invalidate_agent_cache_local(
         if methodology_id is None:
             keys = list(_cache.keys())
             _cache.clear()
+            _cache_skill_roots.clear()
         elif version is not None:
             if owner_user_id is not None:
                 key = cache_key(owner_user_id, methodology_id, version)
                 _cache.pop(key, None)
+                _cache_skill_roots.pop(key, None)
                 keys = [key]
             else:
                 suffix = f":{methodology_id}:v{version}"
                 keys = [k for k in list(_cache) if k.endswith(suffix)]
                 for k in keys:
                     del _cache[k]
+                    _cache_skill_roots.pop(k, None)
         else:
             needle = f":{methodology_id}:v"
             keys = [k for k in list(_cache) if needle in k]
             for k in keys:
                 del _cache[k]
+                _cache_skill_roots.pop(k, None)
 
     for key in keys:
         _drop_build_lock(key)
@@ -212,7 +251,7 @@ def invalidate_agent_cache(
         owner_user_id=owner_user_id,
     )
     try:
-        from deepagents_app.services.cache_pubsub import publish_cache_invalidation
+        from deepagents_app.services.infra.cache_pubsub import publish_cache_invalidation
 
         publish_cache_invalidation(
             methodology_id=methodology_id,
@@ -447,15 +486,15 @@ def _split_roles(
     *,
     context: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """过滤 enabled，拆出 Supervisor 与 SubAgents；无 Supervisor 则无法组装。"""
-    from deepagents_app.services.roles import require_single_supervisor
+    """过滤 enabled，拆出 Supervisor 与 SubAgents（与 publish 共用 roles 口径）。"""
+    from deepagents_app.services.catalog.roles import require_single_supervisor
 
-    enabled = [a for a in agents if _agent_enabled(a)]
     return require_single_supervisor(
-        enabled,
+        agents,
         context=context,
         role_of=_agent_role,
         name_of=lambda a: str(a.get("name") or a.get("id") or "?"),
+        enabled_of=_agent_enabled,
     )
 
 
@@ -472,11 +511,12 @@ async def _compile_from_agents(
     source: str,
     owner_user_id: str,
     memory_content: str | None = None,
-) -> Any:
+) -> tuple[Any, list[Path]]:
     """
     统一组装入口：live ORM / snapshot dict 在此归一后走同一条路径。
 
     仅在缓存未命中、需要真正 ``create_deep_agent`` 时调用（非每条聊天）。
+    返回 ``(compiled_agent, skills_materialize_roots)``，供 LRU 命中时续租约。
     """
     from deepagents import create_deep_agent
 
@@ -576,6 +616,18 @@ async def _compile_from_agents(
             return create_deep_agent(**kwargs), memory_virtual
 
         agent, memory_virtual = await asyncio.to_thread(_materialize_and_create)
+        skill_virtuals: list[str] = []
+        if skills_path:
+            skill_virtuals.append(skills_path)
+        for spec in subagents:
+            for vp in spec.get("skills") or []:
+                if isinstance(vp, str) and vp:
+                    skill_virtuals.append(vp)
+        skill_roots: list[Path] = []
+        for vp in skill_virtuals:
+            root = materialized_skills_dir_from_virtual(workspace_root, vp)
+            if root is not None:
+                skill_roots.append(root)
         logger.info(
             "动态组装 Agent（%s）：methodology=%s v%s user_ws=%s "
             "supervisor=%s subagents=%s memory=%s",
@@ -587,14 +639,14 @@ async def _compile_from_agents(
             [s["name"] for s in subagents],
             memory_virtual,
         )
-        return agent
+        return agent, skill_roots
 
 
 async def _build_from_live(
     db: AsyncSession,
     methodology: Methodology,
     settings: Settings,
-) -> Any:
+) -> tuple[Any, list[Path]]:
     """从当前 live 表组装 Agent（会话版本 == 方法论当前 version）。"""
     return await _compile_from_agents(
         db,
@@ -615,7 +667,7 @@ async def _build_from_snapshot(
     settings: Settings,
     *,
     owner_user_id: str,
-) -> Any:
+) -> tuple[Any, list[Path]]:
     """从 MethodologyRevision 快照组装 Agent（旧会话锁定的历史版本）。"""
     revision = await get_revision(db, methodology_id, version)
     if revision is None:
@@ -653,9 +705,9 @@ async def _build_and_cache(
 ) -> Any:
     """按 live / snapshot 组装；成功后统一写入 LRU 缓存。"""
     if version == methodology.version:
-        agent = await _build_from_live(db, methodology, settings)
+        agent, skill_roots = await _build_from_live(db, methodology, settings)
     else:
-        agent = await _build_from_snapshot(
+        agent, skill_roots = await _build_from_snapshot(
             db,
             methodology.id,
             version,
@@ -663,7 +715,7 @@ async def _build_and_cache(
             owner_user_id=owner_user_id,
         )
     if use_cache:
-        for evicted in _cache_put(key, agent):
+        for evicted in _cache_put(key, agent, skill_roots=skill_roots):
             logger.info("Agent 缓存 LRU 淘汰：%s", evicted)
             _drop_build_lock(evicted)
     return agent
@@ -699,9 +751,8 @@ async def build_agent_from_methodology(
     # 调用方已带齐缓存键（典型 prepare_chat）：先查缓存，命中则不做 DB 查询
     if use_cache and owner_user_id is not None and version is not None:
         key = cache_key(owner_user_id, methodology_id, version)
-        cached = _cache_get(key)
+        cached = await _cache_hit(key)
         if cached is not None:
-            logger.info("命中 Agent 缓存：%s", key)
             return cached
         owner = owner_user_id
         target_version = version
@@ -715,18 +766,16 @@ async def build_agent_from_methodology(
         target_version = version if version is not None else methodology.version
         key = cache_key(owner, methodology.id, target_version)
         if use_cache:
-            cached = _cache_get(key)
+            cached = await _cache_hit(key)
             if cached is not None:
-                logger.info("命中 Agent 缓存：%s", key)
                 return cached
 
     # 按 key 加锁：缓存 miss 时同进程并发请求只组装一次
     try:
         async with _build_lock_for(key):
             if use_cache:
-                cached = _cache_get(key)
+                cached = await _cache_hit(key)
                 if cached is not None:
-                    logger.info("命中 Agent 缓存：%s", key)
                     return cached
 
             if methodology is None:

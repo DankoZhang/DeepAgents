@@ -29,16 +29,16 @@ from deepagents_app.config import Settings, get_settings
 from deepagents_app.db.session import get_async_session_factory
 from deepagents_app.factory import build_checkpointer
 from deepagents_app.ownership import checkpoint_thread_id
-from deepagents_app.services.agent_factory import build_agent_from_methodology
-from deepagents_app.services.conversation import get_conversation_by_thread
-from deepagents_app.services.message_serde import (
+from deepagents_app.services.runtime.agent_factory import build_agent_from_methodology
+from deepagents_app.services.runtime.conversation import get_conversation_by_thread
+from deepagents_app.services.runtime.message_serde import (
     extract_final_text,
     msg_role as _msg_role,
     serialize_interrupts,
     serialize_messages,
     tool_calls_payload as _tool_calls_payload,
 )
-from deepagents_app.services.stream_limiter import (
+from deepagents_app.services.runtime.stream_limiter import (
     acquire_stream_slot,
     close_redis_stream_slots_client,
     release_stream_slot,
@@ -131,7 +131,7 @@ async def prepare_chat(
             settings=settings,
         )
         await db.commit()
-        from deepagents_app.services.revisions import flush_cache_invalidations
+        from deepagents_app.services.versioning.revisions import flush_cache_invalidations
 
         flush_cache_invalidations(db)
         return PreparedChat(
@@ -270,11 +270,12 @@ async def _aiter_sse(
     *,
     meta: dict[str, Any],
     log_label: str,
+    stream_slot: Any | None = None,
 ) -> AsyncIterator[str]:
     """SSE 共用内核：meta → 事件* → done | error（执行期无 DB）；空闲发 ping。
 
     路由应先 ``prepare_chat``，再 ``acquire_stream_slot``，最后进入本函数，
-    避免冷编译占用流式并发槽。
+    避免冷编译占用流式并发槽。``stream_slot`` 若提供，则在 ping 时续租。
     """
     yield _sse("meta", meta)
     logger.info(
@@ -303,6 +304,11 @@ async def _aiter_sse(
                 )
                 if not done:
                     # 超时不取消 next_task，心跳后继续等同一任务
+                    if stream_slot is not None:
+                        renew = getattr(stream_slot, "renew", None)
+                        if callable(renew):
+                            with suppress(Exception):
+                                await renew()
                     yield _sse("ping", {"ok": True})
                     continue
                 try:
@@ -386,10 +392,12 @@ async def iter_chat_sse(
     thread_id: str,
     message: str,
     prepared: PreparedChat | None = None,
+    stream_slot: Any | None = None,
 ) -> AsyncIterator[str]:
     """SSE：组装阶段独占短事务；流式阶段不再持有 Session。
 
     路由可先 ``prepare_chat`` 再抢槽，将结果作为 ``prepared`` 传入，避免重复组装。
+    ``stream_slot`` 用于 Redis 租约在 ping 时续期。
     """
     settings = get_settings()
     validate_chat_message(message, settings)
@@ -406,6 +414,7 @@ async def iter_chat_sse(
             "methodology_version": prepared.methodology_version,
         },
         log_label="chat stream",
+        stream_slot=stream_slot,
     ):
         yield chunk
 
@@ -465,6 +474,7 @@ async def iter_resume_sse(
     thread_id: str,
     approve: bool = True,
     prepared: PreparedChat | None = None,
+    stream_slot: Any | None = None,
 ) -> AsyncIterator[str]:
     """HITL 恢复的 SSE：组装后释放 DB，再 ``astream``。
 
@@ -483,6 +493,7 @@ async def iter_resume_sse(
             "decision": decision_type,
         },
         log_label="chat resume stream",
+        stream_slot=stream_slot,
     ):
         yield chunk
 

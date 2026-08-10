@@ -340,8 +340,7 @@ def test_draft_agent_edit_does_not_bump_version(client):
 def test_agent_cache_lru_evicts_and_drops_build_lock(tmp_path, monkeypatch):
     """缓存超额时按 LRU 淘汰，并释放对应构建锁。"""
     from deepagents_app import config
-    from deepagents_app.services import agent_factory as af
-
+    from deepagents_app.services.runtime import agent_factory as af
     monkeypatch.setenv("AGENT_CACHE_MAX_SIZE", "2")
     monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspace"))
     config.get_settings.cache_clear()
@@ -435,8 +434,8 @@ def test_snapshot_locks_skill_and_tool_payloads(client, demo_ids):
 
     from deepagents_app.db.models import ToolDefinition
     from deepagents_app.db.session import get_async_session_factory
-    from deepagents_app.services.agent_factory import _resolve_runtime_bindings
-    from deepagents_app.services.revisions import get_revision
+    from deepagents_app.services.runtime.agent_factory import _resolve_runtime_bindings
+    from deepagents_app.services.versioning.revisions import get_revision
 
     skill = client.post(
         "/api/skill",
@@ -488,7 +487,7 @@ def test_snapshot_locks_skill_and_tool_payloads(client, demo_ids):
     skill_snap = snap_agent["skills"][0]
     assert "content_hash" in skill_snap
     assert "content" not in skill_snap
-    from deepagents_app.services.content_blobs import hydrate_snapshot_content
+    from deepagents_app.services.versioning.content_blobs import hydrate_snapshot_content
 
     async def _hydrate():
         async with get_async_session_factory()() as db:
@@ -589,7 +588,7 @@ def test_skills_materialize_rejects_escaped_scope(tmp_path, monkeypatch):
     from deepagents_app import config
     from deepagents_app.api.errors import BusinessError
     from deepagents_app.config import Settings
-    from deepagents_app.services.skills import (
+    from deepagents_app.services.catalog.skills import (
         _safe_materialize_root,
         materialize_agent_skills,
     )
@@ -622,7 +621,7 @@ def test_skills_materialize_reuses_complete_dir(tmp_path, monkeypatch):
     from deepagents_app import config
     from deepagents_app.config import Settings
     from deepagents_app.db.models import SkillDefinition
-    from deepagents_app.services.skills import (
+    from deepagents_app.services.catalog.skills import (
         materialize_agent_skills,
         skills_fingerprint,
     )
@@ -658,8 +657,8 @@ def test_cache_eviction_keeps_materialized_skills(tmp_path, monkeypatch):
     from deepagents_app.config import Settings
     from deepagents_app.db.models import SkillDefinition
     from deepagents_app.ownership import user_scope_key
-    from deepagents_app.services import agent_factory as af
-    from deepagents_app.services.skills import (
+    from deepagents_app.services.runtime import agent_factory as af
+    from deepagents_app.services.catalog.skills import (
         materialize_agent_skills,
         skills_fingerprint,
     )
@@ -705,7 +704,7 @@ def test_skills_gc_removes_stale_and_keeps_fresh(tmp_path, monkeypatch):
     from deepagents_app import config
     from deepagents_app.config import Settings
     from deepagents_app.db.models import SkillDefinition
-    from deepagents_app.services.skills import (
+    from deepagents_app.services.catalog.skills import (
         _COMPLETE_MARKER,
         gc_materialized_skills,
         materialize_agent_skills,
@@ -769,7 +768,7 @@ def test_skills_gc_removes_stale_and_keeps_fresh(tmp_path, monkeypatch):
 
 def test_create_lonely_agent_does_not_flush_all_cache(client):
     """新建未被方法论引用的 Agent 不应清空全体编译缓存。"""
-    import deepagents_app.services.agent_factory as af
+    import deepagents_app.services.runtime.agent_factory as af
 
     af._cache["someone_else:v1"] = "OTHER"
     af._cache["mine:v3"] = "MINE"
@@ -850,7 +849,7 @@ def test_user_workspace_and_skills_materialize_isolation(tmp_path, monkeypatch):
     from deepagents_app.config import Settings
     from deepagents_app.db.models import SkillDefinition
     from deepagents_app.ownership import user_scope_key
-    from deepagents_app.services.skills import (
+    from deepagents_app.services.catalog.skills import (
         materialize_agent_skills,
         skills_fingerprint,
     )
@@ -906,8 +905,7 @@ def test_general_purpose_subagent_spec_and_no_global_profile():
 def test_cache_key_includes_user_scope():
     """缓存键带用户 scope。"""
     from deepagents_app.ownership import user_scope_key
-    from deepagents_app.services import agent_factory as af
-
+    from deepagents_app.services.runtime import agent_factory as af
     key = af.cache_key("alice", "meth1", 3)
     assert key == f"{user_scope_key('alice')}:meth1:v3"
 
@@ -943,9 +941,8 @@ def test_chat_e2e_with_fake_model(client, demo_ids, monkeypatch):
 
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
-    from deepagents_app.services import agent_factory as af
-    from deepagents_app.services import llm_models as models_svc
-
+    from deepagents_app.services.runtime import agent_factory as af
+    from deepagents_app.services.catalog import llm_models as models_svc
     class _ToolAwareFake(FakeListChatModel):
         def bind_tools(self, tools, **kwargs):  # noqa: ANN001, ARG002
             return self

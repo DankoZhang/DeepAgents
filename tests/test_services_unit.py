@@ -25,8 +25,7 @@ def test_validate_resource_id_rejects_path_traversal():
 
 
 async def test_list_methodologies_pagination(db_session):
-    from deepagents_app.services import methodology as methodology_svc
-
+    from deepagents_app.services.catalog import methodology as methodology_svc
     rows, total, next_cursor = await methodology_svc.list_methodologies(
         db_session, owner_user_id=TEST_USER, limit=1, offset=0
     )
@@ -58,8 +57,7 @@ async def test_pagination_cursor_roundtrip():
 
 async def test_create_methodology_rejects_bad_id(db_session):
     from deepagents_app.api.errors import BusinessError
-    from deepagents_app.services import methodology as methodology_svc
-
+    from deepagents_app.services.catalog import methodology as methodology_svc
     with pytest.raises(BusinessError):
         await methodology_svc.create_methodology(
             db_session,
@@ -72,8 +70,7 @@ async def test_create_methodology_rejects_bad_id(db_session):
 async def test_agent_cache_lru_eviction(db_session, monkeypatch, tmp_path):
     from deepagents_app import config
     from deepagents_app.ownership import demo_methodology_id_for_user
-    from deepagents_app.services import agent_factory as af
-
+    from deepagents_app.services.runtime import agent_factory as af
     config.get_settings.cache_clear()
     settings = config.get_settings()
     assert settings.agent_cache_max_size == 2
@@ -99,9 +96,8 @@ async def test_agent_cache_lru_eviction(db_session, monkeypatch, tmp_path):
 
 async def test_bind_agents_returns_detail(db_session):
     from deepagents_app.ownership import demo_methodology_id_for_user
-    from deepagents_app.services import agents as agents_svc
-    from deepagents_app.services import methodology as methodology_svc
-
+    from deepagents_app.services.catalog import agents as agents_svc
+    from deepagents_app.services.catalog import methodology as methodology_svc
     mid = demo_methodology_id_for_user(TEST_USER)
     agents, _, _ = await agents_svc.list_agents(db_session, owner_user_id=TEST_USER, limit=10)
     assert agents
@@ -179,6 +175,30 @@ async def test_mcp_tools_cache_hit(monkeypatch):
     tools_reg.clear_mcp_tools_cache(tool_id=row.id)
 
 
+def test_mcp_cache_invalidation_applies_across_pubsub_helper(monkeypatch):
+    """他机收到 MCP 失效消息后应清本地缓存（跳过本 worker_id）。"""
+    from deepagents_app.db.models import ToolDefinition
+    from deepagents_app.registries import tools as tools_reg
+    from deepagents_app.services.infra import cache_pubsub
+    tools_reg.clear_mcp_tools_cache()
+    tools_reg._mcp_tools_cache["tool_x"] = ("fp", [object()])  # noqa: SLF001
+    cache_pubsub._apply_mcp_local({"all": False, "tool_id": "tool_x"})
+    assert "tool_x" not in tools_reg._mcp_tools_cache  # noqa: SLF001
+
+    published: list[dict] = []
+
+    def fake_publish(*, tool_id=None, all_keys=False):  # noqa: ANN001
+        published.append({"tool_id": tool_id, "all_keys": all_keys})
+
+    monkeypatch.setattr(
+        cache_pubsub, "publish_mcp_cache_invalidation", fake_publish
+    )
+    tools_reg._mcp_tools_cache["tool_y"] = ("fp", [object()])  # noqa: SLF001
+    tools_reg.invalidate_mcp_tools_cache(tool_id="tool_y")
+    assert "tool_y" not in tools_reg._mcp_tools_cache  # noqa: SLF001
+    assert published == [{"tool_id": "tool_y", "all_keys": False}]
+
+
 async def test_seed_qa_tools_exist(db_session):
     from deepagents_app.db.models import ToolDefinition
 
@@ -235,7 +255,7 @@ async def test_interrupt_tool_names_from_payloads():
 
 def test_resolve_interrupt_on_merges_system_and_catalog(monkeypatch):
     from deepagents_app import config
-    from deepagents_app.services.agent_factory import _resolve_interrupt_on
+    from deepagents_app.services.runtime.agent_factory import _resolve_interrupt_on
 
     monkeypatch.setenv("ENABLE_HITL", "true")
     config.get_settings.cache_clear()
@@ -267,10 +287,10 @@ def test_resolve_interrupt_on_merges_system_and_catalog(monkeypatch):
 async def test_memory_versioned_in_snapshot_and_materialize(db_session, tmp_path):
     from deepagents_app.config import Settings
     from deepagents_app.ownership import demo_methodology_id_for_user
-    from deepagents_app.services import memory as memory_mod
-    from deepagents_app.services.content_blobs import get_content_blob
-    from deepagents_app.services.memory import materialize_versioned_memory
-    from deepagents_app.services.revisions import serialize_methodology
+    from deepagents_app.services.versioning import memory as memory_mod
+    from deepagents_app.services.versioning.content_blobs import get_content_blob
+    from deepagents_app.services.versioning.memory import materialize_versioned_memory
+    from deepagents_app.services.versioning.revisions import serialize_methodology
     from deepagents_app.workspace import user_workspace_dir
 
     pinned = "# pinned memory v-test\n"
@@ -361,9 +381,8 @@ async def test_checkpointer_requires_redis():
 async def test_publish_rejects_multiple_supervisors(db_session):
     from deepagents_app.api.errors import BusinessError
     from deepagents_app.ownership import scoped_id
-    from deepagents_app.services import agents as agents_svc
-    from deepagents_app.services import methodology as methodology_svc
-
+    from deepagents_app.services.catalog import agents as agents_svc
+    from deepagents_app.services.catalog import methodology as methodology_svc
     a1 = await agents_svc.create_agent(
         db_session,
         owner_user_id=TEST_USER,
@@ -393,13 +412,83 @@ async def test_publish_rejects_multiple_supervisors(db_session):
         )
 
 
+async def test_publish_ignores_disabled_extra_supervisor(db_session):
+    """disabled Supervisor 不计入；与组装口径一致，允许发布。"""
+    from deepagents_app.ownership import scoped_id
+    from deepagents_app.services.catalog import agents as agents_svc
+    from deepagents_app.services.catalog import methodology as methodology_svc
+
+    active = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="sup-on",
+        system_prompt="on",
+        config={"role": "supervisor", "enabled": True},
+        bump_related=False,
+    )
+    disabled = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="sup-off",
+        system_prompt="off",
+        config={"role": "supervisor", "enabled": False},
+        bump_related=False,
+    )
+    meth = await methodology_svc.create_methodology(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="sup-enabled-filter",
+        agent_ids=[active.id, disabled.id],
+        methodology_id=scoped_id(TEST_USER, "meth_sup_enabled"),
+    )
+    published = await methodology_svc.publish_methodology(
+        db_session, meth.id, owner_user_id=TEST_USER
+    )
+    assert published.status == "published"
+
+
+async def test_publish_rejects_only_disabled_supervisor(db_session):
+    """唯一 Supervisor 被禁用时发布失败（与组装「缺少 Supervisor」一致）。"""
+    from deepagents_app.api.errors import BusinessError
+    from deepagents_app.ownership import scoped_id
+    from deepagents_app.services.catalog import agents as agents_svc
+    from deepagents_app.services.catalog import methodology as methodology_svc
+
+    disabled_sup = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="sup-disabled",
+        system_prompt="x",
+        config={"role": "supervisor", "enabled": False},
+        bump_related=False,
+    )
+    sub = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="sub-only",
+        system_prompt="y",
+        config={"role": "subagent", "enabled": True},
+        bump_related=False,
+    )
+    meth = await methodology_svc.create_methodology(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="no-enabled-sup",
+        agent_ids=[disabled_sup.id, sub.id],
+        methodology_id=scoped_id(TEST_USER, "meth_no_en_sup"),
+    )
+    with pytest.raises(BusinessError, match="缺少启用中的 Supervisor"):
+        await methodology_svc.publish_methodology(
+            db_session, meth.id, owner_user_id=TEST_USER
+        )
+
+
 async def test_bind_foreign_tool_returns_forbidden(db_session):
     from deepagents_app.api.errors import ForbiddenError
     from deepagents_app.db.seed import ensure_user_bootstrap
     from deepagents_app.ownership import scoped_id
-    from deepagents_app.services import agents as agents_svc
-    from deepagents_app.services import tools as tools_svc
-
+    from deepagents_app.services.catalog import agents as agents_svc
+    from deepagents_app.services.catalog import tools as tools_svc
     other = "other-owner"
     await ensure_user_bootstrap(db_session, other)
     foreign_tool = await tools_svc.get_tool(
@@ -428,7 +517,7 @@ async def test_bind_foreign_tool_returns_forbidden(db_session):
 
 
 async def test_content_blob_dedup_and_gc(db_session):
-    from deepagents_app.services.content_blobs import (
+    from deepagents_app.services.versioning.content_blobs import (
         ensure_content_blob,
         gc_orphan_content_blobs,
         get_content_blob,
@@ -438,16 +527,80 @@ async def test_content_blob_dedup_and_gc(db_session):
     h2 = await ensure_content_blob(db_session, "hello-blob")
     assert h1 == h2
     assert await get_content_blob(db_session, h1) == "hello-blob"
-    # 无快照引用 → GC 可删
-    deleted = await gc_orphan_content_blobs(db_session)
+    # 无快照引用 → GC 可删（测试跳过宽限期）
+    deleted = await gc_orphan_content_blobs(db_session, min_age_seconds=0)
     assert deleted >= 1
     assert await get_content_blob(db_session, h1) is None
+
+
+async def test_hydrate_missing_blob_raises(db_session):
+    from deepagents_app.api.errors import NotFoundError
+    from deepagents_app.services.versioning.content_blobs import hydrate_snapshot_content
+
+    with pytest.raises(NotFoundError, match="正文缺失"):
+        await hydrate_snapshot_content(
+            db_session,
+            {
+                "agents": [
+                    {
+                        "id": "a1",
+                        "name": "a",
+                        "system_prompt_hash": "deadbeef" * 8,
+                    }
+                ]
+            },
+        )
+
+
+async def test_gc_second_pass_keeps_rereferenced_hash(db_session, monkeypatch):
+    """删除前二次扫引用：第一次像孤儿、第二次又被引用时不得删。"""
+    from deepagents_app.services.versioning import content_blobs as blobs_mod
+    from deepagents_app.services.versioning.content_blobs import (
+        ensure_content_blob,
+        gc_orphan_content_blobs,
+        get_content_blob,
+    )
+
+    digest = await ensure_content_blob(db_session, "keep-me-blob")
+    calls = {"n": 0}
+
+    async def _flaky_collect(_db):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return set()
+        return {digest}
+
+    monkeypatch.setattr(blobs_mod, "collect_referenced_content_hashes", _flaky_collect)
+    await gc_orphan_content_blobs(db_session, min_age_seconds=0)
+    assert calls["n"] == 2
+    assert await get_content_blob(db_session, digest) == "keep-me-blob"
+
+
+def test_touch_materialized_skills_complete(tmp_path):
+    from deepagents_app.services.catalog.skills import (
+        materialized_skills_dir_from_virtual,
+        touch_materialized_skills_complete,
+    )
+
+    root = tmp_path / "skills" / "abc123" / "agent1"
+    root.mkdir(parents=True)
+    marker = root / ".complete"
+    marker.write_text("", encoding="utf-8")
+    old_mtime = marker.stat().st_mtime - 100
+    import os
+
+    os.utime(marker, (old_mtime, old_mtime))
+    virtual = "/skills/abc123/agent1/"
+    resolved = materialized_skills_dir_from_virtual(tmp_path, virtual)
+    assert resolved == root.resolve()
+    assert touch_materialized_skills_complete([resolved]) == 1
+    assert marker.stat().st_mtime > old_mtime
 
 
 def test_serialize_interrupts_structured():
     from types import SimpleNamespace
 
-    from deepagents_app.services.chat import serialize_interrupts
+    from deepagents_app.services.runtime.chat import serialize_interrupts
 
     interrupt = SimpleNamespace(
         id="irq-1",

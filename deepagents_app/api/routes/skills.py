@@ -22,8 +22,7 @@ from deepagents_app.api.pagination import (
 )
 from deepagents_app.api.schemas import SkillCreate, SkillOut, SkillUpdate
 from deepagents_app.db.session import get_async_db
-from deepagents_app.services import skills as skills_svc
-
+from deepagents_app.services.catalog import skills as skills_svc
 router = APIRouter(tags=["skills"])
 
 

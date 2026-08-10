@@ -23,8 +23,7 @@ from deepagents_app.api.pagination import (
 )
 from deepagents_app.api.schemas import ToolCreate, ToolOut, ToolUpdate
 from deepagents_app.db.session import get_async_db
-from deepagents_app.services import tools as tools_svc
-
+from deepagents_app.services.catalog import tools as tools_svc
 router = APIRouter(tags=["tools"])
 
 
