@@ -139,7 +139,6 @@ async def update_methodology(
     if row is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
     if name is not None and name != row.name:
-
         await ensure_unique_owned_name(
             db,
             Methodology,
@@ -245,8 +244,8 @@ async def publish_methodology(
     row.updated_time = datetime.now(timezone.utc)
     schedule_cache_invalidation(db, methodology_id)
     await db.flush()
-    # 发布瞬间再钉一版快照，保证旧会话可按该 version 重建
-    await snapshot_methodology(db, methodology_id)
+    # 发布瞬间再钉一版快照；复用上方已 eager-load 的 row，避免二次全量查询
+    await snapshot_methodology(db, methodology_id, methodology=row)
     return row
 
 

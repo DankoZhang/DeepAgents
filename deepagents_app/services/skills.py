@@ -33,8 +33,8 @@ from deepagents_app.ownership import validate_resource_id
 from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
 from deepagents_app.services.revisions import (
     bump_methodologies_for_agent_ids,
-    bump_methodologies_using_skill,
-    schedule_cache_invalidation_for_agent_ids,
+    refresh_methodologies_for_agent_ids,
+    refresh_methodologies_using_resource,
 )
 from deepagents_app.utils.paths import resolve_under_root
 from deepagents_app.workspace import get_workspace_root
@@ -152,7 +152,6 @@ async def update_skill(
     if name is not None and name.strip() != row.name:
         new_name = name.strip()
         _validate_skill_name(new_name)
-
         await ensure_unique_owned_name(
             db,
             SkillDefinition,
@@ -185,17 +184,12 @@ async def update_skill(
 
     row.updated_time = datetime.now(timezone.utc)
     await db.flush()
-    if bump_related:
-        await bump_methodologies_using_skill(db, skill_id)
-    else:
-
-        agent_ids = [
-            r.agent_id
-            for r in await db.scalars(
-                select(AgentSkill).where(AgentSkill.skill_id == skill_id)
-            )
-        ]
-        await schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+    await refresh_methodologies_using_resource(
+        db,
+        kind="skill",
+        resource_id=skill_id,
+        bump_related=bump_related,
+    )
     return row
 
 
@@ -220,13 +214,9 @@ async def delete_skill(
     ]
     await db.delete(row)
     await db.flush()
-    if bump_related:
-        if agent_ids:
-
-            await bump_methodologies_for_agent_ids(db, agent_ids)
-    elif agent_ids:
-
-        await schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+    await refresh_methodologies_for_agent_ids(
+        db, agent_ids, bump_related=bump_related
+    )
 
 
 # ── 快照还原与磁盘物化（Agent Factory 组装时调用）──────────────────────
@@ -292,6 +282,8 @@ def materialize_agent_skills(
     Returns:
         供 ``skills=`` 使用的源目录虚拟路径；无可用 skill 返回 None。
     """
+    # 空 skills 会提前返回，所以这里必须先校验；有 skills 时
+    # ``_safe_materialize_root`` 还会再校验一次（防御性重复，可接受）。
     _assert_safe_path_segment(agent_id, label="agent id")
     active = [s for s in skills if (s.status or "active") == "active"]
     if not active:

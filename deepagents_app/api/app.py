@@ -47,6 +47,7 @@ from deepagents_app.services.content_blobs_gc_scheduler import (
     start_content_blob_gc_scheduler,
     stop_content_blob_gc_scheduler,
 )
+from deepagents_app.services.redis_conn import close_shared_redis
 from deepagents_app.services.skills_gc_scheduler import (
     start_skills_gc_scheduler,
     stop_skills_gc_scheduler,
@@ -69,6 +70,7 @@ async def lifespan(_app: FastAPI):
     Memory 随方法论快照版本化；组装时按 version 物化。
     """
     settings = get_settings()
+    settings.ensure_directories()
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -102,6 +104,7 @@ async def lifespan(_app: FastAPI):
     finally:
         await stop_content_blob_gc_scheduler()
         await stop_skills_gc_scheduler()
+        await close_shared_redis()
         await stop_cache_invalidation_listener()
         await close_redis_stream_slots_client()
         await close_checkpointer()

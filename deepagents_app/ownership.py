@@ -16,7 +16,6 @@ from deepagents_app.constants import DEFAULT_MODEL_ID, DEMO_METHODOLOGY_ID
 
 # 客户端可指定主键 / thread_id / Skill name 共用：禁止路径分隔与穿越字符
 _RESOURCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-_THREAD_ID_RE = _RESOURCE_ID_RE
 
 
 def validate_resource_id(resource_id: str, *, label: str = "id") -> str:

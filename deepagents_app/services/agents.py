@@ -186,7 +186,6 @@ async def update_agent(
         raise NotFoundError(f"Agent 不存在：{agent_id}")
 
     if name is not None and name != row.name:
-
         await ensure_unique_owned_name(
             db,
             AgentDefinition,

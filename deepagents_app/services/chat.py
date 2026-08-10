@@ -14,6 +14,7 @@ SSE 事件：meta / token / tool_start / tool_end / todo / ping / done / error�
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -23,182 +24,32 @@ from typing import Any
 from langchain_core.messages import AIMessageChunk
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from deepagents_app.api.errors import CapacityError, NotFoundError
+from deepagents_app.api.errors import NotFoundError
 from deepagents_app.config import Settings, get_settings
 from deepagents_app.db.session import get_async_session_factory
 from deepagents_app.factory import build_checkpointer
 from deepagents_app.ownership import checkpoint_thread_id
 from deepagents_app.services.agent_factory import build_agent_from_methodology
 from deepagents_app.services.conversation import get_conversation_by_thread
+from deepagents_app.services.message_serde import (
+    extract_final_text,
+    msg_role as _msg_role,
+    serialize_interrupts,
+    serialize_messages,
+    tool_calls_payload as _tool_calls_payload,
+)
+from deepagents_app.services.stream_limiter import (
+    acquire_stream_slot,
+    close_redis_stream_slots_client,
+    release_stream_slot,
+)
 from deepagents_app.utils.text import normalize_message_content
 from deepagents_app.workspace import user_workspace_dir, workspace_context
 
 logger = logging.getLogger(__name__)
 
 _SSE_PING_INTERVAL_SECONDS = 15.0
-_stream_semaphore: asyncio.Semaphore | None = None
-_stream_semaphore_limit: int | None = None
-_REDIS_STREAM_KEY = "deepagents:chat_stream_inflight"
-# 原子抢槽：超限则立即 DECR，避免 INCR/判断/DECR 竞态超卖
-_REDIS_ACQUIRE_LUA = """
-local n = redis.call('INCR', KEYS[1])
-if n == 1 then
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-end
-if n <= tonumber(ARGV[1]) then
-  return n
-end
-redis.call('DECR', KEYS[1])
-return -1
-"""
-_redis_slots_client: Any | None = None
-_redis_slots_lock: asyncio.Lock | None = None
 
-
-class StreamSlot:
-    """流式槽位句柄；结束时必须 ``await release()``。"""
-
-    async def release(self) -> None:  # noqa: B027
-        return
-
-
-class _LocalStreamSlot(StreamSlot):
-    def __init__(self, gate: asyncio.Semaphore) -> None:
-        self._gate = gate
-
-    async def release(self) -> None:
-        self._gate.release()
-
-
-class _RedisStreamSlot(StreamSlot):
-    def __init__(self, client: Any) -> None:
-        self._client = client
-        self._released = False
-
-    async def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        try:
-            n = await self._client.decr(_REDIS_STREAM_KEY)
-            if int(n) < 0:
-                await self._client.set(_REDIS_STREAM_KEY, 0)
-        except Exception:  # noqa: BLE001
-            logger.debug("释放 Redis 流式槽位失败", exc_info=True)
-
-
-def _stream_gate(settings: Settings) -> asyncio.Semaphore | None:
-    """按配置惰性创建进程内流式并发闸门；0 表示不限。"""
-    global _stream_semaphore, _stream_semaphore_limit
-    limit = int(getattr(settings, "chat_stream_max_concurrent", 0) or 0)
-    if limit <= 0:
-        return None
-    if _stream_semaphore is None or _stream_semaphore_limit != limit:
-        _stream_semaphore = asyncio.Semaphore(limit)
-        _stream_semaphore_limit = limit
-    return _stream_semaphore
-
-
-def _use_redis_stream_limiter(settings: Settings) -> bool:
-    mode = (settings.chat_stream_limiter or "auto").strip().lower()
-    if mode == "redis":
-        return True
-    if mode == "local":
-        return False
-    return int(settings.api_workers) > 1
-
-
-async def _get_redis_slots_client(settings: Settings) -> Any:
-    global _redis_slots_client, _redis_slots_lock
-    if _redis_slots_lock is None:
-        _redis_slots_lock = asyncio.Lock()
-    async with _redis_slots_lock:
-        if _redis_slots_client is None:
-            import redis.asyncio as aioredis
-
-            _redis_slots_client = aioredis.from_url(
-                settings.redis_url,
-                socket_connect_timeout=1.5,
-                socket_timeout=1.5,
-            )
-        return _redis_slots_client
-
-
-async def close_redis_stream_slots_client() -> None:
-    """lifespan 退出时关闭流式限流 Redis 客户端。"""
-    global _redis_slots_client
-    if _redis_slots_lock is None:
-        client = _redis_slots_client
-        _redis_slots_client = None
-    else:
-        async with _redis_slots_lock:
-            client = _redis_slots_client
-            _redis_slots_client = None
-    if client is not None:
-        try:
-            await client.aclose()
-        except Exception:  # noqa: BLE001
-            logger.debug("关闭 Redis 流式槽位客户端失败", exc_info=True)
-
-
-async def _acquire_redis_stream_slot(settings: Settings, limit: int) -> StreamSlot:
-    """跨 worker 用 Redis 原子计数器抢槽；超时 → CapacityError。"""
-    client = await _get_redis_slots_client(settings)
-    timeout = float(getattr(settings, "chat_stream_acquire_timeout_seconds", 1.0) or 0)
-    deadline = asyncio.get_running_loop().time() + (0.001 if timeout <= 0 else timeout)
-    while True:
-        n = int(
-            await client.eval(
-                _REDIS_ACQUIRE_LUA,
-                1,
-                _REDIS_STREAM_KEY,
-                limit,
-                86_400,
-            )
-        )
-        if n > 0:
-            return _RedisStreamSlot(client)
-        if asyncio.get_running_loop().time() >= deadline:
-            raise CapacityError("流式对话繁忙，请稍后重试")
-        await asyncio.sleep(0.05)
-
-
-async def acquire_stream_slot(settings: Settings | None = None) -> StreamSlot | None:
-    """
-    在打开 SSE 之前抢占流式槽位。
-
-    超时或立即不可得时抛 ``CapacityError``（映射 429），避免无界排队。
-    返回的句柄须在流结束后 ``await release()``；无限制时返回 None。
-    多 worker（或 ``CHAT_STREAM_LIMITER=redis``）时用 Redis 全局限流。
-    """
-    settings = settings or get_settings()
-    limit = int(getattr(settings, "chat_stream_max_concurrent", 0) or 0)
-    if limit <= 0:
-        return None
-
-    if _use_redis_stream_limiter(settings):
-        try:
-            return await _acquire_redis_stream_slot(settings, limit)
-        except CapacityError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Redis 流式限流不可用，回退进程内闸门: %s", exc)
-
-    gate = _stream_gate(settings)
-    if gate is None:
-        return None
-    timeout = float(getattr(settings, "chat_stream_acquire_timeout_seconds", 1.0) or 0)
-    wait_s = 0.001 if timeout <= 0 else timeout
-    try:
-        await asyncio.wait_for(gate.acquire(), timeout=wait_s)
-    except TimeoutError as exc:
-        raise CapacityError("流式对话繁忙，请稍后重试") from exc
-    return _LocalStreamSlot(gate)
-
-
-async def release_stream_slot(slot: StreamSlot | None) -> None:
-    if slot is not None:
-        await slot.release()
 
 def validate_chat_message(message: str, settings: Settings | None = None) -> None:
     """校验聊天消息长度；超限抛 ``BusinessError``。"""
@@ -209,10 +60,6 @@ def validate_chat_message(message: str, settings: Settings | None = None) -> Non
         from deepagents_app.api.errors import BusinessError
 
         raise BusinessError(f"消息过长：最多 {max_chars} 字符")
-
-
-def _validate_chat_message(message: str, settings: Settings) -> None:
-    validate_chat_message(message, settings)
 
 
 @dataclass(frozen=True)
@@ -226,141 +73,6 @@ class PreparedChat:
     agent: Any
     settings: Settings
     config: dict[str, Any]
-
-
-def _msg_role(msg: Any) -> str:
-    """LangChain Message.type / OpenAI role → 前端 role。"""
-    raw = getattr(msg, "type", None) or (
-        msg.get("role") if isinstance(msg, dict) else None
-    )
-    raw = str(raw or "unknown")
-    mapping = {
-        "human": "user",
-        "ai": "assistant",
-        "assistant": "assistant",
-        "user": "user",
-        "system": "system",
-        "tool": "tool",
-    }
-    return mapping.get(raw, raw)
-
-
-def _tool_calls_payload(msg: Any) -> list[dict[str, Any]] | None:
-    raw = getattr(msg, "tool_calls", None)
-    if raw is None and isinstance(msg, dict):
-        raw = msg.get("tool_calls")
-    if not raw:
-        return None
-    out: list[dict[str, Any]] = []
-    for item in raw:
-        if isinstance(item, dict):
-            out.append(
-                {
-                    "id": item.get("id"),
-                    "name": item.get("name"),
-                    "args": item.get("args") or item.get("arguments") or {},
-                }
-            )
-            continue
-        out.append(
-            {
-                "id": getattr(item, "id", None),
-                "name": getattr(item, "name", None),
-                "args": getattr(item, "args", None) or {},
-            }
-        )
-    return out or None
-
-
-def serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
-    """将 LangChain / dict 消息转为前端可用结构（保留 tool_calls）。"""
-    out: list[dict[str, Any]] = []
-    for msg in messages or []:
-        role = _msg_role(msg)
-        content = normalize_message_content(
-            getattr(msg, "content", None)
-            or (msg.get("content") if isinstance(msg, dict) else None)
-        )
-        name = getattr(msg, "name", None) or (
-            msg.get("name") if isinstance(msg, dict) else None
-        )
-        tool_calls = _tool_calls_payload(msg)
-        tool_call_id = getattr(msg, "tool_call_id", None) or (
-            msg.get("tool_call_id") if isinstance(msg, dict) else None
-        )
-        if not content and role not in {"user", "assistant"} and not tool_calls:
-            continue
-        row: dict[str, Any] = {"role": role, "content": content, "name": name}
-        if tool_calls:
-            row["tool_calls"] = tool_calls
-        if tool_call_id:
-            row["tool_call_id"] = tool_call_id
-        out.append(row)
-    return out
-
-
-def extract_final_text(result: dict[str, Any]) -> str:
-    """从 agent.ainvoke / invoke 结果取出最后一条 AI 文本。"""
-    messages = result.get("messages") or []
-    for msg in reversed(messages):
-        role = _msg_role(msg)
-        content = normalize_message_content(
-            getattr(msg, "content", None)
-            or (msg.get("content") if isinstance(msg, dict) else None)
-        )
-        if role == "assistant" and content:
-            return content
-    return ""
-
-
-def serialize_interrupts(interrupts: Any) -> list[dict[str, Any]] | None:
-    """
-    将 LangGraph ``__interrupt__`` 转为前端可解析结构。
-
-    期望 HITL value 含 ``action_requests``（工具名 / 参数）；无法识别时降级为 raw。
-    """
-    if not interrupts:
-        return None
-    items = interrupts if isinstance(interrupts, (list, tuple)) else [interrupts]
-    out: list[dict[str, Any]] = []
-    for item in items:
-        iid = getattr(item, "id", None)
-        value = getattr(item, "value", item)
-        actions: list[dict[str, Any]] = []
-        raw_actions = None
-        if isinstance(value, dict):
-            raw_actions = value.get("action_requests")
-        elif hasattr(value, "get"):
-            try:
-                raw_actions = value.get("action_requests")  # type: ignore[union-attr]
-            except Exception:  # noqa: BLE001
-                raw_actions = None
-        if isinstance(raw_actions, list):
-            for req in raw_actions:
-                if isinstance(req, dict):
-                    actions.append(
-                        {
-                            "name": req.get("name"),
-                            "args": req.get("args") or {},
-                            "description": req.get("description"),
-                        }
-                    )
-                else:
-                    actions.append(
-                        {
-                            "name": getattr(req, "name", None),
-                            "args": getattr(req, "args", None) or {},
-                            "description": getattr(req, "description", None),
-                        }
-                    )
-        entry: dict[str, Any] = {"id": iid, "actions": actions}
-        if not actions:
-            try:
-                entry["raw"] = value if isinstance(value, (dict, list, str, int, float, bool)) or value is None else str(value)
-            except Exception:  # noqa: BLE001
-                entry["raw"] = repr(value)
-        out.append(entry)
-    return out or None
 
 
 def _pack_result(
@@ -575,6 +287,7 @@ async def _aiter_sse(
     )
     assembled = ""
     next_task: asyncio.Task[tuple[str, dict[str, Any]]] | None = None
+    event_iter: AsyncIterator[tuple[str, dict[str, Any]]] | None = None
     try:
         with workspace_context(
             user_workspace_dir(prepared.settings, prepared.user_id, ensure=False)
@@ -628,6 +341,11 @@ async def _aiter_sse(
                 await next_task
             except (asyncio.CancelledError, StopAsyncIteration, Exception):  # noqa: BLE001
                 pass
+        if event_iter is not None:
+            aclose = getattr(event_iter, "aclose", None)
+            if callable(aclose):
+                with suppress(asyncio.CancelledError, Exception):
+                    await aclose()
 
 
 async def chat(
@@ -638,7 +356,7 @@ async def chat(
 ) -> dict[str, Any]:
     """发送一轮用户消息：短事务组装后关闭 DB，再 ``ainvoke``。"""
     settings = get_settings()
-    _validate_chat_message(message, settings)
+    validate_chat_message(message, settings)
     prepared = await prepare_chat(user_id=user_id, thread_id=thread_id, settings=settings)
     logger.info(
         "chat user=%s thread=%s methodology=%s v%s",
@@ -674,7 +392,7 @@ async def iter_chat_sse(
     路由可先 ``prepare_chat`` 再抢槽，将结果作为 ``prepared`` 传入，避免重复组装。
     """
     settings = get_settings()
-    _validate_chat_message(message, settings)
+    validate_chat_message(message, settings)
     if prepared is None:
         prepared = await prepare_chat(
             user_id=user_id, thread_id=thread_id, settings=settings
@@ -699,13 +417,18 @@ async def resume_agent(
     approve: bool = True,
 ) -> dict[str, Any]:
     """对已编译 Agent 执行 HITL resume（``ainvoke`` + ``Command``）。"""
+    return await agent.ainvoke(
+        _resume_command(approve),
+        config=config,
+    )
+
+
+def _resume_command(approve: bool) -> Any:
+    """构造 LangGraph HITL resume 命令，避免同步与 SSE 路径的载荷漂移。"""
     from langgraph.types import Command
 
     decision_type = "approve" if approve else "reject"
-    return await agent.ainvoke(
-        Command(resume={"decisions": [{"type": decision_type}]}),
-        config=config,
-    )
+    return Command(resume={"decisions": [{"type": decision_type}]})
 
 
 async def resume_chat(
@@ -747,14 +470,12 @@ async def iter_resume_sse(
 
     路由可先 ``prepare_chat`` 再抢槽，将结果作为 ``prepared`` 传入。
     """
-    from langgraph.types import Command
-
     if prepared is None:
         prepared = await prepare_chat(user_id=user_id, thread_id=thread_id)
     decision_type = "approve" if approve else "reject"
     async for chunk in _aiter_sse(
         prepared,
-        Command(resume={"decisions": [{"type": decision_type}]}),
+        _resume_command(approve),
         meta={
             "thread_id": thread_id,
             "methodology_id": prepared.methodology_id,

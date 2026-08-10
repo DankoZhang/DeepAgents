@@ -63,6 +63,8 @@ async def chat_stream(
 ):
     """SSE：``meta`` → ``token``* → ``done`` | ``error``。"""
     settings = get_settings()
+    # 先于 prepare_chat 校验，避免无效大消息触发 Agent 冷编译。
+    # iter_chat_sse 仍保留服务层校验，供非 HTTP 调用方使用。
     validate_chat_message(body.message, settings)
     # 冷编译在抢槽之前完成，避免占满并发槽后误报 429
     prepared = await prepare_chat(

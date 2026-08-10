@@ -7,14 +7,14 @@ Skills 物化目录 GC 入口
     python -m deepagents_app.services.skills_gc
     python -m deepagents_app.services.skills_gc --max-age-days 7
 
-也可由 API lifespan 按 ``SKILLS_GC_INTERVAL_HOURS`` 在后台线程周期执行。
+也可由 API lifespan 按 ``SKILLS_GC_INTERVAL_HOURS`` 在后台周期执行
+（多 worker 下经 Redis 锁收敛为全集群每窗口一次）。
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import sys
 
 from deepagents_app.config import get_settings
 from deepagents_app.services.skills import gc_materialized_skills

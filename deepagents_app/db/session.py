@@ -189,11 +189,16 @@ async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
     try:
         yield db
         await db.commit()
-        from deepagents_app.services.revisions import flush_cache_invalidations
-
-        flush_cache_invalidations(db)
     except Exception:
         await db.rollback()
         raise
+    else:
+        # 事务已提交，缓存广播失败不能把已成功的写操作伪装成 HTTP 500。
+        try:
+            from deepagents_app.services.revisions import flush_cache_invalidations
+
+            flush_cache_invalidations(db)
+        except Exception:  # noqa: BLE001
+            logger.exception("提交后的 Agent 缓存失效失败")
     finally:
         await db.close()

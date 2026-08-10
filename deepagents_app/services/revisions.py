@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +46,8 @@ __all__ = [
     "schedule_cache_invalidation",
     "flush_cache_invalidations",
     "schedule_cache_invalidation_for_agent_ids",
+    "refresh_methodologies_for_agent_ids",
+    "refresh_methodologies_using_resource",
     "prune_methodology_revisions",
     "bump_methodology",
     "bump_methodologies_for_agent_ids",
@@ -56,8 +59,10 @@ __all__ = [
 ]
 
 
-async def serialize_methodology(db: AsyncSession, methodology_id: str) -> dict[str, Any]:
-    """把当前方法论完整配置序列化为可重建的 JSON（含版本化 Memory）。"""
+async def _load_methodology_for_snapshot(
+    db: AsyncSession, methodology_id: str
+) -> Methodology:
+    """带 agents / tools / middlewares / skills / llm 预加载的方法论。"""
     methodology = (
         await db.scalars(
             select(Methodology)
@@ -67,6 +72,29 @@ async def serialize_methodology(db: AsyncSession, methodology_id: str) -> dict[s
     ).one_or_none()
     if methodology is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
+    return methodology
+
+
+async def serialize_methodology(
+    db: AsyncSession,
+    methodology_id: str | None = None,
+    *,
+    methodology: Methodology | None = None,
+) -> dict[str, Any]:
+    """
+    把当前方法论完整配置序列化为可重建的 JSON（含版本化 Memory）。
+
+    可传已预加载的 ``methodology``（如 publish 刚查过的详情），避免再查一次；
+    若其 agents 尚未 eager-load，仍会按 id 重新加载。
+    """
+    if methodology is None:
+        if not methodology_id:
+            raise ValueError("serialize_methodology 需要 methodology 或 methodology_id")
+        methodology = await _load_methodology_for_snapshot(db, methodology_id)
+    else:
+        state = sa_inspect(methodology)
+        if "agents" in state.unloaded:
+            methodology = await _load_methodology_for_snapshot(db, methodology.id)
 
     from deepagents_app.services.memory import memory_payload_for_snapshot_async
 
@@ -84,18 +112,22 @@ async def serialize_methodology(db: AsyncSession, methodology_id: str) -> dict[s
     }
 
 
-async def snapshot_methodology(db: AsyncSession, methodology_id: str) -> MethodologyRevision:
+async def snapshot_methodology(
+    db: AsyncSession,
+    methodology_id: str,
+    *,
+    methodology: Methodology | None = None,
+) -> MethodologyRevision:
     """按当前 ``methodology.version`` 写入/覆盖快照（同 version 重复调用会覆盖）。"""
-    methodology = await db.get(Methodology, methodology_id)
-    if methodology is None:
-        raise NotFoundError(f"方法论不存在：{methodology_id}")
-
-    payload = await serialize_methodology(db, methodology_id)
+    payload = await serialize_methodology(
+        db, methodology_id=methodology_id, methodology=methodology
+    )
+    version = int(payload["version"])
     existing = (
         await db.scalars(
             select(MethodologyRevision).where(
                 MethodologyRevision.methodology_id == methodology_id,
-                MethodologyRevision.version == methodology.version,
+                MethodologyRevision.version == version,
             )
         )
     ).one_or_none()
@@ -107,9 +139,9 @@ async def snapshot_methodology(db: AsyncSession, methodology_id: str) -> Methodo
         return existing
 
     row = MethodologyRevision(
-        id=f"{methodology_id}_v{methodology.version}",
+        id=f"{methodology_id}_v{version}",
         methodology_id=methodology_id,
-        version=methodology.version,
+        version=version,
         snapshot=payload,
     )
     db.add(row)
@@ -203,6 +235,44 @@ async def schedule_cache_invalidation_for_agent_ids(
     for mid in meth_ids:
         schedule_cache_invalidation(db, mid)
     return True
+
+
+async def refresh_methodologies_for_agent_ids(
+    db: AsyncSession,
+    agent_ids: Iterable[str],
+    *,
+    bump_related: bool,
+) -> bool:
+    """按变更模式，对引用给定 Agent 的方法论升版或仅失效编译缓存。"""
+    ids = list({agent_id for agent_id in agent_ids if agent_id})
+    if not ids:
+        return False
+    if bump_related:
+        return await bump_methodologies_for_agent_ids(db, ids)
+    return await schedule_cache_invalidation_for_agent_ids(db, ids)
+
+
+async def refresh_methodologies_using_resource(
+    db: AsyncSession,
+    *,
+    kind: str,
+    resource_id: str,
+    bump_related: bool,
+) -> bool:
+    """按 Tool / Skill 资源查关联 Agent，再统一升版或失效缓存。"""
+    link_model, column = {
+        "tool": (AgentTool, AgentTool.tool_id),
+        "skill": (AgentSkill, AgentSkill.skill_id),
+    }.get(kind, (None, None))
+    if link_model is None or column is None:
+        raise ValueError(f"未知关联资源类型：{kind}")
+    agent_ids = [
+        link.agent_id
+        for link in await db.scalars(select(link_model).where(column == resource_id))
+    ]
+    return await refresh_methodologies_for_agent_ids(
+        db, agent_ids, bump_related=bump_related
+    )
 
 
 # ── 升版：方法论配置变更的统一收尾 ────────────────────────────────────
@@ -362,8 +432,6 @@ async def bump_methodologies_using_resource(
                 select(AgentTool).where(AgentTool.tool_id == resource_id)
             )
         ]
-        if not agent_ids:
-            return False
         return await bump_methodologies_for_agent_ids(db, agent_ids)
 
     if kind == "skill":
@@ -373,8 +441,6 @@ async def bump_methodologies_using_resource(
                 select(AgentSkill).where(AgentSkill.skill_id == resource_id)
             )
         ]
-        if not agent_ids:
-            return False
         return await bump_methodologies_for_agent_ids(db, agent_ids)
 
     raise ValueError(f"未知 bump 资源类型：{kind}")

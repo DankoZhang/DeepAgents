@@ -21,9 +21,8 @@ from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.ownership import validate_resource_id
 from deepagents_app.services.crud_helpers import ensure_unique_owned_name, get_owned
 from deepagents_app.services.revisions import (
-    bump_methodologies_for_agent_ids,
-    bump_methodologies_using_tool,
-    schedule_cache_invalidation_for_agent_ids,
+    refresh_methodologies_for_agent_ids,
+    refresh_methodologies_using_resource,
 )
 from deepagents_app.utils.mcp_safety import validate_mcp_config
 
@@ -179,7 +178,6 @@ async def update_tool(
             )
     if name is not None:
         if name != row.name:
-
             await ensure_unique_owned_name(
                 db,
                 ToolDefinition,
@@ -203,16 +201,12 @@ async def update_tool(
     await db.flush()
     if row.tool_type == "mcp":
         _invalidate_mcp_cache(tool_id)
-    if bump_related:
-        await bump_methodologies_using_tool(db, tool_id)
-    else:
-        agent_ids = [
-            r.agent_id
-            for r in await db.scalars(
-                select(AgentTool).where(AgentTool.tool_id == tool_id)
-            )
-        ]
-        await schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+    await refresh_methodologies_using_resource(
+        db,
+        kind="tool",
+        resource_id=tool_id,
+        bump_related=bump_related,
+    )
     return row
 
 
@@ -238,12 +232,9 @@ async def delete_tool(
     await db.delete(row)
     await db.flush()
     _invalidate_mcp_cache(tool_id)
-    if bump_related:
-        if agent_ids:
-
-            await bump_methodologies_for_agent_ids(db, agent_ids)
-    elif agent_ids:
-        await schedule_cache_invalidation_for_agent_ids(db, agent_ids)
+    await refresh_methodologies_for_agent_ids(
+        db, agent_ids, bump_related=bump_related
+    )
 
 
 def _resolve_tool_id(tool_id: str | None) -> str:

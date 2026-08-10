@@ -156,7 +156,6 @@ async def update_model(
         raise NotFoundError(f"模型不存在：{model_id}")
 
     if name is not None and name != row.name:
-
         await ensure_unique_owned_name(
             db,
             ModelDefinition,

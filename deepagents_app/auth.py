@@ -80,11 +80,12 @@ async def close_auth_http_client() -> None:
         await client.aclose()
 
 
-def _get_http_client(timeout: float) -> httpx.AsyncClient:
+def _get_http_client() -> httpx.AsyncClient:
+    """返回复用连接池；超时在每次请求上读取当前 Settings。"""
     global _http_client
     with _http_client_lock:
         if _http_client is None or _http_client.is_closed:
-            _http_client = httpx.AsyncClient(timeout=timeout)
+            _http_client = httpx.AsyncClient()
         return _http_client
 
 
@@ -125,9 +126,15 @@ async def introspect_token(token: str, settings: Settings | None = None) -> str:
         headers["Content-Type"] = "application/json"
         json_body = {"token": token}
 
-    client = _get_http_client(float(settings.auth_timeout_seconds))
+    client = _get_http_client()
     try:
-        resp = await client.request(method, url, headers=headers, json=json_body)
+        resp = await client.request(
+            method,
+            url,
+            headers=headers,
+            json=json_body,
+            timeout=float(settings.auth_timeout_seconds),
+        )
     except Exception as exc:  # noqa: BLE001
         raise AuthError(f"鉴权服务不可用：{exc}") from exc
 

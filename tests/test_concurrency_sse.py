@@ -33,6 +33,30 @@ async def test_build_lock_allows_concurrent_await():
 
 
 @pytest.mark.asyncio
+async def test_failed_agent_build_drops_unowned_build_lock(monkeypatch):
+    """编译失败后不应把永远不会进缓存的锁留在进程内字典。"""
+    from deepagents_app.services import agent_factory as af
+
+    af.invalidate_agent_cache()
+    key = af.cache_key("failed-build-user", "failed-meth", 1)
+
+    async def fail_load(*_args, **_kwargs):
+        raise RuntimeError("模拟组装失败")
+
+    monkeypatch.setattr(af, "get_methodology_config", fail_load)
+    with pytest.raises(RuntimeError, match="模拟组装失败"):
+        await af.build_agent_from_methodology(
+            object(),
+            "failed-meth",
+            owner_user_id="failed-build-user",
+            version=1,
+            settings=object(),
+        )
+
+    assert key not in af._build_locks
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_lock_allows_concurrent_await():
     """同一 user 的两个并发 bootstrap 锁不应挂死事件循环。"""
     from deepagents_app.db import seed
@@ -109,6 +133,57 @@ async def test_sse_ping_does_not_kill_stream(monkeypatch):
     assert "ping" in events
     assert events.count("token") == 2
     assert "done" in events
+
+
+@pytest.mark.asyncio
+async def test_sse_cancellation_closes_underlying_event_iterator(monkeypatch):
+    """客户端断连取消外层 SSE 后，应关闭持有 LLM 流的内层异步生成器。"""
+    from contextlib import contextmanager, suppress
+    from pathlib import Path
+
+    from deepagents_app.services import chat as chat_svc
+
+    closed = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def fake_stream(agent, payload, config):
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+            yield "token", {"text": "不会到这里"}
+        finally:
+            closed.set()
+
+    @contextmanager
+    def _ws(_root):
+        yield Path("/tmp")
+
+    monkeypatch.setattr(chat_svc, "_aiter_stream_events", fake_stream)
+    monkeypatch.setattr(chat_svc, "workspace_context", _ws)
+    monkeypatch.setattr(
+        chat_svc, "user_workspace_dir", lambda *args, **kwargs: Path("/tmp")
+    )
+
+    class _Prepared:
+        user_id = "u"
+        thread_id = "t"
+        methodology_id = "m"
+        methodology_version = 1
+        agent = object()
+        settings = object()
+        config = {}
+
+    stream = chat_svc._aiter_sse(
+        _Prepared(), {}, meta={"thread_id": "t"}, log_label="test"
+    )
+    await anext(stream)  # meta；内层流尚未开始
+    pending = asyncio.create_task(anext(stream))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    pending.cancel()
+    with suppress(asyncio.CancelledError):
+        await pending
+
+    assert closed.is_set()
 
 
 @pytest.mark.asyncio

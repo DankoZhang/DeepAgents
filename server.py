@@ -34,6 +34,9 @@ def main() -> None:
     host = settings.api_host
     port = int(settings.api_port)
     server = (settings.api_server or "uvicorn").strip().lower()
+    # Windows 默认 ProactorEventLoop 与 psycopg 异步不兼容；uvicorn 0.36+
+    # 会显式选用 Proactor，需改为 SelectorEventLoop。
+    loop = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
 
     if server == "gunicorn":
         from gunicorn.app.base import BaseApplication
@@ -72,6 +75,7 @@ def main() -> None:
         host=host,
         port=port,
         workers=workers,
+        loop=loop,
         reload=False,
     )
 

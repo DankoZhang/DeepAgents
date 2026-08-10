@@ -115,8 +115,11 @@ def _drop_build_lock(key: str) -> None:
     _build_locks.pop(key, None)
 
 
-def _cleanup_evicted_key(key: str) -> None:
-    """淘汰 / 失效某条缓存后尝试释放构建锁（物化 Skills 按内容寻址保留）。"""
+async def _cleanup_failed_build_lock(key: str) -> None:
+    """失败建构释放无主锁；先让已唤醒的等待者重新取得锁。"""
+    # asyncio.Lock.release() 唤醒 waiter 后，waiter 会在下一轮事件循环中才将
+    # 锁标记为 held。让出一次执行权，避免删掉仍有 waiter 的锁字典条目。
+    await asyncio.sleep(0)
     _drop_build_lock(key)
 
 
@@ -192,7 +195,7 @@ def invalidate_agent_cache_local(
                 del _cache[k]
 
     for key in keys:
-        _cleanup_evicted_key(key)
+        _drop_build_lock(key)
     return len(keys)
 
 
@@ -638,6 +641,34 @@ async def _build_from_snapshot(
     )
 
 
+async def _build_and_cache(
+    db: AsyncSession,
+    methodology: Methodology,
+    *,
+    owner_user_id: str,
+    version: int,
+    settings: Settings,
+    key: str,
+    use_cache: bool,
+) -> Any:
+    """按 live / snapshot 组装；成功后统一写入 LRU 缓存。"""
+    if version == methodology.version:
+        agent = await _build_from_live(db, methodology, settings)
+    else:
+        agent = await _build_from_snapshot(
+            db,
+            methodology.id,
+            version,
+            settings,
+            owner_user_id=owner_user_id,
+        )
+    if use_cache:
+        for evicted in _cache_put(key, agent):
+            logger.info("Agent 缓存 LRU 淘汰：%s", evicted)
+            _drop_build_lock(evicted)
+    return agent
+
+
 # ── 对外主入口 ────────────────────────────────────────────────────────
 
 
@@ -663,71 +694,56 @@ async def build_agent_from_methodology(
         LangGraph CompiledStateGraph
     """
     settings = settings or get_settings()
+    methodology: Methodology | None = None
 
-    # 快路径：调用方已带齐缓存键字段（典型：prepare_chat）
+    # 调用方已带齐缓存键（典型 prepare_chat）：先查缓存，命中则不做 DB 查询
     if use_cache and owner_user_id is not None and version is not None:
         key = cache_key(owner_user_id, methodology_id, version)
         cached = _cache_get(key)
         if cached is not None:
             logger.info("命中 Agent 缓存：%s", key)
             return cached
-        async with _build_lock_for(key):
+        owner = owner_user_id
+        target_version = version
+    else:
+        methodology = await get_methodology_config(
+            db,
+            methodology_id,
+            owner_user_id=owner_user_id,
+        )
+        owner = owner_user_id or methodology.owner_user_id
+        target_version = version if version is not None else methodology.version
+        key = cache_key(owner, methodology.id, target_version)
+        if use_cache:
             cached = _cache_get(key)
             if cached is not None:
                 logger.info("命中 Agent 缓存：%s", key)
                 return cached
-
-            methodology = await get_methodology_config(
-                db,
-                methodology_id,
-                owner_user_id=owner_user_id,
-            )
-            if version == methodology.version:
-                agent = await _build_from_live(db, methodology, settings)
-            else:
-                agent = await _build_from_snapshot(
-                    db,
-                    methodology.id,
-                    version,
-                    settings,
-                    owner_user_id=owner_user_id,
-                )
-            for evicted in _cache_put(key, agent):
-                logger.info("Agent 缓存 LRU 淘汰：%s", evicted)
-                _cleanup_evicted_key(evicted)
-            return agent
-
-    methodology = await get_methodology_config(
-        db,
-        methodology_id,
-        owner_user_id=owner_user_id,
-    )
-    owner = owner_user_id or methodology.owner_user_id
-    target_version = version if version is not None else methodology.version
-    key = cache_key(owner, methodology.id, target_version)
 
     # 按 key 加锁：缓存 miss 时同进程并发请求只组装一次
-    async with _build_lock_for(key):
-        if use_cache:
-            cached = _cache_get(key)
-            if cached is not None:
-                logger.info("命中 Agent 缓存：%s", key)
-                return cached
+    try:
+        async with _build_lock_for(key):
+            if use_cache:
+                cached = _cache_get(key)
+                if cached is not None:
+                    logger.info("命中 Agent 缓存：%s", key)
+                    return cached
 
-        # 版本与 live 一致走当前配置；否则按会话锁定的旧 version 从快照重建
-        if target_version == methodology.version:
-            agent = await _build_from_live(db, methodology, settings)
-        else:
-            agent = await _build_from_snapshot(
+            if methodology is None:
+                methodology = await get_methodology_config(
+                    db,
+                    methodology_id,
+                    owner_user_id=owner_user_id,
+                )
+            return await _build_and_cache(
                 db,
-                methodology.id,
-                target_version,
-                settings,
+                methodology,
                 owner_user_id=owner,
+                version=target_version,
+                settings=settings,
+                key=key,
+                use_cache=use_cache,
             )
-
-        if use_cache:
-            for evicted in _cache_put(key, agent):
-                logger.info("Agent 缓存 LRU 淘汰：%s", evicted)
-                _cleanup_evicted_key(evicted)
-        return agent
+    except BaseException:
+        await _cleanup_failed_build_lock(key)
+        raise

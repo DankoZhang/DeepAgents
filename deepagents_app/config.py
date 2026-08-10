@@ -9,6 +9,7 @@
 - 路径统一解析为绝对路径，避免 cwd 变化导致 workspace 漂移
 - 业务代码只依赖 ``get_settings()``，不直接读 ``os.environ``
 - Settings 为 frozen：禁止就地改字段；临时覆盖用 ``settings_with`` / ``model_copy``
+- ``get_settings()`` 只读配置；目录创建由 lifespan / bootstrap 显式调用 ``ensure_directories()``
 """
 
 from __future__ import annotations
@@ -115,9 +116,11 @@ class Settings(BaseSettings):
     skills_gc_max_age_days: float = Field(default=14.0, ge=0, le=3650)
     # Skills 物化 GC：残留临时目录超过该小时数则删除
     skills_gc_tmp_max_age_hours: float = Field(default=1.0, ge=0.01, le=720)
-    # API 进程内后台 GC 间隔（小时）；0=不启动后台任务（可用模块 CLI）
+    # Skills GC 后台间隔（小时）；0=不启动后台任务（可用模块 CLI）
+    # 全集群语义：每个 worker 都起调度器，但同一窗口内只有抢到 Redis 锁的进程真跑
     skills_gc_interval_hours: float = Field(default=24.0, ge=0, le=720)
     # content_blob 孤儿 GC 后台间隔（小时）；0=不启动（可用模块 CLI）
+    # 同样是全集群语义，不随 API_WORKERS 放大
     content_blob_gc_interval_hours: float = Field(default=24.0, ge=0, le=720)
     # Fernet 密钥（url-safe base64）或任意口令；用于加密模型 api_key
     # 生产必须设置；未设置且未允许 insecure 时启动/加密会失败
@@ -164,9 +167,7 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """进程内单例配置；测试场景可 ``get_settings.cache_clear()`` 后重建。"""
-    settings = Settings()
-    settings.ensure_directories()
-    return settings
+    return Settings()
 
 
 def settings_with(**overrides: Any) -> Settings:

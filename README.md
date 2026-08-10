@@ -168,6 +168,8 @@ python -m deepagents_app.services.content_blobs_gc
 
 `SKILLS_GC_INTERVAL_HOURS` / `CONTENT_BLOB_GC_INTERVAL_HOURS`（默认 24）控制 API 进程内后台任务；`0` 表示仅手动。
 
+两个间隔都是**全集群**语义。调度器在每个 worker 都会启动，但每轮执行前先用 `SET NX EX` 抢一把 Redis 锁（key 为 `deepagents:gc:skills` / `deepagents:gc:content_blob`，TTL 为间隔的 0.9 倍），同一窗口内只有一个进程真正执行清理，因此 `API_WORKERS` 调大不会让 GC 频率跟着放大。Redis 不可用时本轮直接跳过并记警告。
+
 ---
 
 ## 已演示的 Deep Agents 能力

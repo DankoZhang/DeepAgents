@@ -354,7 +354,7 @@ def test_agent_cache_lru_evicts_and_drops_build_lock(tmp_path, monkeypatch):
     evicted = af._cache_put("m3:v1", "C")
     assert evicted == ["m1:v1"]
     for key in evicted:
-        af._cleanup_evicted_key(key)
+        af._drop_build_lock(key)
     assert "m1:v1" not in af._cache
     assert "m1:v1" not in af._build_locks
     assert list(af._cache.keys()) == ["m2:v1", "m3:v1"]
@@ -691,7 +691,7 @@ def test_cache_eviction_keeps_materialized_skills(tmp_path, monkeypatch):
     key = af.cache_key("alice", "meth1", 1)
     af._cache[key] = "AGENT"
     af._build_lock_for(key)
-    af._cleanup_evicted_key(key)
+    af._drop_build_lock(key)
     assert key not in af._build_locks
     assert skill_file.is_file()
     assert user_scope_key("alice") in str(user_ws)

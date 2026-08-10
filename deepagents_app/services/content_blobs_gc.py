@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import sys
 
 from deepagents_app.config import get_settings
 from deepagents_app.db.session import get_async_session_factory, migrate_db, reset_engine
