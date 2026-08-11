@@ -3,7 +3,7 @@
 ==============
 
 前端统一配置 provider / 模型名 / 超参数，并支持连通性测试。
-Agent 通过 model_id 绑定目录中的模型（方案 B）。
+Agent 通过 model_id 绑定目录中的模型。
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
     cursor_query,
     limit_query,
-    offset_query,
     set_next_cursor,
     set_total_count,
 )
@@ -37,7 +36,6 @@ async def list_models(
     response: Response,
     status: str | None = Query(None, description="active | disabled"),
     limit: int = Depends(limit_query),
-    offset: int = Depends(offset_query),
     cursor: str | None = Depends(cursor_query),
     db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
@@ -47,7 +45,6 @@ async def list_models(
         owner_user_id=user_id,
         status=status,
         limit=limit,
-        offset=offset,
         cursor=cursor,
     )
     set_total_count(response, total)
@@ -104,7 +101,6 @@ async def update_model(
         provider=body.provider,
         model_name=body.model_name,
         api_key=body.api_key,
-        clear_api_key=body.clear_api_key,
         base_url=body.base_url,
         temperature=body.temperature,
         top_p=body.top_p,
@@ -137,7 +133,9 @@ async def test_model_inline(
     - 传 ``model_id``：用目录已存配置测试
     - 否则用 body 内联字段（保存前试连）
     """
-    if body.model_id:
+    # 仅当带了 model_id 且未提供新 api_key 时，才走目录已存配置；
+    # 否则内联试连（避免编辑抽屉里新粘贴的 key 被 model_id 短路丢掉）。
+    if body.model_id and not body.api_key:
         return await models_svc.test_model_by_id(
             db, body.model_id, owner_user_id=user_id
         )

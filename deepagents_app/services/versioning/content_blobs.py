@@ -6,7 +6,7 @@ Skill / system_prompt / Memory 等大段正文按 sha256 去重存储。
 方法论快照只存 ``content_hash``，旧会话按 hash 取回不可变正文。
 
 GC：删除未被任何 ``MethodologyRevision.snapshot`` 引用的孤儿 blob
-（写路径不调用；由 ``services.gc`` 后台 / CLI 执行）。
+（写路径不调用；由 ``services.infra.gc`` 后台 / CLI 执行）。
 """
 
 from __future__ import annotations
@@ -135,7 +135,6 @@ async def hydrate_snapshot_content(
     """
     将快照中的 ``*_hash`` 解析为正文，供组装使用。
 
-    兼容旧快照：若已有 ``content`` / ``system_prompt`` 明文则保留。
     一次 IN 查询批量取回所需 blob，避免 N+1。
     引用 hash 在库中不存在时抛 ``NotFoundError``（避免空 prompt 静默跑飞）。
     """
@@ -145,26 +144,29 @@ async def hydrate_snapshot_content(
 
     needed: set[str] = set()
     mem = out.get("memory")
-    if isinstance(mem, dict) and "content" not in mem and mem.get("content_hash"):
+    if isinstance(mem, dict) and mem.get("content_hash"):
         needed.add(str(mem["content_hash"]))
     for agent in out.get("agents") or []:
         if not isinstance(agent, dict):
             continue
-        if not agent.get("system_prompt") and agent.get("system_prompt_hash"):
+        if agent.get("system_prompt_hash"):
             needed.add(str(agent["system_prompt_hash"]))
         for skill in agent.get("skills") or []:
-            if isinstance(skill, dict) and not skill.get("content") and skill.get(
-                "content_hash"
-            ):
+            if isinstance(skill, dict) and skill.get("content_hash"):
                 needed.add(str(skill["content_hash"]))
 
     bodies = await get_content_blobs(db, needed)
 
     if isinstance(mem, dict):
         mem = dict(mem)
-        if "content" not in mem and mem.get("content_hash"):
+        digest = mem.get("content_hash")
+        if digest:
             mem["content"] = _require_blob_body(
-                bodies, str(mem["content_hash"]), label="Memory"
+                bodies, str(digest), label="Memory"
+            )
+        elif mem.get("content"):
+            raise NotFoundError(
+                "快照 Memory 仅为明文、缺少 content_hash；请重新发布方法论"
             )
         out["memory"] = mem
 
@@ -173,18 +175,28 @@ async def hydrate_snapshot_content(
         if not isinstance(agent, dict):
             continue
         a = dict(agent)
-        if not a.get("system_prompt") and a.get("system_prompt_hash"):
+        digest = a.get("system_prompt_hash")
+        if digest:
             a["system_prompt"] = _require_blob_body(
-                bodies, str(a["system_prompt_hash"]), label="system_prompt"
+                bodies, str(digest), label="system_prompt"
+            )
+        elif a.get("system_prompt"):
+            raise NotFoundError(
+                "快照 system_prompt 仅为明文、缺少 system_prompt_hash；请重新发布方法论"
             )
         skills: list[dict[str, Any]] = []
         for skill in a.get("skills") or []:
             if not isinstance(skill, dict):
                 continue
             s = dict(skill)
-            if not s.get("content") and s.get("content_hash"):
+            skill_digest = s.get("content_hash")
+            if skill_digest:
                 s["content"] = _require_blob_body(
-                    bodies, str(s["content_hash"]), label="Skill"
+                    bodies, str(skill_digest), label="Skill"
+                )
+            elif s.get("content"):
+                raise NotFoundError(
+                    "快照 Skill 仅为明文、缺少 content_hash；请重新发布方法论"
                 )
             skills.append(s)
         a["skills"] = skills

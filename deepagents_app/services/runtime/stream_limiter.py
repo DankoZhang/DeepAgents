@@ -6,10 +6,9 @@ SSE 路由在开始流式响应前申请槽位：单 worker 用进程内 semapho
 用 Redis ZSET 租约（每连接独立 member + 过期 score）。该模块不依赖聊天编排，
 可独立复用与测试。
 
-租约模型相对旧「整数计数 + 仅首次 EXPIRE」：
+租约要点：
 - 崩溃未 release 的槽位靠 score 过期，在后续 acquire 时 ZREMRANGEBYSCORE 回收
-- 不会出现整 key 过期后 DECR 把计数打负
-- 长连接通过 ``StreamSlot.renew()``（SSE ping）续期
+- 长连接通过 ``StreamSlot.renew()`` 续期（SSE 空闲 ping 与忙流均按间隔调用）
 """
 
 from __future__ import annotations
@@ -30,9 +29,7 @@ _stream_semaphore_limit: int | None = None
 
 # ZSET：member=slot_id，score=unix 过期时间
 _REDIS_LEASE_KEY = "deepagents:chat_stream_leases"
-# 旧计数器 key；启动/acquire 时顺带删掉，避免残留干扰运维观察
-_REDIS_LEGACY_COUNTER_KEY = "deepagents:chat_stream_inflight"
-# 租约时长；短于长 SSE 时靠 renew（ping）续期，崩溃后最多泄漏该窗口
+# 租约时长；短于长 SSE 时靠 renew 续期，崩溃后最多泄漏该窗口
 _REDIS_LEASE_TTL_SECONDS = 90.0
 
 _REDIS_ACQUIRE_LUA = """
@@ -63,10 +60,6 @@ redis.call('ZADD', key, expire_at, member)
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
 return 1
 """
-
-_redis_slots_client: Any | None = None
-_redis_slots_lock: asyncio.Lock | None = None
-_legacy_counter_cleared = False
 
 
 class StreamSlot:
@@ -137,49 +130,10 @@ def _use_redis_stream_limiter(settings: Settings) -> bool:
     return mode == "redis" or (mode == "auto" and settings.api_workers > 1)
 
 
-async def _get_redis_slots_client(settings: Settings) -> Any:
-    global _redis_slots_client, _redis_slots_lock, _legacy_counter_cleared
-    if _redis_slots_lock is None:
-        _redis_slots_lock = asyncio.Lock()
-    async with _redis_slots_lock:
-        if _redis_slots_client is None:
-            import redis.asyncio as aioredis
-
-            _redis_slots_client = aioredis.from_url(
-                settings.redis_url,
-                socket_connect_timeout=1.5,
-                socket_timeout=1.5,
-            )
-        client = _redis_slots_client
-        if not _legacy_counter_cleared:
-            try:
-                await client.delete(_REDIS_LEGACY_COUNTER_KEY)
-            except Exception:  # noqa: BLE001
-                logger.debug("清理旧流式计数器 key 失败", exc_info=True)
-            _legacy_counter_cleared = True
-        return client
-
-
-async def close_redis_stream_slots_client() -> None:
-    """关闭流式限流 Redis 客户端（lifespan 退出时调用）。"""
-    global _redis_slots_client, _legacy_counter_cleared
-    if _redis_slots_lock is None:
-        client = _redis_slots_client
-        _redis_slots_client = None
-    else:
-        async with _redis_slots_lock:
-            client = _redis_slots_client
-            _redis_slots_client = None
-    _legacy_counter_cleared = False
-    if client is not None:
-        try:
-            await client.aclose()
-        except Exception:  # noqa: BLE001
-            logger.debug("关闭 Redis 流式槽位客户端失败", exc_info=True)
-
-
 async def _acquire_redis_stream_slot(settings: Settings, limit: int) -> StreamSlot:
-    client = await _get_redis_slots_client(settings)
+    from deepagents_app.services.infra.redis_conn import get_shared_redis
+
+    client = await get_shared_redis()
     timeout = float(settings.chat_stream_acquire_timeout_seconds)
     deadline = asyncio.get_running_loop().time() + (0.001 if timeout <= 0 else timeout)
     lease_ttl = _REDIS_LEASE_TTL_SECONDS

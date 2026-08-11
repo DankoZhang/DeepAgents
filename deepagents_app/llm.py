@@ -8,6 +8,10 @@ Chat Model 工厂
 - openai
 - anthropic
 - openai_compatible（任意兼容 OpenAI API 的端点）
+
+密钥策略：
+- 未传 ``api_key``（本地默认 / 未绑定目录模型）→ 回退 Settings/.env
+- 显式传入 ``api_key=None``/空串（目录模型缺密钥）→ 报错，禁止静默用共享密钥
 """
 
 from __future__ import annotations
@@ -22,6 +26,9 @@ from deepagents_app.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# 区分「未传参，可用 Settings」与「显式无密钥，禁止回退」
+_API_KEY_UNSET: object = object()
+
 
 def build_chat_model(
     settings: Settings,
@@ -31,7 +38,7 @@ def build_chat_model(
     top_p: float | None = None,
     max_tokens: int | None = None,
     provider: str | None = None,
-    api_key: str | None = None,
+    api_key: Any = _API_KEY_UNSET,
     base_url: str | None = None,
     timeout: float | None = None,
     extra: Mapping[str, Any] | None = None,
@@ -41,6 +48,7 @@ def build_chat_model(
 
     参数优先使用显式传入值，缺省回退 ``settings`` / 约定默认值。
     ``extra`` 会合并进构造参数（勿覆盖已显式设置的键）。
+    显式 ``api_key=None``/空串不会回退 ``OPENAI_API_KEY``。
     """
     resolved_provider = provider or settings.model_provider
     name = model_name or settings.model_name
@@ -57,10 +65,11 @@ def build_chat_model(
         for key, value in extra.items():
             kwargs.setdefault(key, value)
 
+    key = _resolve_api_key(settings, resolved_provider, api_key)
+
     if resolved_provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        key = api_key if api_key is not None else settings.openai_api_key
         url = base_url if base_url is not None else settings.openai_base_url
         if key:
             kwargs["api_key"] = key
@@ -81,8 +90,7 @@ def build_chat_model(
         url = base_url if base_url is not None else settings.openai_base_url
         if not url:
             raise BusinessError("openai_compatible 模式必须设置 base_url / OPENAI_BASE_URL")
-        key = api_key if api_key is not None else settings.openai_api_key
-        # 写入 kwargs（覆盖 extra 同名键），避免 ChatOpenAI(api_key=..., **kwargs) 重复传参
+        # Settings 路径允许 EMPTY（如本地无 key 的占位）；目录路径已在 _resolve_api_key 拒绝空密钥
         kwargs["api_key"] = key or "EMPTY"
         kwargs["base_url"] = url
         logger.info(
@@ -98,7 +106,6 @@ def build_chat_model(
     if resolved_provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        key = api_key if api_key is not None else settings.anthropic_api_key
         if key:
             kwargs["api_key"] = key
         logger.info(
@@ -111,6 +118,21 @@ def build_chat_model(
         return ChatAnthropic(**kwargs)
 
     raise BusinessError(f"不支持的 model_provider：{resolved_provider}")
+
+
+def _resolve_api_key(
+    settings: Settings,
+    provider: str,
+    api_key: Any,
+) -> str | None:
+    """未传参 → Settings；显式空 → BusinessError（防多租户串用共享密钥）。"""
+    if api_key is _API_KEY_UNSET:
+        if provider == "anthropic":
+            return settings.anthropic_api_key
+        return settings.openai_api_key
+    if isinstance(api_key, str) and api_key.strip():
+        return api_key.strip()
+    raise BusinessError("未配置 API Key，拒绝使用进程级默认密钥")
 
 
 def model_spec_from_row(row: Any) -> dict[str, Any]:
@@ -144,7 +166,8 @@ def build_chat_model_from_spec(
     spec: Mapping[str, Any] | None,
 ) -> BaseChatModel:
     """从快照 / 目录序列化的 spec 构建模型；spec 为空则用 Settings。"""
-    spec = dict(spec or {})
+    if not spec:
+        return build_chat_model(settings)
     return build_chat_model(
         settings,
         provider=spec.get("provider"),

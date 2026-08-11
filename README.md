@@ -4,7 +4,7 @@
 
 能力概览：
 
-- FastAPI 配置与会话 API（同步聊天 + SSE）
+- FastAPI 配置与会话 API（SSE 聊天）
 - PostgreSQL：方法论 / Agent / Tool / Skill / Middleware / 模型目录（按用户隔离）
 - Redis Stack：LangGraph checkpoint、Agent / MCP 缓存跨 worker 失效、多 worker 下 SSE 全局限流
 - 按方法论动态 `create_deep_agent()` + 进程内 LRU；多进程经 Redis pub/sub 失效
@@ -18,7 +18,7 @@
 ## 快速启动（本地推荐）
 
 ```bash
-cd Agents-Project/DeepAgents
+cd DeepAgents
 
 # 依赖（Python 3.13；以 pyproject.toml / uv.lock 为准）
 uv sync --group dev
@@ -41,7 +41,7 @@ python server.py
 另开终端起前端：
 
 ```bash
-cd Agents-Project/DeepAgents-frontend
+cd ../DeepAgents-frontend
 npm install
 npm run dev
 # http://localhost:5173
@@ -137,9 +137,8 @@ python -m deepagents_app.db.migrate
 | GET | `/api/middleware/list` | 中间件注册表 |
 | POST | `/api/conversation` | 创建会话（绑定方法论版本） |
 | GET | `/api/conversation/{thread_id}/messages` | 历史消息 |
-| POST | `/api/chat` | 聊天（同步 JSON） |
 | POST | `/api/chat/stream` | 聊天（SSE） |
-| POST | `/api/chat/resume` | HITL 恢复 |
+| POST | `/api/chat/resume/stream` | HITL 恢复（SSE） |
 
 流式并发受 `CHAT_STREAM_MAX_CONCURRENT` 限制；抢不到槽返回 **429**。
 

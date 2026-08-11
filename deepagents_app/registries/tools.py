@@ -6,7 +6,7 @@ Tool Registry
 - mcp：按 config 连接 MCP Server，展开为 LangChain tools
 - mcp 工具列表按 tool_id+config 指纹进程内缓存，避免每次组装都重连
 - 配置变更经 Redis pub/sub 跨 worker 失效（见 ``invalidate_mcp_tools_cache``）
-- MCP 加载走当前事件循环的 async 路径（不再使用常驻后台 loop）
+- MCP 加载走当前事件循环的 async 路径
 """
 
 from __future__ import annotations

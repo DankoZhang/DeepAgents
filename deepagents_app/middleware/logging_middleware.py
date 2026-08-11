@@ -71,9 +71,8 @@ def _resolve_agent_name(
 def _tool_call_name(request: ToolCallRequest) -> str:
     tool_call = getattr(request, "tool_call", {}) or {}
     name = tool_call.get("name") if isinstance(tool_call, dict) else None
-    # ToolCallRequest 在不同版本字段略有差异，做兼容读取
     if name is None:
-        name = getattr(request, "name", None) or getattr(request, "tool_name", "?")
+        name = getattr(request, "name", None)
     return str(name or "?")
 
 
@@ -85,7 +84,7 @@ def _task_subagent_type(request: ToolCallRequest) -> str | None:
     args = tool_call.get("args") or {}
     if not isinstance(args, dict):
         return None
-    subagent = args.get("subagent_type") or args.get("agent")
+    subagent = args.get("subagent_type")
     return str(subagent) if subagent else None
 
 

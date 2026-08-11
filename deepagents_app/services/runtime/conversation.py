@@ -91,7 +91,6 @@ async def list_conversations(
     user_id: str,
     methodology_id: str | None = None,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
 ) -> tuple[list[Conversation], int, str | None]:
     """列出当前用户会话；可按方法论过滤。返回 (rows, total, next_cursor)。"""
@@ -107,7 +106,6 @@ async def list_conversations(
         db,
         stmt,
         limit=limit,
-        offset=offset,
         cursor=cursor,
         sort_column=Conversation.created_time,
         id_column=Conversation.id,

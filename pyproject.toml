@@ -1,9 +1,9 @@
 # Project metadata and tool configuration
 
 [project]
-name = "deepagents-demo"
+name = "deepagents-app"
 version = "0.2.0"
-description = "Add your description here"
+description = "DeepAgents methodology-driven multi-agent platform (backend)"
 readme = "README.md"
 # 仅支持 3.13，避免 uv 为 3.14+/win32 等无关环境解析
 requires-python = ">=3.13,<3.14"

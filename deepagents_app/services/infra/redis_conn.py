@@ -2,11 +2,11 @@
 共享 Redis 客户端
 =================
 
-进程内单例的 ``redis.asyncio`` 客户端，供不需要独立连接参数的轻量用途复用
-（当前：GC 调度器的全局单飞锁）。
+进程内单例的 ``redis.asyncio`` 客户端，供 GC 单飞锁、流式限流、
+缓存失效广播（发布）与健康检查复用。
 
-流式限流（``services.chat``）与缓存失效广播（``services.cache_pubsub``：Agent / MCP）目前
-各自维护客户端，后续可迁移到本模块统一管理。
+缓存失效 **订阅** 也借用本客户端创建 pubsub；关闭时只 ``aclose`` pubsub，
+勿在订阅循环里关掉共享客户端。进程退出统一走 ``close_shared_redis``。
 """
 
 from __future__ import annotations

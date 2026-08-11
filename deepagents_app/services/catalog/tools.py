@@ -9,7 +9,6 @@ Tool 注册管理
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from sqlalchemy import select
@@ -18,8 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.db.models import AgentTool, ToolDefinition
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
-from deepagents_app.ownership import validate_resource_id
-from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.catalog.crud_helpers import (
+    ensure_unique_owned_name,
+    get_owned,
+    resolve_resource_id,
+)
 from deepagents_app.services.versioning.revisions import (
     refresh_methodologies_for_agent_ids,
     refresh_methodologies_using_resource,
@@ -40,7 +42,6 @@ async def list_tools(
     status: str | None = None,
     tool_type: str | None = None,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
 ) -> tuple[list[ToolDefinition], int, str | None]:
     """列出当前用户的工具目录；可按 status / tool_type 过滤。返回 (rows, total, next_cursor)。"""
@@ -58,7 +59,6 @@ async def list_tools(
         db,
         stmt,
         limit=limit,
-        offset=offset,
         cursor=cursor,
         sort_column=ToolDefinition.name,
         id_column=ToolDefinition.id,
@@ -97,7 +97,7 @@ async def create_builtin_tool(
         message=f"工具名已存在：{name}",
     )
     row = ToolDefinition(
-        id=_resolve_tool_id(tool_id),
+        id=resolve_resource_id(tool_id, prefix="tool_", label="tool id"),
         owner_user_id=owner_user_id,
         name=name,
         description=description,
@@ -135,7 +135,7 @@ async def create_mcp_tool(
         message=f"工具名已存在：{name}",
     )
     row = ToolDefinition(
-        id=_resolve_tool_id(tool_id),
+        id=resolve_resource_id(tool_id, prefix="tool_", label="tool id"),
         owner_user_id=owner_user_id,
         name=name,
         description=description,
@@ -235,8 +235,3 @@ async def delete_tool(
     await refresh_methodologies_for_agent_ids(
         db, agent_ids, bump_related=bump_related
     )
-
-
-def _resolve_tool_id(tool_id: str | None) -> str:
-    resolved = tool_id or f"tool_{uuid.uuid4().hex[:12]}"
-    return validate_resource_id(resolved, label="tool id")

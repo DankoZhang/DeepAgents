@@ -1,4 +1,4 @@
-# DeepAgents MVP 基础设施：PostgreSQL（配置库）+ Redis Stack（checkpoint）
+# DeepAgents 基础设施：PostgreSQL（配置库）+ Redis Stack（checkpoint）
 #
 # 数据一律走 named volume，避免 bind-mount 路径漂移、容器重建丢盘。
 # 端口默认只绑 127.0.0.1，避免同网段未授权访问。
@@ -23,8 +23,8 @@ services:
       retries: 10
 
   redis:
-    # 固定小版本，避免 latest 静默破坏；自带 RedisJSON + RediSearch
-    image: redis/redis-stack-server:latest
+    # 钉版本，避免 latest 静默破坏；自带 RedisJSON + RediSearch
+    image: redis/redis-stack-server:7.4.0-v8
     container_name: deepagents-redis
     ports:
       - "127.0.0.1:6379:6379"

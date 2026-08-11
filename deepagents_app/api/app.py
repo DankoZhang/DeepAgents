@@ -5,9 +5,7 @@ FastAPI 应用工厂
 职责：
 - 应用启动时初始化日志、引擎、可选统一 GC 后台
 - 挂载 CORS 与各业务路由
-
-HarnessProfile / general-purpose 子 Agent 在组装时按方法论显式注入，
-不再在 lifespan 全局注册。
+- lifespan 内初始化 checkpointer / 缓存失效监听 / GC
 """
 
 from __future__ import annotations
@@ -42,9 +40,8 @@ from deepagents_app.services.infra.cache_pubsub import (
     start_cache_invalidation_listener,
     stop_cache_invalidation_listener,
 )
-from deepagents_app.services.runtime.chat import close_redis_stream_slots_client
 from deepagents_app.services.infra.gc import start_gc_scheduler, stop_gc_scheduler
-from deepagents_app.services.infra.redis_conn import close_shared_redis
+from deepagents_app.services.infra.redis_conn import close_shared_redis, get_shared_redis
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +92,9 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         await stop_gc_scheduler()
-        await close_shared_redis()
+        # 先停订阅/发布任务，再关共享客户端
         await stop_cache_invalidation_listener()
-        await close_redis_stream_slots_client()
+        await close_shared_redis()
         await close_checkpointer()
         await close_auth_http_client()
 
@@ -113,17 +110,12 @@ async def _check_db() -> str:
         return "error"
 
 
-async def _check_redis(redis_url: str) -> str:
+async def _check_redis() -> str:
     try:
-        import redis.asyncio as aioredis
-
-        client = aioredis.from_url(redis_url, socket_connect_timeout=1.5)
-        try:
-            if await client.ping():
-                return "ok"
-            return "error"
-        finally:
-            await client.aclose()
+        client = await get_shared_redis()
+        if await client.ping():
+            return "ok"
+        return "error"
     except Exception as exc:  # noqa: BLE001
         logger.warning("health redis check failed: %s", exc)
         return "error"
@@ -134,7 +126,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title="DeepAgents Methodology Platform",
-        description="可配置方法论驱动的多 Agent 平台（MVP）",
+        description="可配置方法论驱动的多 Agent 平台",
         version="0.2.0",
         lifespan=lifespan,
     )
@@ -191,7 +183,7 @@ def create_app() -> FastAPI:
                         return body
 
         db_status = await _check_db()
-        redis_status = await _check_redis(cfg.redis_url)
+        redis_status = await _check_redis()
 
         overall = "ok"
         if db_status != "ok" or redis_status != "ok":

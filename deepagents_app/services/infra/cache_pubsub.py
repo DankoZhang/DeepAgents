@@ -20,14 +20,11 @@ logger = logging.getLogger(__name__)
 
 AGENT_CHANNEL = "deepagents:agent_cache_invalidate"
 MCP_CHANNEL = "deepagents:mcp_cache_invalidate"
-# 旧名兼容（仅文档/外部引用）；逻辑统一用 AGENT_CHANNEL
-CHANNEL = AGENT_CHANNEL
 
 _WORKER_ID = uuid.uuid4().hex
 
 _listener_task: asyncio.Task[None] | None = None
 _listener_stop: asyncio.Event | None = None
-_publish_client: Any | None = None
 _publish_lock = asyncio.Lock()
 _publish_tasks: set[asyncio.Task[None]] = set()
 
@@ -68,20 +65,11 @@ def _apply_message(channel: str, payload: dict[str, Any]) -> None:
 
 async def _apublish(channel: str, payload: dict[str, Any]) -> None:
     """异步发布；失败只打日志。"""
-    global _publish_client
     try:
-        import redis.asyncio as aioredis
-
-        from deepagents_app.config import get_settings
+        from deepagents_app.services.infra.redis_conn import get_shared_redis
 
         async with _publish_lock:
-            if _publish_client is None:
-                _publish_client = aioredis.from_url(
-                    get_settings().redis_url,
-                    socket_connect_timeout=1.5,
-                    socket_timeout=1.5,
-                )
-            client = _publish_client
+            client = await get_shared_redis()
         await client.publish(channel, json.dumps(payload, ensure_ascii=False))
     except Exception as exc:  # noqa: BLE001
         logger.warning("广播缓存失效失败 channel=%s: %s", channel, exc)
@@ -160,18 +148,10 @@ def publish_mcp_cache_invalidation(
 
 
 async def close_cache_invalidation_publisher() -> None:
-    global _publish_client
+    """等待 in-flight 发布完成；共享 Redis 由 ``close_shared_redis`` 关闭。"""
     pending = list(_publish_tasks)
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
-    async with _publish_lock:
-        client = _publish_client
-        _publish_client = None
-    if client is not None:
-        try:
-            await client.aclose()
-        except Exception:  # noqa: BLE001
-            logger.debug("关闭 cache invalidate publisher 失败", exc_info=True)
 
 
 def _decode_channel(raw: Any) -> str:
@@ -189,16 +169,12 @@ async def start_cache_invalidation_listener() -> None:
     stop = _listener_stop
 
     async def _run() -> None:
-        import redis.asyncio as aioredis
+        from deepagents_app.services.infra.redis_conn import get_shared_redis
 
-        from deepagents_app.config import get_settings
-
-        url = get_settings().redis_url
         while not stop.is_set():
-            client = None
             pubsub = None
             try:
-                client = aioredis.from_url(url, socket_connect_timeout=1.5)
+                client = await get_shared_redis()
                 pubsub = client.pubsub()
                 await pubsub.subscribe(AGENT_CHANNEL, MCP_CHANNEL)
                 logger.info(
@@ -236,11 +212,6 @@ async def start_cache_invalidation_listener() -> None:
                     try:
                         await pubsub.unsubscribe(AGENT_CHANNEL, MCP_CHANNEL)
                         await pubsub.aclose()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if client is not None:
-                    try:
-                        await client.aclose()
                     except Exception:  # noqa: BLE001
                         pass
 

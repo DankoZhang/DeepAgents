@@ -589,7 +589,7 @@ async def _compile_from_agents(
             )
             memory_paths = [memory_virtual] if memory_virtual else None
 
-            # 显式注入 general-purpose，避免依赖全局 HarnessProfile
+            # 按方法论注入 general-purpose 兜底子 Agent
             final_subagents = list(subagents)
             if not any(s.get("name") == "general-purpose" for s in final_subagents):
                 final_subagents.append(

@@ -5,7 +5,7 @@ Skill 目录与物化
 - 目录 CRUD：用户可维护 SKILL.md 正文（含 YAML frontmatter）
 - 组装时按内容哈希物化到 ``workspace/skills/<fingerprint>/<agent_id>/``
   （只写不删；已发布目录可跨缓存生命周期复用）
-- 变更后默认 bump 引用该方法论；旧会话靠快照内嵌 content 重建
+- 变更后默认 bump 引用该方法论；旧会话靠快照 content_hash + content_blob 还原重建
 """
 
 from __future__ import annotations
@@ -29,10 +29,12 @@ from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.config import Settings
 from deepagents_app.db.models import AgentSkill, SkillDefinition
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
-from deepagents_app.ownership import validate_resource_id
-from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.catalog.crud_helpers import (
+    ensure_unique_owned_name,
+    get_owned,
+    resolve_resource_id,
+)
 from deepagents_app.services.versioning.revisions import (
-    bump_methodologies_for_agent_ids,
     refresh_methodologies_for_agent_ids,
     refresh_methodologies_using_resource,
 )
@@ -52,7 +54,6 @@ async def list_skills(
     owner_user_id: str,
     status: str | None = None,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
 ) -> tuple[list[SkillDefinition], int, str | None]:
     """列出当前用户的 Skill 目录；可按 status 过滤。返回 (rows, total, next_cursor)。"""
@@ -68,7 +69,6 @@ async def list_skills(
         db,
         stmt,
         limit=limit,
-        offset=offset,
         cursor=cursor,
         sort_column=SkillDefinition.name,
         id_column=SkillDefinition.id,
@@ -119,7 +119,7 @@ async def create_skill(
         body = build_skill_markdown(name=name, description=description, body=body)
 
     row = SkillDefinition(
-        id=_resolve_skill_id(skill_id),
+        id=resolve_resource_id(skill_id, prefix="skill_", label="skill id"),
         owner_user_id=owner_user_id,
         name=name,
         description=(description or "").strip(),
@@ -657,8 +657,3 @@ def _validate_skill_name(name: str) -> None:
         raise BusinessError(
             "Skill name 须为字母/数字开头，仅含字母数字、连字符、下划线（亦作物化目录名）"
         )
-
-
-def _resolve_skill_id(skill_id: str | None) -> str:
-    resolved = skill_id or f"skill_{uuid.uuid4().hex[:12]}"
-    return validate_resource_id(resolved, label="skill id")

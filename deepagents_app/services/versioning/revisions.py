@@ -8,7 +8,8 @@
 - 配置变更时统一 ``bump_methodology``：
   - draft：不升版、不写快照（draft 无人读）；仅刷新时间戳并失效缓存
   - published：升版 + 新快照，并按保留策略裁剪历史
-- Agent / 模型 / 工具 / Skill 变更时，级联 bump 所有引用它们的方法论
+- Agent / 模型变更时级联 bump；Tool / Skill 变更走 ``refresh_methodologies_using_resource``
+  （可升版或仅失效缓存）
 """
 
 from __future__ import annotations
@@ -54,8 +55,6 @@ __all__ = [
     "bump_methodologies_using_resource",
     "bump_methodologies_using_agent",
     "bump_methodologies_using_model",
-    "bump_methodologies_using_tool",
-    "bump_methodologies_using_skill",
 ]
 
 
@@ -410,8 +409,9 @@ async def bump_methodologies_using_resource(
     """
     按资源类型解析引用该资源的 Agent，再级联 bump 相关方法论。
 
-    ``kind``：``agent`` / ``model`` / ``tool`` / ``skill``。
-    返回是否命中至少一个方法论（agent/model）或至少一个关联 Agent（tool/skill）。
+    ``kind``：``agent`` / ``model``。
+    Tool / Skill 变更请走 ``refresh_methodologies_using_resource``。
+    返回是否命中至少一个方法论。
     """
     if kind == "agent":
         return await bump_methodologies_for_agent_ids(db, [resource_id])
@@ -421,24 +421,6 @@ async def bump_methodologies_using_resource(
             a.id
             for a in await db.scalars(
                 select(AgentDefinition).where(AgentDefinition.model_id == resource_id)
-            )
-        ]
-        return await bump_methodologies_for_agent_ids(db, agent_ids)
-
-    if kind == "tool":
-        agent_ids = [
-            link.agent_id
-            for link in await db.scalars(
-                select(AgentTool).where(AgentTool.tool_id == resource_id)
-            )
-        ]
-        return await bump_methodologies_for_agent_ids(db, agent_ids)
-
-    if kind == "skill":
-        agent_ids = [
-            link.agent_id
-            for link in await db.scalars(
-                select(AgentSkill).where(AgentSkill.skill_id == resource_id)
             )
         ]
         return await bump_methodologies_for_agent_ids(db, agent_ids)
@@ -454,17 +436,3 @@ async def bump_methodologies_using_agent(db: AsyncSession, agent_id: str) -> Non
 async def bump_methodologies_using_model(db: AsyncSession, model_id: str) -> None:
     """模型超参数变更：bump 所有引用该模型的 Agent 所在方法论。"""
     await bump_methodologies_using_resource(db, kind="model", resource_id=model_id)
-
-
-async def bump_methodologies_using_tool(db: AsyncSession, tool_id: str) -> bool:
-    """升版引用该工具的方法论；返回是否命中至少一个 Agent。"""
-    return await bump_methodologies_using_resource(
-        db, kind="tool", resource_id=tool_id
-    )
-
-
-async def bump_methodologies_using_skill(db: AsyncSession, skill_id: str) -> bool:
-    """升版引用该 Skill 的方法论；返回是否命中至少一个 Agent。"""
-    return await bump_methodologies_using_resource(
-        db, kind="skill", resource_id=skill_id
-    )

@@ -17,7 +17,6 @@ from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
     cursor_query,
     limit_query,
-    offset_query,
     set_next_cursor,
     set_total_count,
 )
@@ -33,7 +32,6 @@ async def list_tools(
     status: str | None = Query(None, description="active | disabled"),
     tool_type: str | None = Query(None, description="builtin | mcp"),
     limit: int = Depends(limit_query),
-    offset: int = Depends(offset_query),
     cursor: str | None = Depends(cursor_query),
     db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
@@ -44,7 +42,6 @@ async def list_tools(
         status=status,
         tool_type=tool_type,
         limit=limit,
-        offset=offset,
         cursor=cursor,
     )
     set_total_count(response, total)

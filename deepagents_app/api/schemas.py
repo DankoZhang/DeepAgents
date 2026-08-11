@@ -17,6 +17,8 @@ from typing import Any, Literal
 # BaseModel：schema 基类；Field：默认值/工厂；model_validator：跨字段校验
 from pydantic import BaseModel, Field, computed_field, model_validator
 
+from deepagents_app.constants import ModelProvider
+
 
 # ── Tool / Middleware briefs（嵌套在 Agent 响应里的精简摘要）──────────────
 
@@ -59,7 +61,7 @@ class ModelCreate(BaseModel):
     """POST /api/model：前端配置一条大模型。"""
 
     name: str  # 显示名，全局唯一
-    provider: Literal["openai", "anthropic", "openai_compatible"] = "openai"
+    provider: ModelProvider = "openai"
     model_name: str  # 提供商侧模型 ID，如 gpt-4o / deepseek-chat
     api_key: str | None = None
     base_url: str | None = None  # openai_compatible 常用
@@ -76,10 +78,9 @@ class ModelUpdate(BaseModel):
     """PATCH /api/model/{id}。"""
 
     name: str | None = None
-    provider: Literal["openai", "anthropic", "openai_compatible"] | None = None
+    provider: ModelProvider | None = None
     model_name: str | None = None
     api_key: str | None = None
-    clear_api_key: bool = False  # True 时清空已存密钥
     base_url: str | None = None
     temperature: float | None = None
     top_p: float | None = None
@@ -137,7 +138,7 @@ class ModelTestRequest(BaseModel):
     """POST /api/model/test：按 id 或内联配置试连。"""
 
     model_id: str | None = None
-    provider: Literal["openai", "anthropic", "openai_compatible"] | None = None
+    provider: ModelProvider | None = None
     model_name: str | None = None
     api_key: str | None = None
     base_url: str | None = None
@@ -162,7 +163,7 @@ class AgentCreate(BaseModel):
 
     name: str  # 全局唯一名称
     system_prompt: str = ""  # 系统提示词
-    model_id: str | None = None  # 绑定模型目录；缺省用 model_default
+    model_id: str | None = None  # 绑定模型目录；缺省用用户默认模型
     # 扩展字段：role(supervisor|subagent) / description / enabled 等
     config: dict[str, Any] = Field(default_factory=dict)
     tool_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的工具 id
@@ -176,7 +177,7 @@ class AgentUpdate(BaseModel):
 
     name: str | None = None
     system_prompt: str | None = None
-    model_id: str | None = None  # 传空串则回落 model_default
+    model_id: str | None = None  # 传空串则回落用户默认模型
     config: dict[str, Any] | None = None  # 与现有 config 做 merge，非整表替换语义由 service 定
     tool_ids: list[str] | None = None  # 传入则整表替换绑定
     middleware_ids: list[str] | None = None
@@ -428,17 +429,6 @@ class ChatResumeRequest(BaseModel):
 
     thread_id: str
     approve: bool = True  # True 批准继续；False 拒绝
-
-
-class ChatResponse(BaseModel):
-    """一轮 chat / resume 的结果。"""
-
-    thread_id: str
-    reply: str  # 助手最终回复文本
-    interrupted: bool = False  # 是否因 HITL 暂停
-    interrupt: list[dict[str, Any]] | None = None  # 结构化 HITL（工具名/参数/id）
-    methodology_id: str
-    methodology_version: int
 
 
 class ChatMessageOut(BaseModel):

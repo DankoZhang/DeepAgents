@@ -224,7 +224,7 @@ wheels = [
 ]
 
 [[package]]
-name = "deepagents-demo"
+name = "deepagents-app"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [

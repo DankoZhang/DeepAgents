@@ -27,23 +27,18 @@ def test_validate_resource_id_rejects_path_traversal():
 async def test_list_methodologies_pagination(db_session):
     from deepagents_app.services.catalog import methodology as methodology_svc
     rows, total, next_cursor = await methodology_svc.list_methodologies(
-        db_session, owner_user_id=TEST_USER, limit=1, offset=0
+        db_session, owner_user_id=TEST_USER, limit=1
     )
     assert total >= 1
     assert len(rows) == 1
 
-    rows2, total2, _ = await methodology_svc.list_methodologies(
-        db_session, owner_user_id=TEST_USER, limit=1, offset=1
-    )
-    assert total2 == total
     if total > 1:
-        assert rows[0].id != rows2[0].id
         assert next_cursor is not None
-        rows3, total3, _ = await methodology_svc.list_methodologies(
+        rows2, total2, _ = await methodology_svc.list_methodologies(
             db_session, owner_user_id=TEST_USER, limit=1, cursor=next_cursor
         )
-        assert total3 == total
-        assert rows3[0].id == rows2[0].id
+        assert total2 == total
+        assert rows[0].id != rows2[0].id
 
 
 async def test_pagination_cursor_roundtrip():
@@ -68,30 +63,32 @@ async def test_create_methodology_rejects_bad_id(db_session):
 
 
 async def test_agent_cache_lru_eviction(db_session, monkeypatch, tmp_path):
+    """缓存超额时按 LRU 淘汰，并释放对应空闲构建锁。"""
     from deepagents_app import config
-    from deepagents_app.ownership import demo_methodology_id_for_user
     from deepagents_app.services.runtime import agent_factory as af
+
     config.get_settings.cache_clear()
     settings = config.get_settings()
     assert settings.agent_cache_max_size == 2
 
-    mid = demo_methodology_id_for_user(TEST_USER)
     af.invalidate_agent_cache()
-
-    # 不真正 create_deep_agent：用假对象测 LRU 读写
     af._cache.clear()
     af._cache_put("u:a:v1", object())
+    af._build_lock_for("u:a:v1")
     af._cache_put("u:b:v1", object())
+    af._build_lock_for("u:b:v1")
     assert len(af._cache) == 2
     # 访问 a，再放入 c → 应淘汰最久未用的 b
     assert af._cache_get("u:a:v1") is not None
     evicted = af._cache_put("u:c:v1", object())
     assert "u:b:v1" in evicted
+    for key in evicted:
+        af._drop_build_lock(key)
     assert "u:b:v1" not in af._cache
+    assert "u:b:v1" not in af._build_locks
     assert "u:a:v1" in af._cache
     assert "u:c:v1" in af._cache
-    # mid 仅用于确认 bootstrap 可用
-    assert mid
+    af.invalidate_agent_cache()
 
 
 async def test_bind_agents_returns_detail(db_session):
@@ -552,6 +549,28 @@ async def test_hydrate_missing_blob_raises(db_session):
         )
 
 
+async def test_hydrate_plaintext_only_snapshot_rejected(db_session):
+    """快照须含 content_blob hash；仅明文正文无法重建。"""
+    from deepagents_app.api.errors import NotFoundError
+    from deepagents_app.services.versioning.content_blobs import hydrate_snapshot_content
+
+    with pytest.raises(NotFoundError, match="仅为明文"):
+        await hydrate_snapshot_content(
+            db_session,
+            {
+                "memory": {"content": "old plaintext memory"},
+                "agents": [
+                    {
+                        "id": "a1",
+                        "name": "a",
+                        "system_prompt": "old prompt",
+                        "skills": [{"name": "s", "content": "old skill"}],
+                    }
+                ],
+            },
+        )
+
+
 async def test_gc_second_pass_keeps_rereferenced_hash(db_session, monkeypatch):
     """删除前二次扫引用：第一次像孤儿、第二次又被引用时不得删。"""
     from deepagents_app.services.versioning import content_blobs as blobs_mod
@@ -600,7 +619,7 @@ def test_touch_materialized_skills_complete(tmp_path):
 def test_serialize_interrupts_structured():
     from types import SimpleNamespace
 
-    from deepagents_app.services.runtime.chat import serialize_interrupts
+    from deepagents_app.services.runtime.message_serde import serialize_interrupts
 
     interrupt = SimpleNamespace(
         id="irq-1",
@@ -614,3 +633,110 @@ def test_serialize_interrupts_structured():
     assert packed is not None
     assert packed[0]["id"] == "irq-1"
     assert packed[0]["actions"][0]["name"] == "run_shell_command"
+
+
+async def test_resolve_model_spec_rejects_disabled_even_with_snapshot_llm(
+    db_session,
+):
+    """内嵌 snapshot llm 时仍须校验 live status=active，禁止跳过运营停用。"""
+    from deepagents_app.api.errors import BusinessError
+    from deepagents_app.services.catalog import llm_models as models_svc
+
+    row = await models_svc.create_model(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="resolve-disabled-probe",
+        provider="openai_compatible",
+        model_name="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+        api_key="sk-test-resolve",
+        status="active",
+    )
+    snapshot_llm = models_svc.serialize_model_for_snapshot(row)
+    assert snapshot_llm is not None
+
+    ok = await models_svc.resolve_model_spec_for_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        model_id=row.id,
+        snapshot_llm=snapshot_llm,
+    )
+    assert ok is not None
+    assert ok.get("model_id") == row.id
+    assert ok.get("api_key")  # 从 live 回填
+
+    await models_svc.update_model(
+        db_session,
+        row.id,
+        owner_user_id=TEST_USER,
+        status="disabled",
+        bump_related=False,
+    )
+
+    with pytest.raises(BusinessError, match="模型已禁用"):
+        await models_svc.resolve_model_spec_for_agent(
+            db_session,
+            owner_user_id=TEST_USER,
+            model_id=row.id,
+            snapshot_llm=snapshot_llm,
+        )
+
+
+async def test_resolve_model_spec_rejects_missing_catalog_api_key(db_session):
+    """目录模型无密钥时不得回退 OPENAI_API_KEY。"""
+    from deepagents_app.api.errors import BusinessError
+    from deepagents_app.services.catalog import llm_models as models_svc
+
+    row = await models_svc.create_model(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="resolve-nokey-probe",
+        provider="openai_compatible",
+        model_name="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+        api_key=None,
+        status="active",
+    )
+    snapshot_llm = models_svc.serialize_model_for_snapshot(row)
+
+    with pytest.raises(BusinessError, match="未配置 API Key"):
+        await models_svc.resolve_model_spec_for_agent(
+            db_session,
+            owner_user_id=TEST_USER,
+            model_id=row.id,
+            snapshot_llm=snapshot_llm,
+        )
+
+
+def test_build_chat_model_rejects_explicit_empty_api_key():
+    from deepagents_app.api.errors import BusinessError
+    from deepagents_app.config import Settings
+    from deepagents_app.llm import build_chat_model, build_chat_model_from_spec
+
+    settings = Settings(
+        model_provider="openai_compatible",
+        model_name="demo",
+        openai_api_key="sk-env-shared",
+        openai_base_url="https://api.deepseek.com/v1",
+    )
+    with pytest.raises(BusinessError, match="拒绝使用进程级默认密钥"):
+        build_chat_model(
+            settings,
+            provider="openai_compatible",
+            model_name="x",
+            base_url="https://api.deepseek.com/v1",
+            api_key=None,
+        )
+    with pytest.raises(BusinessError, match="拒绝使用进程级默认密钥"):
+        build_chat_model_from_spec(
+            settings,
+            {
+                "provider": "openai_compatible",
+                "model_name": "x",
+                "base_url": "https://api.deepseek.com/v1",
+                "api_key": None,
+            },
+        )
+    # 未绑定目录模型：允许 Settings 回退
+    model = build_chat_model_from_spec(settings, None)
+    assert model is not None

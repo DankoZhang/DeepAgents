@@ -5,13 +5,14 @@
 - CRUD：用户维护可用模型（provider / base_url / 超参）
 - 连通性测试：不落库，仅验证配置能否发起调用
 - 变更后 bump 引用该模型的方法论，旧会话靠快照 llm 重建
-- 组装时 ``resolve_model_spec_for_agent``：快照 llm → 目录 → Settings 默认
+- 组装时 ``resolve_model_spec_for_agent``：快照 llm → 目录 → Settings 默认；
+  有目录 ``model_id`` 时一律校验 live ``status=active`` 且已配置 API Key
+  （禁止串用进程级 ``OPENAI_API_KEY``）
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,18 +21,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.config import Settings, get_settings
-from deepagents_app.crypto import decrypt_secret, encrypt_secret, secret_is_present
+from deepagents_app.constants import ALLOWED_PROVIDERS
+from deepagents_app.crypto import decrypt_secret, encrypt_secret
 from deepagents_app.db.models import AgentDefinition, ModelDefinition
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.llm import build_chat_model, model_spec_from_row
-from deepagents_app.ownership import default_model_id_for_user, validate_resource_id
+from deepagents_app.ownership import default_model_id_for_user
 from deepagents_app.utils.text import normalize_message_content
 from deepagents_app.utils.url_safety import assert_safe_http_url
-from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.catalog.crud_helpers import (
+    ensure_unique_owned_name,
+    get_owned,
+    resolve_resource_id,
+)
 
 logger = logging.getLogger(__name__)
-
-ALLOWED_PROVIDERS = frozenset({"openai", "anthropic", "openai_compatible"})
 
 
 async def list_models(
@@ -40,7 +44,6 @@ async def list_models(
     owner_user_id: str,
     status: str | None = None,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
 ) -> tuple[list[ModelDefinition], int, str | None]:
     """列出当前用户的模型目录；可按 status 过滤。返回 (rows, total, next_cursor)。"""
@@ -56,7 +59,6 @@ async def list_models(
         db,
         stmt,
         limit=limit,
-        offset=offset,
         cursor=cursor,
         sort_column=ModelDefinition.name,
         id_column=ModelDefinition.id,
@@ -107,7 +109,7 @@ async def create_model(
     )
 
     row = ModelDefinition(
-        id=_resolve_model_create_id(model_id),
+        id=resolve_resource_id(model_id, prefix="model_", label="model id"),
         owner_user_id=owner_user_id,
         name=name,
         provider=provider,
@@ -135,7 +137,6 @@ async def update_model(
     provider: str | None = None,
     model_name: str | None = None,
     api_key: str | None = None,
-    clear_api_key: bool = False,
     base_url: str | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -148,8 +149,7 @@ async def update_model(
     """
     更新模型；字段为 None 表示不改。
 
-    ``clear_api_key=True`` 显式清空密钥（与传空字符串区分）。
-    ``bump_related=True`` 时升版所有引用该模型的方法论。
+    ``api_key`` 有值则加密覆盖；``bump_related=True`` 时升版所有引用该模型的方法论。
     """
     row = await get_model(db, model_id, owner_user_id=owner_user_id)
     if row is None:
@@ -170,9 +170,7 @@ async def update_model(
         row.provider = provider
     if model_name is not None:
         row.model_name = model_name
-    if clear_api_key:
-        row.api_key = None
-    elif api_key is not None:
+    if api_key is not None:
         row.api_key = encrypt_secret(api_key or None)
     if base_url is not None:
         if base_url:
@@ -254,6 +252,12 @@ async def test_model_connectivity(
     """对给定配置发起一次极简调用，验证连通性（不写库）。"""
     settings = settings or get_settings()
     _validate_provider(provider)
+    if not (api_key and str(api_key).strip()):
+        return {
+            "ok": False,
+            "message": "未提供 API Key，拒绝使用进程级默认密钥试连",
+            "reply_preview": None,
+        }
     if base_url:
         # 生产拦截 SSRF；本地 AUTH_DISABLED 允许 Ollama 等私网端点
         base_url = assert_safe_http_url(
@@ -356,6 +360,14 @@ def _decrypt_api_key(stored: str | None, *, context: str) -> str | None:
         raise BusinessError(f"{context}：{exc}") from exc
 
 
+def _require_catalog_api_key(api_key: str | None, *, label: str) -> str:
+    """目录模型必须自带密钥，禁止回退进程级 OPENAI_API_KEY。"""
+    key = (api_key or "").strip()
+    if not key:
+        raise BusinessError(f"模型未配置 API Key：{label}")
+    return key
+
+
 async def resolve_model_spec_for_agent(
     db: AsyncSession,
     *,
@@ -366,35 +378,50 @@ async def resolve_model_spec_for_agent(
     """
     组装 Agent 时解析最终模型 spec。
 
-    优先级：快照 llm（缺 api_key 则按 model_id 回填并解密）> model_id 目录；
-    皆无则返回 None（上层回退 Settings/.env）。
+    优先级：快照 llm（密钥一律按 model_id 从 live 回填）> model_id 目录；
+    凡能解析到目录 ``model_id`` 的，一律读 live，要求 ``status=active``
+    且已配置 API Key（禁止因内嵌 llm / 缺密钥而串用进程级默认密钥）。
+    皆无则返回 None（上层回退 Settings/.env，仅未绑定目录模型时）。
     """
+    mid: str | None = None
+    if snapshot_llm and snapshot_llm.get("model_id"):
+        mid = str(snapshot_llm["model_id"])
+    elif model_id:
+        mid = str(model_id)
+
+    live: ModelDefinition | None = None
+    if mid:
+        live = await get_model(db, mid, owner_user_id=owner_user_id)
+        if live is None:
+            raise NotFoundError(f"Agent 绑定的模型不存在：{mid}")
+        if live.status != "active":
+            raise BusinessError(f"模型已禁用：{live.name} ({mid})")
+
     if snapshot_llm:
-        spec = dict(snapshot_llm)
-        mid = spec.get("model_id")
-        # 快照通常不存密钥，组装时从 live 目录补回
-        if mid and not spec.get("api_key"):
-            live = await get_model(db, str(mid), owner_user_id=owner_user_id)
-            if live is not None:
-                spec["api_key"] = _decrypt_api_key(
-                    live.api_key, context=f"模型 {mid} 的 api_key 解密失败"
-                )
-                if not spec.get("base_url"):
-                    spec["base_url"] = live.base_url
-        elif spec.get("api_key"):
-            spec["api_key"] = _decrypt_api_key(
-                str(spec["api_key"]),
-                context="快照中的 api_key 解密失败",
+        if live is None:
+            raise BusinessError(
+                "快照模型缺少可校验的 model_id，拒绝回退进程级默认密钥"
             )
+        spec = dict(snapshot_llm)
+        # 快照不存密钥；始终从 live 回填，且必须非空
+        spec["api_key"] = _require_catalog_api_key(
+            _decrypt_api_key(
+                live.api_key, context=f"模型 {mid} 的 api_key 解密失败"
+            ),
+            label=f"{live.name} ({mid})",
+        )
+        if not spec.get("base_url"):
+            spec["base_url"] = live.base_url
         return spec
 
-    if model_id:
-        row = await get_model(db, model_id, owner_user_id=owner_user_id)
-        if row is None:
-            raise NotFoundError(f"Agent 绑定的模型不存在：{model_id}")
-        if row.status != "active":
-            raise BusinessError(f"模型已禁用：{row.name} ({model_id})")
-        return model_spec_from_row(row)
+    if live is not None:
+        spec = model_spec_from_row(live)
+        raw_key = spec.get("api_key")
+        spec["api_key"] = _require_catalog_api_key(
+            raw_key if isinstance(raw_key, str) else None,
+            label=f"{live.name} ({mid})",
+        )
+        return spec
 
     return None
 
@@ -436,8 +463,3 @@ def _validate_provider(provider: str) -> None:
         raise BusinessError(
             f"不支持的 provider：{provider}，可选：{', '.join(sorted(ALLOWED_PROVIDERS))}"
         )
-
-
-def _resolve_model_create_id(model_id: str | None) -> str:
-    resolved = model_id or f"model_{uuid.uuid4().hex[:12]}"
-    return validate_resource_id(resolved, label="model id")

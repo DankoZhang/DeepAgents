@@ -16,7 +16,6 @@ from deepagents_app.api.errors import require_entity
 from deepagents_app.api.pagination import (
     cursor_query,
     limit_query,
-    offset_query,
     set_next_cursor,
     set_total_count,
 )
@@ -31,7 +30,6 @@ async def list_skills(
     response: Response,
     status: str | None = Query(None, description="active | disabled"),
     limit: int = Depends(limit_query),
-    offset: int = Depends(offset_query),
     cursor: str | None = Depends(cursor_query),
     db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
@@ -41,7 +39,6 @@ async def list_skills(
         owner_user_id=user_id,
         status=status,
         limit=limit,
-        offset=offset,
         cursor=cursor,
     )
     set_total_count(response, total)

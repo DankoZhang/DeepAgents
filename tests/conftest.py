@@ -43,20 +43,27 @@ def _cleanup_test_redis_keys() -> None:
         logger.warning("清理测试 Redis 失败（%s）: %s", TEST_REDIS_URL, exc)
 
 
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
+def _apply_test_env(
+    monkeypatch,
+    tmp_path,
+    *,
+    db_name: str,
+    auth_user: str,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    """HTTP / DB fixture 共用的环境变量与缓存重置。"""
     from deepagents_app import config
     from deepagents_app.auth import clear_auth_cache
     from deepagents_app.db.seed import clear_bootstrap_cache
-    from deepagents_app.db.session import migrate_db, reset_engine
+    from deepagents_app.db.session import reset_engine
     from deepagents_app.services.runtime.agent_factory import invalidate_agent_cache
 
-    db_path = tmp_path / "test.db"
+    db_path = tmp_path / db_name
     monkeypatch.setenv("DATABASE_URL", f"sqlite+pysqlite:///{db_path}")
     monkeypatch.setenv("REDIS_URL", TEST_REDIS_URL)
     monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspace"))
     monkeypatch.setenv("AUTH_DISABLED", "true")
-    monkeypatch.setenv("AUTH_DEV_USER_ID", TEST_USER)
+    monkeypatch.setenv("AUTH_DEV_USER_ID", auth_user)
     monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
     monkeypatch.setenv(
         "MCP_STDIO_COMMAND_ALLOWLIST", "npx,uvx,node,python,python3,echo"
@@ -65,6 +72,8 @@ def client(tmp_path, monkeypatch):
     # 测试里禁用后台 GC，避免干扰断言 / 占用事件循环
     monkeypatch.setenv("SKILLS_GC_INTERVAL_HOURS", "0")
     monkeypatch.setenv("CONTENT_BLOB_GC_INTERVAL_HOURS", "0")
+    for key, value in (extra_env or {}).items():
+        monkeypatch.setenv(key, value)
     config.get_settings.cache_clear()
     clear_auth_cache()
     clear_bootstrap_cache()
@@ -72,6 +81,27 @@ def client(tmp_path, monkeypatch):
     invalidate_agent_cache()
     _cleanup_test_redis_keys()
 
+
+def _reset_test_state() -> None:
+    from deepagents_app import config
+    from deepagents_app.auth import clear_auth_cache
+    from deepagents_app.db.seed import clear_bootstrap_cache
+    from deepagents_app.db.session import reset_engine
+    from deepagents_app.services.runtime.agent_factory import invalidate_agent_cache
+
+    reset_engine()
+    invalidate_agent_cache()
+    clear_bootstrap_cache()
+    clear_auth_cache()
+    config.get_settings.cache_clear()
+    _cleanup_test_redis_keys()
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    from deepagents_app.db.session import migrate_db
+
+    _apply_test_env(monkeypatch, tmp_path, db_name="test.db", auth_user=TEST_USER)
     migrate_db()
 
     from fastapi.testclient import TestClient
@@ -83,47 +113,22 @@ def client(tmp_path, monkeypatch):
         assert boot.status_code == 200, boot.text
         yield c
 
-    reset_engine()
-    invalidate_agent_cache()
-    clear_bootstrap_cache()
-    clear_auth_cache()
-    config.get_settings.cache_clear()
-    _cleanup_test_redis_keys()
+    _reset_test_state()
 
 
 @pytest.fixture()
 async def db_session(tmp_path, monkeypatch):
-    from deepagents_app import config
-    from deepagents_app.auth import clear_auth_cache
-    from deepagents_app.db.seed import clear_bootstrap_cache, ensure_user_bootstrap
-    from deepagents_app.db.session import (
-        get_async_session_factory,
-        migrate_db,
-        reset_engine,
-    )
-    from deepagents_app.services.runtime.agent_factory import invalidate_agent_cache
+    from deepagents_app.db.seed import ensure_user_bootstrap
+    from deepagents_app.db.session import get_async_session_factory, migrate_db
     from deepagents_app.services.versioning.revisions import flush_cache_invalidations
 
-    db_path = tmp_path / "svc.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+pysqlite:///{db_path}")
-    monkeypatch.setenv("REDIS_URL", TEST_REDIS_URL)
-    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "workspace"))
-    monkeypatch.setenv("AUTH_DISABLED", "true")
-    monkeypatch.setenv("AUTH_DEV_USER_ID", SVC_TEST_USER)
-    monkeypatch.setenv("AGENT_CACHE_MAX_SIZE", "2")
-    monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    monkeypatch.setenv(
-        "MCP_STDIO_COMMAND_ALLOWLIST", "npx,uvx,node,python,python3,echo"
+    _apply_test_env(
+        monkeypatch,
+        tmp_path,
+        db_name="svc.db",
+        auth_user=SVC_TEST_USER,
+        extra_env={"AGENT_CACHE_MAX_SIZE": "2"},
     )
-    monkeypatch.setenv("SECRETS_ALLOW_INSECURE_DEV_KEY", "true")
-    monkeypatch.setenv("SKILLS_GC_INTERVAL_HOURS", "0")
-    monkeypatch.setenv("CONTENT_BLOB_GC_INTERVAL_HOURS", "0")
-    config.get_settings.cache_clear()
-    clear_auth_cache()
-    clear_bootstrap_cache()
-    reset_engine()
-    invalidate_agent_cache()
-    _cleanup_test_redis_keys()
     migrate_db()
 
     factory = get_async_session_factory()
@@ -135,9 +140,4 @@ async def db_session(tmp_path, monkeypatch):
         yield db
     finally:
         await db.close()
-        reset_engine()
-        invalidate_agent_cache()
-        clear_bootstrap_cache()
-        clear_auth_cache()
-        config.get_settings.cache_clear()
-        _cleanup_test_redis_keys()
+        _reset_test_state()

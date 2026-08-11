@@ -3,7 +3,7 @@ API / 配置库冒烟测试（不依赖 LLM）。
 
 运行::
 
-    python -m pytest tests/test_api_mvp.py -q
+    python -m pytest tests/test_api.py -q
 """
 
 from __future__ import annotations
@@ -124,11 +124,11 @@ def test_model_catalog_crud(client, demo_ids):
 
     patched = client.patch(
         f"/api/model/{model_id}",
-        json={"temperature": 0.5, "clear_api_key": True},
+        json={"temperature": 0.5},
     )
     assert patched.status_code == 200
     assert patched.json()["temperature"] == 0.5
-    assert patched.json()["has_api_key"] is False
+    assert patched.json()["has_api_key"] is True
 
     agent = client.post(
         "/api/agent",
@@ -936,13 +936,15 @@ def test_middleware_list_ok(client):
 
 
 def test_chat_e2e_with_fake_model(client, demo_ids, monkeypatch):
-    """A1 回归：真实 AsyncRedisSaver + 假 ChatModel，聊天路径可 ainvoke。"""
+    """A1 回归：真实 AsyncRedisSaver + 假 ChatModel，SSE 聊天路径可跑通。"""
+    import json
     import uuid
 
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
     from deepagents_app.services.runtime import agent_factory as af
     from deepagents_app.services.catalog import llm_models as models_svc
+
     class _ToolAwareFake(FakeListChatModel):
         def bind_tools(self, tools, **kwargs):  # noqa: ANN001, ARG002
             return self
@@ -981,18 +983,29 @@ def test_chat_e2e_with_fake_model(client, demo_ids, monkeypatch):
     assert created.status_code == 200, created.text
     assert created.json()["thread_id"] == tid
 
-    chat = client.post(
-        "/api/chat",
+    with client.stream(
+        "POST",
+        "/api/chat/stream",
         json={"thread_id": tid, "message": "打个招呼"},
-    )
-    assert chat.status_code == 200, chat.text
-    body = chat.json()
-    assert body["thread_id"] == tid
-    assert body.get("interrupted") is False
-    assert body.get("reply")
-    assert "冒烟" in body["reply"] or len(body["reply"]) > 0
+    ) as chat:
+        assert chat.status_code == 200, chat.text
+        text = "".join(chat.iter_text())
+
+    done: dict | None = None
+    event_name = None
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            event_name = line.removeprefix("event:").strip()
+        elif line.startswith("data:") and event_name == "done":
+            done = json.loads(line.removeprefix("data:").strip())
+            break
+    assert done is not None, text
+    assert done["thread_id"] == tid
+    assert done.get("interrupted") is False
+    assert done.get("reply")
+    assert "冒烟" in done["reply"] or len(done["reply"]) > 0
 
     msgs = client.get(f"/api/conversation/{tid}/messages")
     assert msgs.status_code == 200, msgs.text
     history = msgs.json()
-    assert history.get("messages") or history  # 兼容 list / dict
+    assert history.get("messages") or history

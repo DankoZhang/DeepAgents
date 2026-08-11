@@ -38,17 +38,22 @@ from deepagents_app.services.runtime.message_serde import (
     serialize_messages,
     tool_calls_payload as _tool_calls_payload,
 )
-from deepagents_app.services.runtime.stream_limiter import (
-    acquire_stream_slot,
-    close_redis_stream_slots_client,
-    release_stream_slot,
-)
 from deepagents_app.utils.text import normalize_message_content
 from deepagents_app.workspace import user_workspace_dir, workspace_context
 
 logger = logging.getLogger(__name__)
 
 _SSE_PING_INTERVAL_SECONDS = 15.0
+# 忙流也按该间隔续租，须明显小于 Redis 租约 TTL（默认 90s）
+_SSE_LEASE_RENEW_INTERVAL_SECONDS = _SSE_PING_INTERVAL_SECONDS
+
+
+async def _renew_stream_slot(stream_slot: Any | None) -> None:
+    """续期流式槽位；本地 semaphore 的 renew 为空操作。"""
+    if stream_slot is None:
+        return
+    with suppress(Exception):
+        await stream_slot.renew()
 
 
 def validate_chat_message(message: str, settings: Settings | None = None) -> None:
@@ -82,7 +87,7 @@ def _pack_result(
     methodology_id: str,
     methodology_version: int,
 ) -> dict[str, Any]:
-    """统一 chat / resume 响应结构；``__interrupt__`` 表示 HITL 暂停。"""
+    """统一 chat / resume SSE 响应结构；``__interrupt__`` 表示 HITL 暂停。"""
     interrupts = result.get("__interrupt__")
     return {
         "thread_id": thread_id,
@@ -112,7 +117,7 @@ async def prepare_chat(
     """
     短事务加载会话并组装 Agent，返回后 Session 已关闭。
 
-    供 chat / SSE / resume 共用：LLM 执行阶段不再占用连接池。
+    供 SSE / resume 共用：LLM 执行阶段释放连接池。
     """
     settings = settings or get_settings()
     db = get_async_session_factory()()
@@ -169,6 +174,24 @@ def _todo_payload_from_msg(msg: Any) -> dict[str, Any] | None:
     return None
 
 
+def _iter_tool_starts(msg: Any) -> list[tuple[str, dict[str, Any]]]:
+    """从消息提取 tool_start 事件列表。"""
+    tool_calls = _tool_calls_payload(msg)
+    if not tool_calls:
+        return []
+    return [
+        (
+            "tool_start",
+            {
+                "id": tc.get("id"),
+                "name": tc.get("name"),
+                "args": tc.get("args") or {},
+            },
+        )
+        for tc in tool_calls
+    ]
+
+
 async def _aiter_stream_events(
     agent: Any, payload: Any, config: dict[str, Any]
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
@@ -197,26 +220,14 @@ async def _aiter_stream_events(
                 if piece:
                     yielded_token = True
                     yield "token", {"text": piece}
-                tool_calls = _tool_calls_payload(msg)
-                if tool_calls:
-                    for tc in tool_calls:
-                        yield "tool_start", {
-                            "id": tc.get("id"),
-                            "name": tc.get("name"),
-                            "args": tc.get("args") or {},
-                        }
+                for event in _iter_tool_starts(msg):
+                    yield event
                 continue
 
             if role == "assistant":
                 # 完整 AIMessage：推 tool_calls，不重复推全文
-                tool_calls = _tool_calls_payload(msg)
-                if tool_calls:
-                    for tc in tool_calls:
-                        yield "tool_start", {
-                            "id": tc.get("id"),
-                            "name": tc.get("name"),
-                            "args": tc.get("args") or {},
-                        }
+                for event in _iter_tool_starts(msg):
+                    yield event
                 todo = _todo_payload_from_msg(msg)
                 if todo:
                     yield "todo", todo
@@ -275,7 +286,8 @@ async def _aiter_sse(
     """SSE 共用内核：meta → 事件* → done | error（执行期无 DB）；空闲发 ping。
 
     路由应先 ``prepare_chat``，再 ``acquire_stream_slot``，最后进入本函数，
-    避免冷编译占用流式并发槽。``stream_slot`` 若提供，则在 ping 时续租。
+    避免冷编译占用流式并发槽。``stream_slot`` 若提供，则在空闲 ping 与忙流
+    路径上按间隔续租，避免持续出事件时租约过期被误回收。
     """
     yield _sse("meta", meta)
     logger.info(
@@ -289,6 +301,8 @@ async def _aiter_sse(
     assembled = ""
     next_task: asyncio.Task[tuple[str, dict[str, Any]]] | None = None
     event_iter: AsyncIterator[tuple[str, dict[str, Any]]] | None = None
+    # acquire 时已写入新鲜租约；从现在起按间隔续期即可
+    last_renew_at = asyncio.get_running_loop().time()
     try:
         with workspace_context(
             user_workspace_dir(prepared.settings, prepared.user_id, ensure=False)
@@ -304,11 +318,8 @@ async def _aiter_sse(
                 )
                 if not done:
                     # 超时不取消 next_task，心跳后继续等同一任务
-                    if stream_slot is not None:
-                        renew = getattr(stream_slot, "renew", None)
-                        if callable(renew):
-                            with suppress(Exception):
-                                await renew()
+                    await _renew_stream_slot(stream_slot)
+                    last_renew_at = asyncio.get_running_loop().time()
                     yield _sse("ping", {"ok": True})
                     continue
                 try:
@@ -317,6 +328,10 @@ async def _aiter_sse(
                     break
                 finally:
                     next_task = None
+                now = asyncio.get_running_loop().time()
+                if now - last_renew_at >= _SSE_LEASE_RENEW_INTERVAL_SECONDS:
+                    await _renew_stream_slot(stream_slot)
+                    last_renew_at = now
                 if event == "token":
                     assembled += str(data.get("text") or "")
                 yield _sse(event, data)
@@ -354,38 +369,6 @@ async def _aiter_sse(
                     await aclose()
 
 
-async def chat(
-    *,
-    user_id: str,
-    thread_id: str,
-    message: str,
-) -> dict[str, Any]:
-    """发送一轮用户消息：短事务组装后关闭 DB，再 ``ainvoke``。"""
-    settings = get_settings()
-    validate_chat_message(message, settings)
-    prepared = await prepare_chat(user_id=user_id, thread_id=thread_id, settings=settings)
-    logger.info(
-        "chat user=%s thread=%s methodology=%s v%s",
-        user_id,
-        thread_id,
-        prepared.methodology_id,
-        prepared.methodology_version,
-    )
-    with workspace_context(
-        user_workspace_dir(prepared.settings, user_id, ensure=False)
-    ):
-        result = await prepared.agent.ainvoke(
-            {"messages": [{"role": "user", "content": message}]},
-            config=prepared.config,
-        )
-    return _pack_result(
-        thread_id=thread_id,
-        result=result,
-        methodology_id=prepared.methodology_id,
-        methodology_version=prepared.methodology_version,
-    )
-
-
 async def iter_chat_sse(
     *,
     user_id: str,
@@ -394,10 +377,10 @@ async def iter_chat_sse(
     prepared: PreparedChat | None = None,
     stream_slot: Any | None = None,
 ) -> AsyncIterator[str]:
-    """SSE：组装阶段独占短事务；流式阶段不再持有 Session。
+    """SSE：组装阶段独占短事务；流式阶段释放 Session。
 
     路由可先 ``prepare_chat`` 再抢槽，将结果作为 ``prepared`` 传入，避免重复组装。
-    ``stream_slot`` 用于 Redis 租约在 ping 时续期。
+    ``stream_slot`` 用于 Redis 租约在空闲 ping / 忙流间隔续期。
     """
     settings = get_settings()
     validate_chat_message(message, settings)
@@ -419,53 +402,12 @@ async def iter_chat_sse(
         yield chunk
 
 
-async def resume_agent(
-    agent: Any,
-    config: dict[str, Any],
-    *,
-    approve: bool = True,
-) -> dict[str, Any]:
-    """对已编译 Agent 执行 HITL resume（``ainvoke`` + ``Command``）。"""
-    return await agent.ainvoke(
-        _resume_command(approve),
-        config=config,
-    )
-
-
 def _resume_command(approve: bool) -> Any:
-    """构造 LangGraph HITL resume 命令，避免同步与 SSE 路径的载荷漂移。"""
+    """构造 LangGraph HITL resume 命令。"""
     from langgraph.types import Command
 
     decision_type = "approve" if approve else "reject"
     return Command(resume={"decisions": [{"type": decision_type}]})
-
-
-async def resume_chat(
-    *,
-    user_id: str,
-    thread_id: str,
-    approve: bool = True,
-) -> dict[str, Any]:
-    """HITL 恢复：短事务组装后关闭 DB，再 resume。"""
-    prepared = await prepare_chat(user_id=user_id, thread_id=thread_id)
-    logger.info(
-        "chat resume user=%s thread=%s decision=%s",
-        user_id,
-        thread_id,
-        "approve" if approve else "reject",
-    )
-    with workspace_context(
-        user_workspace_dir(prepared.settings, user_id, ensure=False)
-    ):
-        result = await resume_agent(
-            prepared.agent, prepared.config, approve=approve
-        )
-    return _pack_result(
-        thread_id=thread_id,
-        result=result,
-        methodology_id=prepared.methodology_id,
-        methodology_version=prepared.methodology_version,
-    )
 
 
 async def iter_resume_sse(

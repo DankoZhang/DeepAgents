@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Literal, get_args
+
 # 种子逻辑 id（实际入库主键经 ownership.scoped_id 按用户派生）
 DEFAULT_MODEL_ID = "model_default"
 DEMO_METHODOLOGY_ID = "demo_deepagents"
+
+# LLM provider：schemas / Settings / 目录校验共用同一真相源
+ModelProvider = Literal["openai", "anthropic", "openai_compatible"]
+ALLOWED_PROVIDERS: frozenset[str] = frozenset(get_args(ModelProvider))

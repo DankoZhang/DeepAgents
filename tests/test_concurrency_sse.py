@@ -3,8 +3,50 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 
 import pytest
+
+
+def _stub_prepared(*, settings: Any | None = None) -> Any:
+    resolved = settings or type(
+        "S",
+        (),
+        {"workspace_dir": None, "chat_stream_max_concurrent": 0},
+    )()
+
+    class _Prepared:
+        user_id = "u"
+        thread_id = "t"
+        methodology_id = "m"
+        methodology_version = 1
+        agent = object()
+        config: dict[str, Any] = {}
+
+    prepared = _Prepared()
+    prepared.settings = resolved
+    return prepared
+
+
+def _stub_workspace(monkeypatch, chat_svc) -> None:
+    @contextmanager
+    def _ws(_root):
+        yield Path("/tmp")
+
+    monkeypatch.setattr(chat_svc, "workspace_context", _ws)
+    monkeypatch.setattr(
+        chat_svc, "user_workspace_dir", lambda *a, **k: Path("/tmp")
+    )
+
+
+def _sse_event_names(frames: list[str]) -> list[str]:
+    events: list[str] = []
+    for frame in frames:
+        if frame.startswith("event: "):
+            events.append(frame.split("\n", 1)[0].removeprefix("event: ").strip())
+    return events
 
 
 @pytest.mark.asyncio
@@ -92,51 +134,69 @@ async def test_sse_ping_does_not_kill_stream(monkeypatch):
 
     monkeypatch.setattr(chat_svc, "_aiter_stream_events", fake_stream)
     monkeypatch.setattr(chat_svc, "_afinal_state_result", fake_final)
+    _stub_workspace(monkeypatch, chat_svc)
 
-    class _Prepared:
-        user_id = "u"
-        thread_id = "t"
-        methodology_id = "m"
-        methodology_version = 1
-        agent = object()
-        settings = type(
-            "S",
-            (),
-            {"workspace_dir": None, "chat_stream_max_concurrent": 0},
-        )()
-        config = {}
-
-    # workspace_context 需要真实 Path；改 stub 掉 workspace helpers
-    from pathlib import Path
-    from contextlib import contextmanager
-
-    @contextmanager
-    def _ws(_root):
-        yield Path("/tmp")
-
-    monkeypatch.setattr(chat_svc, "workspace_context", _ws)
-    monkeypatch.setattr(
-        chat_svc, "user_workspace_dir", lambda *a, **k: Path("/tmp")
-    )
-
-    prepared = _Prepared()
-    events: list[str] = []
+    frames: list[str] = []
     async for frame in chat_svc._aiter_sse(
-        prepared, {}, meta={"thread_id": "t"}, log_label="test"
+        _stub_prepared(), {}, meta={"thread_id": "t"}, log_label="test"
     ):
-        if frame.startswith("event: "):
-            events.append(frame.split("\n", 1)[0].removeprefix("event: ").strip())
+        frames.append(frame)
 
+    events = _sse_event_names(frames)
     assert "ping" in events
     assert events.count("token") == 2
     assert "done" in events
 
 
 @pytest.mark.asyncio
+async def test_sse_busy_stream_renews_lease_without_idle_ping(monkeypatch):
+    """持续出事件（无空闲 ping）时，也应按间隔续租，避免忙流突破限流。"""
+    from deepagents_app.services.runtime import chat as chat_svc
+
+    monkeypatch.setattr(chat_svc, "_SSE_PING_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(chat_svc, "_SSE_LEASE_RENEW_INTERVAL_SECONDS", 0.05)
+
+    async def fake_stream(agent, payload, config):
+        # 间隔小于 ping timeout，全程无空闲 ping；总时长超过续期间隔
+        for i in range(6):
+            await asyncio.sleep(0.02)
+            yield "token", {"text": str(i)}
+
+    async def fake_final(agent, config):
+        return {"messages": []}
+
+    class _Slot:
+        def __init__(self) -> None:
+            self.renew_count = 0
+
+        async def renew(self) -> None:
+            self.renew_count += 1
+
+    monkeypatch.setattr(chat_svc, "_aiter_stream_events", fake_stream)
+    monkeypatch.setattr(chat_svc, "_afinal_state_result", fake_final)
+    _stub_workspace(monkeypatch, chat_svc)
+
+    slot = _Slot()
+    frames: list[str] = []
+    async for frame in chat_svc._aiter_sse(
+        prepared=_stub_prepared(),
+        payload={},
+        meta={"thread_id": "t"},
+        log_label="test",
+        stream_slot=slot,
+    ):
+        frames.append(frame)
+
+    events = _sse_event_names(frames)
+    assert "ping" not in events
+    assert events.count("token") == 6
+    assert slot.renew_count >= 1
+
+
+@pytest.mark.asyncio
 async def test_sse_cancellation_closes_underlying_event_iterator(monkeypatch):
     """客户端断连取消外层 SSE 后，应关闭持有 LLM 流的内层异步生成器。"""
-    from contextlib import contextmanager, suppress
-    from pathlib import Path
+    from contextlib import suppress
 
     from deepagents_app.services.runtime import chat as chat_svc
     closed = asyncio.Event()
@@ -150,27 +210,14 @@ async def test_sse_cancellation_closes_underlying_event_iterator(monkeypatch):
         finally:
             closed.set()
 
-    @contextmanager
-    def _ws(_root):
-        yield Path("/tmp")
-
     monkeypatch.setattr(chat_svc, "_aiter_stream_events", fake_stream)
-    monkeypatch.setattr(chat_svc, "workspace_context", _ws)
-    monkeypatch.setattr(
-        chat_svc, "user_workspace_dir", lambda *args, **kwargs: Path("/tmp")
-    )
-
-    class _Prepared:
-        user_id = "u"
-        thread_id = "t"
-        methodology_id = "m"
-        methodology_version = 1
-        agent = object()
-        settings = object()
-        config = {}
+    _stub_workspace(monkeypatch, chat_svc)
 
     stream = chat_svc._aiter_sse(
-        _Prepared(), {}, meta={"thread_id": "t"}, log_label="test"
+        _stub_prepared(settings=object()),
+        {},
+        meta={"thread_id": "t"},
+        log_label="test",
     )
     await anext(stream)  # meta；内层流尚未开始
     pending = asyncio.create_task(anext(stream))
@@ -233,11 +280,14 @@ async def test_redis_stream_lease_acquire_release_and_limit(monkeypatch):
     """Redis ZSET 租约：占满后 429；release 后可再申请；崩溃槽位过期可回收。"""
     from deepagents_app.api.errors import CapacityError
     from deepagents_app.config import Settings
+    from deepagents_app.services.infra.redis_conn import (
+        close_shared_redis,
+        get_shared_redis,
+    )
     from deepagents_app.services.runtime import stream_limiter as sl
 
     monkeypatch.setattr(sl, "_REDIS_LEASE_TTL_SECONDS", 2.0)
-    monkeypatch.setattr(sl, "_legacy_counter_cleared", False)
-    await sl.close_redis_stream_slots_client()
+    await close_shared_redis()
 
     settings = Settings(
         redis_url="redis://localhost:6379",
@@ -247,7 +297,7 @@ async def test_redis_stream_lease_acquire_release_and_limit(monkeypatch):
         api_workers=1,
     )
     # 清掉测试 key，避免脏数据
-    client = await sl._get_redis_slots_client(settings)
+    client = await get_shared_redis()
     await client.delete(sl._REDIS_LEASE_KEY)
 
     s1 = await sl.acquire_stream_slot(settings)
@@ -267,18 +317,21 @@ async def test_redis_stream_lease_acquire_release_and_limit(monkeypatch):
 
     await s3.release()
     await s4.release()
-    await sl.close_redis_stream_slots_client()
+    await close_shared_redis()
 
 
 @pytest.mark.asyncio
 async def test_redis_stream_lease_renew_extends_life(monkeypatch):
     """ping 续租后，槽位不应在原 TTL 到期时被当成过期清掉。"""
     from deepagents_app.config import Settings
+    from deepagents_app.services.infra.redis_conn import (
+        close_shared_redis,
+        get_shared_redis,
+    )
     from deepagents_app.services.runtime import stream_limiter as sl
 
     monkeypatch.setattr(sl, "_REDIS_LEASE_TTL_SECONDS", 1.0)
-    monkeypatch.setattr(sl, "_legacy_counter_cleared", False)
-    await sl.close_redis_stream_slots_client()
+    await close_shared_redis()
 
     settings = Settings(
         redis_url="redis://localhost:6379",
@@ -287,7 +340,7 @@ async def test_redis_stream_lease_renew_extends_life(monkeypatch):
         chat_stream_limiter="redis",
         api_workers=1,
     )
-    client = await sl._get_redis_slots_client(settings)
+    client = await get_shared_redis()
     await client.delete(sl._REDIS_LEASE_KEY)
 
     slot = await sl.acquire_stream_slot(settings)
@@ -305,4 +358,4 @@ async def test_redis_stream_lease_renew_extends_life(monkeypatch):
     again = await sl.acquire_stream_slot(settings)
     assert again is not None
     await again.release()
-    await sl.close_redis_stream_slots_client()
+    await close_shared_redis()

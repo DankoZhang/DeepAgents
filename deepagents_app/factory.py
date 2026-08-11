@@ -6,7 +6,7 @@ Deep Agent 共享组装工具
 checkpointer / HITL / permissions / general-purpose 子 Agent 规格。
 
 方法论驱动的完整 Agent 组装见 ``deepagents_app.services.runtime.agent_factory``。
-HarnessProfile **不再**全局注册：按方法论在组装时显式注入 ``general-purpose`` 子 Agent。
+按方法论在组装时显式注入 ``general-purpose`` 子 Agent。
 """
 
 from __future__ import annotations
@@ -154,10 +154,8 @@ def build_general_purpose_subagent(
     specialist_names: list[str],
 ) -> dict[str, Any]:
     """
-    按当前方法论的专业子 Agent 列表，构造显式 ``general-purpose`` 子 Agent。
-
-    传入 ``create_deep_agent(subagents=...)`` 后，deepagents 不会再按全局
-    HarnessProfile 自动注入同名兜底 Agent，从而避免跨方法论互相污染。
+    按当前方法论的专业子 Agent 列表，构造显式 ``general-purpose`` 子 Agent，
+    传入 ``create_deep_agent(subagents=...)``，避免跨方法论互相污染。
     """
     names = " / ".join(specialist_names) if specialist_names else "专业子 Agent"
     return {

@@ -8,7 +8,6 @@ Middleware 注册管理
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from sqlalchemy import select
@@ -16,8 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.db.models import MiddlewareDefinition
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
-from deepagents_app.ownership import validate_resource_id
-from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name, get_owned
+from deepagents_app.services.catalog.crud_helpers import (
+    ensure_unique_owned_name,
+    get_owned,
+    resolve_resource_id,
+)
 
 
 async def list_middlewares(
@@ -25,7 +27,6 @@ async def list_middlewares(
     *,
     owner_user_id: str,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
 ) -> tuple[list[MiddlewareDefinition], int, str | None]:
     """列出当前用户已注册的中间件。返回 (rows, total, next_cursor)。"""
@@ -39,7 +40,6 @@ async def list_middlewares(
         db,
         stmt,
         limit=limit,
-        offset=offset,
         cursor=cursor,
         sort_column=MiddlewareDefinition.name,
         id_column=MiddlewareDefinition.id,
@@ -81,7 +81,7 @@ async def create_middleware(
         message=f"中间件名已存在：{name}",
     )
     row = MiddlewareDefinition(
-        id=_resolve_middleware_id(middleware_id),
+        id=resolve_resource_id(middleware_id, prefix="mw_", label="middleware id"),
         owner_user_id=owner_user_id,
         name=name,
         class_path=class_path,
@@ -90,8 +90,3 @@ async def create_middleware(
     db.add(row)
     await db.flush()
     return row
-
-
-def _resolve_middleware_id(middleware_id: str | None) -> str:
-    resolved = middleware_id or f"mw_{uuid.uuid4().hex[:12]}"
-    return validate_resource_id(resolved, label="middleware id")

@@ -38,7 +38,6 @@ async def list_methodologies(
     owner_user_id: str,
     status: str | None = None,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
 ) -> tuple[list[Methodology], int, str | None]:
     """按所有者列出方法论；可按 draft/published 过滤。返回 (rows, total, next_cursor)。"""
@@ -54,7 +53,6 @@ async def list_methodologies(
         db,
         stmt,
         limit=limit,
-        offset=offset,
         cursor=cursor,
         sort_column=Methodology.updated_time,
         id_column=Methodology.id,

@@ -9,14 +9,12 @@ Agent 本身不隶属单一方法论；方法论通过勾选引用。
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import BusinessError, ForbiddenError, NotFoundError
-from deepagents_app.constants import DEFAULT_MODEL_ID
 from deepagents_app.db.loading import agent_detail_options
 from deepagents_app.db.models import (
     AgentDefinition,
@@ -27,9 +25,12 @@ from deepagents_app.db.models import (
     SkillDefinition,
     ToolDefinition,
 )
-from deepagents_app.ownership import default_model_id_for_user, validate_resource_id
+from deepagents_app.ownership import default_model_id_for_user
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
-from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name
+from deepagents_app.services.catalog.crud_helpers import (
+    ensure_unique_owned_name,
+    resolve_resource_id,
+)
 from deepagents_app.services.versioning.revisions import (
     bump_methodologies_using_agent,
     bump_methodology,
@@ -42,7 +43,6 @@ async def list_agents(
     owner_user_id: str,
     methodology_id: str | None = None,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
 ) -> tuple[list[AgentDefinition], int, str | None]:
     """列出全局 Agent；若传 methodology_id 则只返回该方法论已勾选的。返回 (rows, total, next_cursor)。"""
@@ -61,7 +61,6 @@ async def list_agents(
         db,
         stmt,
         limit=limit,
-        offset=offset,
         cursor=cursor,
         sort_column=AgentDefinition.name,
         id_column=AgentDefinition.id,
@@ -119,7 +118,7 @@ async def create_agent(
     cfg.setdefault("enabled", True)
 
     row = AgentDefinition(
-        id=_resolve_agent_id(agent_id),
+        id=resolve_resource_id(agent_id, prefix="agent_", label="agent id"),
         owner_user_id=owner_user_id,
         name=name,
         system_prompt=system_prompt,
@@ -477,8 +476,8 @@ async def _resolve_model_id_for_user(
     *,
     owner_user_id: str,
 ) -> str | None:
-    """解析并校验 model_id；None / 默认 base id 映射为该用户 scoped 默认模型。"""
-    if not model_id or model_id == DEFAULT_MODEL_ID:
+    """解析并校验 model_id；缺省映射为该用户 scoped 默认模型。"""
+    if not model_id:
         model_id = default_model_id_for_user(owner_user_id)
     return await _validate_model_id(db, model_id, owner_user_id=owner_user_id)
 
@@ -497,8 +496,3 @@ async def _validate_model_id(
     if row.status != "active":
         raise BusinessError(f"模型已禁用：{row.name}")
     return model_id
-
-
-def _resolve_agent_id(agent_id: str | None) -> str:
-    resolved = agent_id or f"agent_{uuid.uuid4().hex[:12]}"
-    return validate_resource_id(resolved, label="agent id")

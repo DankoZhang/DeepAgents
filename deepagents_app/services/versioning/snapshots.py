@@ -5,8 +5,8 @@
 live ORM → 可持久化 JSON 的唯一入口。
 ``revisions``（落库）与 ``agent_factory``（组装归一）共用，避免两处漂移。
 
-落库快照中 Skill / system_prompt / Memory 正文改为 content_blob 哈希引用；
-组装前由 ``hydrate_snapshot_content`` 还原明文。
+落库快照中 Skill / system_prompt / Memory 正文只存 content_blob 哈希引用；
+组装前由 ``hydrate_snapshot_content`` 按 hash 还原正文。
 """
 
 from __future__ import annotations
@@ -49,16 +49,20 @@ def serialize_middleware_for_snapshot(row: MiddlewareDefinition) -> dict[str, An
     }
 
 
-def serialize_skill_for_live(row: SkillDefinition) -> dict[str, Any]:
-    """live 组装用：保留完整 content。"""
+def _skill_common_fields(row: SkillDefinition) -> dict[str, Any]:
+    """Skill live / snapshot 共有字段（正文除外）。"""
     return {
         "id": row.id,
         "name": row.name,
         "description": row.description,
-        "content": row.content,
         "config": dict(row.config or {}),
         "status": row.status,
     }
+
+
+def serialize_skill_for_live(row: SkillDefinition) -> dict[str, Any]:
+    """live 组装用：保留完整 content。"""
+    return {**_skill_common_fields(row), "content": row.content}
 
 
 async def serialize_skill_for_snapshot(
@@ -66,30 +70,30 @@ async def serialize_skill_for_snapshot(
 ) -> dict[str, Any]:
     """钉死 Skill 元信息；正文写入 content_blob，快照只存 hash。"""
     digest = await ensure_content_blob(db, row.content or "")
-    return {
-        "id": row.id,
-        "name": row.name,
-        "description": row.description,
-        "content_hash": digest,
-        "config": dict(row.config or {}),
-        "status": row.status,
-    }
+    return {**_skill_common_fields(row), "content_hash": digest}
 
 
-def serialize_agent_for_live(agent: AgentDefinition) -> dict[str, Any]:
-    """live ORM → 组装用 dict（含明文正文）。"""
+def _agent_common_fields(agent: AgentDefinition) -> dict[str, Any]:
+    """Agent live / snapshot 共有字段（system_prompt / skills 除外）。"""
     return {
         "id": agent.id,
         "name": agent.name,
-        "system_prompt": agent.system_prompt,
         "model_id": agent.model_id,
         "config": dict(agent.config or {}),
         "tools": [serialize_tool_for_snapshot(t) for t in agent.tools],
         "middlewares": [
             serialize_middleware_for_snapshot(m) for m in agent.middlewares
         ],
-        "skills": [serialize_skill_for_live(s) for s in agent.skills],
         "llm": serialize_model_for_snapshot(agent.llm_model),
+    }
+
+
+def serialize_agent_for_live(agent: AgentDefinition) -> dict[str, Any]:
+    """live ORM → 组装用 dict（含明文正文）。"""
+    return {
+        **_agent_common_fields(agent),
+        "system_prompt": agent.system_prompt,
+        "skills": [serialize_skill_for_live(s) for s in agent.skills],
     }
 
 
@@ -99,17 +103,9 @@ async def serialize_agent_for_snapshot(
     """live Agent ORM → revision 快照 dict（正文以 hash 引用）。"""
     prompt_hash = await ensure_content_blob(db, agent.system_prompt or "")
     return {
-        "id": agent.id,
-        "name": agent.name,
+        **_agent_common_fields(agent),
         "system_prompt_hash": prompt_hash,
-        "model_id": agent.model_id,
-        "config": dict(agent.config or {}),
-        "tools": [serialize_tool_for_snapshot(t) for t in agent.tools],
-        "middlewares": [
-            serialize_middleware_for_snapshot(m) for m in agent.middlewares
-        ],
         "skills": [
             await serialize_skill_for_snapshot(db, s) for s in agent.skills
         ],
-        "llm": serialize_model_for_snapshot(agent.llm_model),
     }

@@ -2,10 +2,7 @@
 列表分页（服务层）
 ================
 
-- ``paginate``：count + offset/limit（兼容现有前端）
-- ``paginate_keyset``：按排序键 + id 的游标翻页（长列表）
-- ``page_rows``：统一入口——有 cursor 走 keyset，否则走 offset，并计算下一页游标
-
+Keyset 游标翻页：无 ``cursor`` 为首页，有 ``cursor`` 从该点续翻。
 API 层的 Query 依赖与响应头见 ``deepagents_app.api.pagination``。
 """
 
@@ -49,20 +46,6 @@ def decode_cursor(cursor: str) -> tuple[Any, str]:
     if not item_id:
         raise ValueError("非法分页游标")
     return sort, item_id
-
-
-async def paginate(
-    db: AsyncSession,
-    stmt: Select[tuple[T]],
-    *,
-    limit: int,
-    offset: int,
-) -> tuple[list[T], int]:
-    """对 ``select()`` 语句做 count + slice，返回 (rows, total)。"""
-    count_stmt = select(func.count()).select_from(stmt.order_by(None).subquery())
-    total = int(await db.scalar(count_stmt) or 0)
-    rows = list(await db.scalars(stmt.offset(offset).limit(limit)))
-    return rows, total
 
 
 async def paginate_keyset(
@@ -128,7 +111,6 @@ async def page_rows(
     stmt: Select[tuple[T]],
     *,
     limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
     cursor: str | None = None,
     sort_column: InstrumentedAttribute[Any],
     id_column: InstrumentedAttribute[str],
@@ -137,7 +119,7 @@ async def page_rows(
     coerce_sort: Callable[[Any], Any] | None = None,
 ) -> tuple[list[T], int, str | None]:
     """
-    统一分页：有 ``cursor`` 时忽略 ``offset`` 走 keyset；否则 offset/limit。
+    Keyset 分页：无 ``cursor`` 取首页；有则从游标后续翻。
 
     返回 ``(rows, total, next_cursor)``；无更多时 ``next_cursor`` 为 None。
     """
@@ -160,8 +142,12 @@ async def page_rows(
             descending=descending,
         )
     else:
-        rows, total = await paginate(db, stmt, limit=limit, offset=offset)
-        has_more = offset + len(rows) < total
+        count_stmt = select(func.count()).select_from(stmt.order_by(None).subquery())
+        total = int(await db.scalar(count_stmt) or 0)
+        rows = list(await db.scalars(stmt.limit(limit + 1)))
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
 
     next_cursor: str | None = None
     if has_more and rows:

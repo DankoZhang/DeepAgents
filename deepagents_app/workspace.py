@@ -83,7 +83,7 @@ def ensure_user_workspace(root: Path) -> Path:
     幂等初始化用户工作区布局。
 
     子目录：documents / notes / audit / skills。
-    Agent 注入的 Memory 以方法论快照版本化物化为准（见 ``services.memory``）。
+    Agent 注入的 Memory 以方法论快照版本化物化为准（见 ``services.versioning.memory``）。
     """
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)

@@ -60,13 +60,11 @@ def _fernet_for_key(material: str) -> Fernet:
 
 
 def _primary_material() -> str:
-    settings = get_settings()
-    return getattr(settings, "secrets_encryption_key", None) or ""
+    return get_settings().secrets_encryption_key or ""
 
 
 def _previous_materials() -> list[str]:
-    settings = get_settings()
-    raw = getattr(settings, "secrets_encryption_previous_keys", None) or ""
+    raw = get_settings().secrets_encryption_previous_keys or ""
     return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
@@ -98,7 +96,7 @@ def encrypt_secret(plain: str | None) -> str | None:
 
 
 def decrypt_secret(stored: str | None) -> str | None:
-    """密文 → 明文；无 ``enc:v1:`` 前缀则抛错（不再兼容明文落库）。"""
+    """密文 → 明文；仅接受 ``enc:v1:`` 前缀。"""
     if stored is None:
         return None
     text = stored.strip()

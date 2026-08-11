@@ -21,7 +21,9 @@ from typing import Any, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 项目根目录：Agents-Project/DeepAgents/
+from deepagents_app.constants import ModelProvider
+
+# 项目根目录（本仓库 DeepAgents/）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -36,7 +38,7 @@ class Settings(BaseSettings):
     )
 
     # ── 模型 ──────────────────────────────────────────────────────────
-    model_provider: Literal["openai", "anthropic", "openai_compatible"] = "openai"
+    model_provider: ModelProvider = "openai"
     model_name: str = "gpt-4o"
     openai_api_key: str | None = None
     openai_base_url: str | None = None

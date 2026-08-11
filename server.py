@@ -38,6 +38,14 @@ def main() -> None:
     # 会显式选用 Proactor，需改为 SelectorEventLoop。
     loop = "asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto"
 
+    # gunicorn 依赖 fcntl，仅 Unix 可用；Windows 自动回退到 uvicorn。
+    if server == "gunicorn" and sys.platform == "win32":
+        print(
+            "WARNING: API_SERVER=gunicorn 在 Windows 上不可用（无 fcntl），已回退到 uvicorn",
+            file=sys.stderr,
+        )
+        server = "uvicorn"
+
     if server == "gunicorn":
         from gunicorn.app.base import BaseApplication
 

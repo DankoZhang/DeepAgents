@@ -2,8 +2,8 @@
 默认种子数据（按用户）
 ====================
 
-全局启动不再灌业务配置。用户首次鉴权通过后调用 ``ensure_user_bootstrap``，
-幂等写入该用户的默认模型 / 内置 Tool / Middleware / Skills / demo Agents / 方法论。
+用户通过 ``ensure_user_bootstrap`` 幂等写入该用户的默认模型 /
+内置 Tool / Middleware / Skills / demo Agents / 方法论。
 """
 
 from __future__ import annotations

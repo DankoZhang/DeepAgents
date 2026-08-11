@@ -2,19 +2,32 @@
 Service 层 CRUD 样板
 ====================
 
-收敛「按 owner 取行」「同名唯一」两类重复逻辑。
+收敛「按 owner 取行」「同名唯一」「创建时解析主键」三类重复逻辑。
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import BusinessError
+from deepagents_app.ownership import validate_resource_id
 
 T = TypeVar("T")
+
+
+def resolve_resource_id(
+    resource_id: str | None,
+    *,
+    prefix: str,
+    label: str,
+) -> str:
+    """创建资源时：客户端指定 id 则校验，否则 ``{prefix}{12hex}`` 自动生成。"""
+    resolved = resource_id or f"{prefix}{uuid.uuid4().hex[:12]}"
+    return validate_resource_id(resolved, label=label)
 
 
 async def get_owned(
