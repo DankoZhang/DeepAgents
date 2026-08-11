@@ -9,8 +9,8 @@
 轮转时可把旧密钥放进 ``SECRETS_ENCRYPTION_PREVIOUS_KEYS``（逗号分隔），
 解密时主密钥失败后依次尝试旧密钥；新写入只用主密钥。
 
-未配置主密钥时：仅当 ``AUTH_DISABLED`` 或 ``SECRETS_ALLOW_INSECURE_DEV_KEY``
-为真才允许固定开发派生密钥；否则 fail-fast。
+未配置主密钥时：仅当 ``SECRETS_ALLOW_INSECURE_DEV_KEY`` 为真才允许固定
+开发派生密钥；否则 fail-fast（生产环境必须设置主密钥）。
 """
 
 from __future__ import annotations
@@ -41,14 +41,10 @@ def _fernet_for_key(material: str) -> Fernet:
             return Fernet(base64.urlsafe_b64encode(digest))
 
     settings = get_settings()
-    allow_insecure = bool(
-        settings.auth_disabled or settings.secrets_allow_insecure_dev_key
-    )
-    if not allow_insecure:
+    if not settings.secrets_allow_insecure_dev_key:
         raise RuntimeError(
             "未配置 SECRETS_ENCRYPTION_KEY：生产环境必须设置该密钥。"
-            "本地可用 AUTH_DISABLED=true 或 SECRETS_ALLOW_INSECURE_DEV_KEY=true，"
-            "或执行："
+            "本地请设 SECRETS_ALLOW_INSECURE_DEV_KEY=true，或执行："
             'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
         )
     digest = hashlib.sha256(_INSECURE_DEV_MATERIAL).digest()
