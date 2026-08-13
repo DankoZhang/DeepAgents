@@ -99,7 +99,8 @@ def test_user_isolation(client, demo_ids, monkeypatch, tmp_path):
 def test_model_catalog_crud(client, demo_ids):
     listed = client.get("/api/model/list")
     assert listed.status_code == 200
-    assert any(m["id"] == demo_ids["model"] for m in listed.json())
+    seed = next(m for m in listed.json() if m["id"] == demo_ids["model"])
+    assert seed["is_default"] is True
 
     created = client.post(
         "/api/model",
@@ -120,6 +121,7 @@ def test_model_catalog_crud(client, demo_ids):
     assert "api_key" not in body
     assert body["top_p"] == 0.9
     assert "context_length" not in body
+    assert body["is_default"] is False
     model_id = body["id"]
 
     patched = client.patch(
@@ -156,6 +158,71 @@ def test_model_catalog_crud(client, demo_ids):
     refreshed = client.get(f"/api/agent/{agent.json()['id']}")
     assert refreshed.status_code == 200
     assert refreshed.json()["model_id"] == demo_ids["model"]
+
+
+def test_model_default_flag_and_agent_fallback(client, demo_ids):
+    """种子模型为默认；切换默认后，未指定 model_id 的 Agent 绑定新默认。"""
+    listed = client.get("/api/model/list")
+    assert listed.status_code == 200
+    seed = next(m for m in listed.json() if m["id"] == demo_ids["model"])
+    assert seed["is_default"] is True
+
+    created = client.post(
+        "/api/model",
+        json={
+            "name": "备用默认模型",
+            "provider": "openai_compatible",
+            "model_name": "deepseek-chat",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "sk-test-default",
+        },
+    )
+    assert created.status_code == 200
+    new_id = created.json()["id"]
+    assert created.json()["is_default"] is False
+
+    switched = client.patch(f"/api/model/{new_id}", json={"is_default": True})
+    assert switched.status_code == 200
+    assert switched.json()["is_default"] is True
+    seed_after = client.get(f"/api/model/{demo_ids['model']}")
+    assert seed_after.status_code == 200
+    assert seed_after.json()["is_default"] is False
+
+    listed2 = client.get("/api/model/list")
+    assert sum(1 for m in listed2.json() if m["is_default"]) == 1
+
+    agent = client.post(
+        "/api/agent",
+        json={"name": "fallback-to-new-default", "system_prompt": "hi"},
+    )
+    assert agent.status_code == 200
+    assert agent.json()["model_id"] == new_id
+
+    client.patch(f"/api/model/{demo_ids['model']}", json={"is_default": True})
+    agent2 = client.post(
+        "/api/agent",
+        json={"name": "fallback-to-seed-default", "system_prompt": "hi"},
+    )
+    assert agent2.status_code == 200
+    assert agent2.json()["model_id"] == demo_ids["model"]
+
+    create_as_default = client.post(
+        "/api/model",
+        json={
+            "name": "创建时即默认",
+            "provider": "openai_compatible",
+            "model_name": "deepseek-chat",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "sk-test-create-default",
+            "is_default": True,
+        },
+    )
+    assert create_as_default.status_code == 200
+    assert create_as_default.json()["is_default"] is True
+    listed3 = client.get("/api/model/list")
+    defaults = [m for m in listed3.json() if m["is_default"]]
+    assert len(defaults) == 1
+    assert defaults[0]["id"] == create_as_default.json()["id"]
 
 
 def test_skill_crud_and_agent_bind(client):

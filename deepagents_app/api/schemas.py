@@ -71,6 +71,7 @@ class ModelCreate(BaseModel):
     timeout: float | None = None
     config: dict[str, Any] = Field(default_factory=dict)  # 额外 SDK 参数
     status: str = "active"
+    is_default: bool = False  # 新建默认关闭；开启则取消同用户其他默认
     id: str | None = None
 
 
@@ -88,6 +89,7 @@ class ModelUpdate(BaseModel):
     timeout: float | None = None
     config: dict[str, Any] | None = None
     status: str | None = None
+    is_default: bool | None = None  # True 时同用户其他模型自动取消默认
 
 
 class ModelOut(BaseModel):
@@ -104,6 +106,7 @@ class ModelOut(BaseModel):
     timeout: float | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     status: str
+    is_default: bool = False
     created_time: datetime
     updated_time: datetime
     # 由 ORM api_key 派生，不在响应中暴露密钥本身
@@ -130,6 +133,7 @@ class ModelBrief(BaseModel):
     top_p: float | None = None
     max_tokens: int | None = None
     status: str = "active"
+    is_default: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -163,7 +167,7 @@ class AgentCreate(BaseModel):
 
     name: str  # 全局唯一名称
     system_prompt: str = ""  # 系统提示词
-    model_id: str | None = None  # 绑定模型目录；缺省用用户默认模型
+    model_id: str | None = None  # 绑定模型目录；缺省用当前用户 is_default 模型
     # 扩展字段：role(supervisor|subagent) / description / enabled 等
     config: dict[str, Any] = Field(default_factory=dict)
     tool_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的工具 id
@@ -177,7 +181,7 @@ class AgentUpdate(BaseModel):
 
     name: str | None = None
     system_prompt: str | None = None
-    model_id: str | None = None  # 传空串则回落用户默认模型
+    model_id: str | None = None  # 传空串则回落当前用户 is_default 模型
     config: dict[str, Any] | None = None  # 与现有 config 做 merge，非整表替换语义由 service 定
     tool_ids: list[str] | None = None  # 传入则整表替换绑定
     middleware_ids: list[str] | None = None

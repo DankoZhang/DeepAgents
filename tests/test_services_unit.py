@@ -740,3 +740,50 @@ def test_build_chat_model_rejects_explicit_empty_api_key():
     # 未绑定目录模型：允许 Settings 回退
     model = build_chat_model_from_spec(settings, None)
     assert model is not None
+
+
+async def test_model_is_default_exclusive_and_agent_fallback(db_session):
+    """同一用户只能有一个默认模型；创建 Agent 未指定模型时绑定当前默认。"""
+    from deepagents_app.ownership import default_model_id_for_user
+    from deepagents_app.services.catalog import agents as agents_svc
+    from deepagents_app.services.catalog import llm_models as models_svc
+
+    seed = await models_svc.get_model(
+        db_session,
+        default_model_id_for_user(TEST_USER),
+        owner_user_id=TEST_USER,
+    )
+    assert seed is not None
+    assert seed.is_default is True
+
+    extra = await models_svc.create_model(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="extra-default-candidate",
+        provider="openai_compatible",
+        model_name="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+        api_key="sk-extra",
+    )
+    assert extra.is_default is False
+
+    await models_svc.update_model(
+        db_session,
+        extra.id,
+        owner_user_id=TEST_USER,
+        is_default=True,
+        bump_related=False,
+    )
+    await db_session.refresh(seed)
+    await db_session.refresh(extra)
+    assert extra.is_default is True
+    assert seed.is_default is False
+
+    agent = await agents_svc.create_agent(
+        db_session,
+        owner_user_id=TEST_USER,
+        name="uses-current-default",
+        system_prompt="x",
+        bump_related=False,
+    )
+    assert agent.model_id == extra.id

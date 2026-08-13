@@ -82,6 +82,7 @@ async def create_model(
         timeout=body.timeout,
         config=body.config,
         status=body.status,
+        is_default=body.is_default,
         model_id=body.id,
     )
 
@@ -108,6 +109,7 @@ async def update_model(
         timeout=body.timeout,
         config=body.config,
         status=body.status,
+        is_default=body.is_default,
     )
 
 

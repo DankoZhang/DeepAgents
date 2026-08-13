@@ -21,6 +21,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -41,6 +43,14 @@ class ModelDefinition(Base):
     __tablename__ = "model_definition"
     __table_args__ = (
         UniqueConstraint("owner_user_id", "name", name="uq_model_owner_name"),
+        # 同一用户至多一条 is_default=True（部分唯一索引）
+        Index(
+            "uq_model_one_default_per_owner",
+            "owner_user_id",
+            unique=True,
+            postgresql_where=text("is_default IS TRUE"),
+            sqlite_where=text("is_default = 1"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -56,6 +66,9 @@ class ModelDefinition(Base):
     timeout: Mapped[float | None] = mapped_column(Float, nullable=True)
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
     created_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

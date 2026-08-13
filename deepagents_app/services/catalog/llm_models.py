@@ -5,6 +5,7 @@
 - CRUD：用户维护可用模型（provider / base_url / 超参）
 - 连通性测试：不落库，仅验证配置能否发起调用
 - 变更后 bump 引用该模型的方法论，旧会话靠快照 llm 重建
+- ``is_default``：同一用户至多一个默认模型；创建 Agent 未指定模型时使用
 - 组装时 ``resolve_model_spec_for_agent``：快照 llm → 目录 → Settings 默认；
   有目录 ``model_id`` 时一律校验 live ``status=active`` 且已配置 API Key
   （禁止串用进程级 ``OPENAI_API_KEY``）
@@ -74,6 +75,43 @@ async def get_model(
     return await get_owned(db, ModelDefinition, model_id, owner_user_id=owner_user_id)
 
 
+async def get_default_model(
+    db: AsyncSession, *, owner_user_id: str
+) -> ModelDefinition | None:
+    """当前用户标记为默认的模型；同一用户至多一条。"""
+
+    return (
+        await db.scalars(
+            select(ModelDefinition).where(
+                ModelDefinition.owner_user_id == owner_user_id,
+                ModelDefinition.is_default.is_(True),
+            )
+        )
+    ).one_or_none()
+
+
+async def _promote_exclusive_default(db: AsyncSession, row: ModelDefinition) -> None:
+    """将 row 设为该用户唯一默认模型，其余自动取消。"""
+
+    others = (
+        await db.scalars(
+            select(ModelDefinition).where(
+                ModelDefinition.owner_user_id == row.owner_user_id,
+                ModelDefinition.id != row.id,
+                ModelDefinition.is_default.is_(True),
+            )
+        )
+    ).all()
+    now = datetime.now(timezone.utc)
+    for other in others:
+        other.is_default = False
+        other.updated_time = now
+    if others:
+        # 先落库取消旧默认，避免与随后的新默认同时为 True 触发唯一索引
+        await db.flush()
+    row.is_default = True
+
+
 async def create_model(
     db: AsyncSession,
     *,
@@ -89,9 +127,10 @@ async def create_model(
     timeout: float | None = None,
     config: dict[str, Any] | None = None,
     status: str = "active",
+    is_default: bool = False,
     model_id: str | None = None,
 ) -> ModelDefinition:
-    """创建模型目录项；同用户下 name 唯一。"""
+    """创建模型目录项；同用户下 name 唯一。新建默认非默认模型。"""
 
     _validate_provider(provider)
     if base_url:
@@ -122,9 +161,13 @@ async def create_model(
         timeout=timeout,
         config=dict(config or {}),
         status=status,
+        is_default=False,
     )
     db.add(row)
     await db.flush()
+    if is_default:
+        await _promote_exclusive_default(db, row)
+        await db.flush()
     return row
 
 
@@ -144,6 +187,7 @@ async def update_model(
     timeout: float | None = None,
     config: dict[str, Any] | None = None,
     status: str | None = None,
+    is_default: bool | None = None,
     bump_related: bool = True,
 ) -> ModelDefinition:
     """
@@ -195,6 +239,10 @@ async def update_model(
         row.config = merged
     if status is not None:
         row.status = status
+    if is_default is True:
+        await _promote_exclusive_default(db, row)
+    elif is_default is False:
+        row.is_default = False
 
     _validate_provider(row.provider)
     row.updated_time = datetime.now(timezone.utc)
@@ -231,9 +279,30 @@ async def delete_model(
         more = "" if len(agents) <= 5 else f" 等 {len(agents)} 个"
         raise BusinessError(f"模型仍被 Agent 引用，无法删除：{names}{more}")
 
+    was_default = row.is_default
+    owner_user_id = row.owner_user_id
     # 无 Agent 引用：无需 bump / 清缓存
     await db.delete(row)
     await db.flush()
+    if was_default:
+        replacement = (
+            await db.scalars(
+                select(ModelDefinition)
+                .where(
+                    ModelDefinition.owner_user_id == owner_user_id,
+                    ModelDefinition.id != model_id,
+                )
+                .order_by(
+                    (ModelDefinition.status == "active").desc(),
+                    ModelDefinition.created_time,
+                    ModelDefinition.id,
+                )
+            )
+        ).first()
+        if replacement is not None:
+            replacement.is_default = True
+            replacement.updated_time = datetime.now(timezone.utc)
+            await db.flush()
 
 
 async def test_model_connectivity(
@@ -454,6 +523,7 @@ async def ensure_default_model_from_settings(
         base_url=settings.openai_base_url,
         temperature=0.2,
         status="active",
+        is_default=True,
     )
 
 

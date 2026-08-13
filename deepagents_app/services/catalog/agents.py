@@ -25,7 +25,7 @@ from deepagents_app.db.models import (
     SkillDefinition,
     ToolDefinition,
 )
-from deepagents_app.ownership import default_model_id_for_user
+from deepagents_app.services.catalog.llm_models import get_default_model
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.services.catalog.crud_helpers import (
     ensure_unique_owned_name,
@@ -476,9 +476,12 @@ async def _resolve_model_id_for_user(
     *,
     owner_user_id: str,
 ) -> str | None:
-    """解析并校验 model_id；缺省映射为该用户 scoped 默认模型。"""
+    """解析并校验 model_id；缺省取当前用户标记为默认的目录模型。"""
     if not model_id:
-        model_id = default_model_id_for_user(owner_user_id)
+        default = await get_default_model(db, owner_user_id=owner_user_id)
+        if default is None:
+            raise BusinessError("未指定模型且当前用户没有默认模型，请先设置默认模型")
+        model_id = default.id
     return await _validate_model_id(db, model_id, owner_user_id=owner_user_id)
 
 
