@@ -172,6 +172,168 @@ async def test_mcp_tools_cache_hit(monkeypatch):
     tools_reg.clear_mcp_tools_cache(tool_id=row.id)
 
 
+def test_validate_http_tool_config_fills_param_in():
+    from deepagents_app.config import Settings
+    from deepagents_app.utils.http_tool_safety import validate_http_tool_config
+
+    settings = Settings(auth_disabled=True)
+    out = validate_http_tool_config(
+        {
+            "method": "post",
+            "url": "http://127.0.0.1:9/users/{id}",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                },
+            },
+        },
+        settings=settings,
+    )
+    assert out["method"] == "POST"
+    assert out["param_in"]["id"] == "path"
+    assert out["param_in"]["name"] == "body"
+
+
+def test_validate_http_tool_config_rejects_host_placeholder():
+    from deepagents_app.api.errors import BusinessError
+    from deepagents_app.config import Settings
+    from deepagents_app.utils.http_tool_safety import validate_http_tool_config
+
+    with pytest.raises(BusinessError, match="主机名不能包含占位符"):
+        validate_http_tool_config(
+            {
+                "url": "http://{host}/x",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"host": {"type": "string"}},
+                },
+            },
+            settings=Settings(auth_disabled=True),
+        )
+
+
+async def test_load_http_tool_invokes_httpx(monkeypatch):
+    from deepagents_app.config import Settings
+    from deepagents_app.db.models import ToolDefinition
+    from deepagents_app.registries.http_tools import load_http_tool
+    from deepagents_app.registries.tools import expand_tool_definition
+
+    monkeypatch.setattr(
+        "deepagents_app.utils.http_tool_safety.get_settings",
+        lambda: Settings(auth_disabled=True),
+    )
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        text = '{"ok": true}'
+
+    class _Client:
+        follow_redirects = False
+
+        async def request(self, method, url, **kwargs):  # noqa: ANN001
+            captured["method"] = method
+            captured["url"] = url
+            captured["params"] = kwargs.get("params")
+            captured["headers"] = kwargs.get("headers")
+            captured["timeout"] = kwargs.get("timeout")
+            return _Resp()
+
+    monkeypatch.setattr(
+        "deepagents_app.registries.http_tools.get_http_tool_client",
+        lambda: _Client(),
+    )
+    row = ToolDefinition(
+        id="tool_http_weather",
+        name="get_weather",
+        description="查询天气",
+        tool_type="http",
+        class_path=None,
+        requires_hitl=False,
+        config={
+            "method": "GET",
+            "url": "http://127.0.0.1:9/weather/{city}",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "units": {"type": "string"},
+                },
+                "required": ["city"],
+            },
+            "headers": {"X-Token": "abc"},
+        },
+        status="active",
+    )
+    tools = await expand_tool_definition(row)
+    assert len(tools) == 1
+    tool = load_http_tool(row)
+    assert tool.name == "get_weather"
+    result = await tool.ainvoke({"city": "上海", "units": "metric"})
+    assert result == '{"ok": true}'
+    assert captured["method"] == "GET"
+    assert captured["url"] == "http://127.0.0.1:9/weather/%E4%B8%8A%E6%B5%B7"
+    assert captured["params"] == {"units": "metric"}
+    assert captured["headers"]["X-Token"] == "abc"
+    assert captured["timeout"] == 15
+
+
+async def test_http_tool_client_shared_and_closed():
+    from deepagents_app.registries import http_tools as http_tools_reg
+
+    await http_tools_reg.close_http_tool_client()
+    http_tools_reg.init_http_tool_client()
+    a = http_tools_reg.get_http_tool_client()
+    b = http_tools_reg.get_http_tool_client()
+    assert a is b
+    assert a.follow_redirects is False
+    await http_tools_reg.close_http_tool_client()
+    assert http_tools_reg._http_client is None  # noqa: SLF001
+
+
+async def test_probe_http_connection_uses_get_for_post(monkeypatch):
+    from deepagents_app.config import Settings
+    from deepagents_app.registries.http_tools import probe_http_connection
+
+    monkeypatch.setattr(
+        "deepagents_app.utils.http_tool_safety.get_settings",
+        lambda: Settings(auth_disabled=True),
+    )
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 404
+        text = "missing"
+
+    class _Client:
+        async def request(self, method, url, **kwargs):  # noqa: ANN001, ARG002
+            captured["method"] = method
+            captured["url"] = url
+            return _Resp()
+
+    monkeypatch.setattr(
+        "deepagents_app.registries.http_tools.get_http_tool_client",
+        lambda: _Client(),
+    )
+    result = await probe_http_connection(
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:9/items/{id}",
+            "input_schema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+            },
+        }
+    )
+    assert result["ok"] is True
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith("/items/ping")
+    assert "404" in result["detail"]
+
+
 def test_mcp_cache_invalidation_applies_across_pubsub_helper(monkeypatch):
     """他机收到 MCP 失效消息后应清本地缓存（跳过本 worker_id）。"""
     from deepagents_app.db.models import ToolDefinition
@@ -241,12 +403,19 @@ async def test_interrupt_tool_names_from_payloads():
                 "status": "active",
                 "config": {"include_tools": ["read_file", "write_file"]},
             },
+            {
+                "name": "get_weather",
+                "tool_type": "http",
+                "requires_hitl": True,
+                "status": "active",
+            },
         ]
     )
     assert names == {
         "run_shell_command": True,
         "read_file": True,
         "write_file": True,
+        "get_weather": True,
     }
 
 

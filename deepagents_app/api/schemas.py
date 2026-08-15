@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 # BaseModel：schema 基类；Field：默认值/工厂；model_validator：跨字段校验
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 from deepagents_app.constants import ModelProvider
 
@@ -28,7 +28,7 @@ class ToolBrief(BaseModel):
 
     id: str  # 工具主键
     name: str  # 工具名
-    tool_type: str = "builtin"  # builtin | mcp，前端可用不同 Tag 展示
+    tool_type: str = "builtin"  # builtin | mcp | http，前端可用不同 Tag 展示
 
     # 允许 Agent.tools 关系里的 ToolDefinition ORM 对象直接转本模型
     model_config = {"from_attributes": True}
@@ -312,15 +312,80 @@ class McpServerConfig(BaseModel):
         return self
 
 
-class ToolCreate(BaseModel):
-    """POST /api/tool：仅允许创建 MCP 工具（内置工具由种子写入）。"""
+class HttpToolConfig(BaseModel):
+    """
+    HTTP 工具配置（前端新增工具时填写，存入 ToolDefinition.config）。
 
-    name: str  # 全局唯一名（也常作 MCP Server 逻辑名）
+    运行时按 input_schema 生成 LangChain StructuredTool，再按 param_in
+    把模型填的参数映射到 path / query / json body / header。
+    """
+
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "GET"
+    url: str  # 可含 {city} 等 path 占位符；主机名不能是占位符
+    # 给 LLM 的 JSON Schema，必须是 type=object
+    input_schema: dict[str, Any]
+    # 参数落点；未声明的字段按 method 默认：GET/DELETE→query，其余→body
+    param_in: dict[str, Literal["path", "query", "body", "header"]] = Field(
+        default_factory=dict
+    )
+    headers: dict[str, str] = Field(default_factory=dict)  # 静态头（鉴权等）
+    timeout: float = 15  # 秒；服务层限制 1–60
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def _upper_method(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
+
+    @model_validator(mode="after")
+    def _check_schema(self) -> HttpToolConfig:
+        if not str(self.url or "").strip():
+            raise ValueError("http 工具需要提供 url")
+        schema = self.input_schema
+        if schema.get("type") != "object":
+            raise ValueError("input_schema.type 必须是 object")
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            raise ValueError("input_schema.properties 必须是对象")
+        unknown = set(self.param_in) - set(props)
+        if unknown:
+            raise ValueError(f"param_in 含未知参数：{', '.join(sorted(unknown))}")
+        return self
+
+
+class ToolCreate(BaseModel):
+    """POST /api/tool：创建 MCP 或 HTTP 工具（内置工具由种子写入）。"""
+
+    name: str  # 全局唯一名；http 时亦为运行时 LangChain tool.name
     description: str = ""
-    mcp: McpServerConfig  # 必填连接配置 → 落入 DB config
-    requires_hitl: bool = True  # MCP 默认需人工审批
+    tool_type: Literal["mcp", "http"] | None = None  # 缺省时按 mcp/http 块推断
+    mcp: McpServerConfig | None = None  # tool_type=mcp 时必填
+    http: HttpToolConfig | None = None  # tool_type=http 时必填
+    requires_hitl: bool | None = None  # mcp 默认 True，http 默认 False
     status: str = "active"  # active | disabled
     id: str | None = None  # 可选指定主键
+
+    @model_validator(mode="after")
+    def _check_spec(self) -> ToolCreate:
+        if self.mcp is not None and self.http is not None:
+            raise ValueError("不能同时提供 mcp 和 http")
+        tool_type = self.tool_type
+        if tool_type is None:
+            if self.http is not None:
+                tool_type = "http"
+            elif self.mcp is not None:
+                tool_type = "mcp"
+            else:
+                raise ValueError("需要提供 mcp 或 http 配置")
+            self.tool_type = tool_type
+        if tool_type == "mcp":
+            if self.mcp is None:
+                raise ValueError("mcp 工具必须提供 mcp")
+        elif tool_type == "http":
+            if self.http is None:
+                raise ValueError("http 工具必须提供 http")
+        return self
 
 
 class ToolUpdate(BaseModel):
@@ -329,8 +394,15 @@ class ToolUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     mcp: McpServerConfig | None = None  # 仅 mcp 类型可更新连接
-    requires_hitl: bool | None = None  # builtin / mcp 均可改
+    http: HttpToolConfig | None = None  # 仅 http 类型可更新接口配置
+    requires_hitl: bool | None = None  # builtin / mcp / http 均可改
     status: str | None = None
+
+    @model_validator(mode="after")
+    def _check_spec(self) -> ToolUpdate:
+        if self.mcp is not None and self.http is not None:
+            raise ValueError("不能同时提供 mcp 和 http")
+        return self
 
 
 class ToolOut(BaseModel):
@@ -339,13 +411,49 @@ class ToolOut(BaseModel):
     id: str
     name: str
     description: str
-    tool_type: str  # builtin | mcp
-    class_path: str | None = None  # builtin 有值；mcp 一般为 None
+    tool_type: str  # builtin | mcp | http
+    class_path: str | None = None  # builtin 有值；mcp / http 一般为 None
     requires_hitl: bool = False
-    config: dict[str, Any]  # builtin 扩展配置，或 mcp 的连接 dict
+    config: dict[str, Any]  # builtin 扩展配置，或 mcp / http 的执行 dict
     status: str
 
     model_config = {"from_attributes": True}
+
+
+class ToolTestRequest(BaseModel):
+    """POST /api/tool/test：按 id 或内联 mcp/http 配置试连。"""
+
+    tool_id: str | None = None
+    tool_type: Literal["mcp", "http"] | None = None
+    mcp: McpServerConfig | None = None
+    http: HttpToolConfig | None = None
+
+    @model_validator(mode="after")
+    def _check_spec(self) -> ToolTestRequest:
+        if self.tool_id:
+            return self
+        if self.mcp is not None and self.http is not None:
+            raise ValueError("不能同时提供 mcp 和 http")
+        tool_type = self.tool_type
+        if tool_type is None:
+            if self.http is not None:
+                tool_type = "http"
+            elif self.mcp is not None:
+                tool_type = "mcp"
+            else:
+                raise ValueError("未传 tool_id 时需要提供 mcp 或 http 配置")
+            self.tool_type = tool_type
+        if tool_type == "mcp" and self.mcp is None:
+            raise ValueError("mcp 试连必须提供 mcp")
+        if tool_type == "http" and self.http is None:
+            raise ValueError("http 试连必须提供 http")
+        return self
+
+
+class ToolTestResult(BaseModel):
+    ok: bool
+    message: str
+    detail: str | None = None
 
 
 class MiddlewareOut(BaseModel):

@@ -4,6 +4,7 @@ Tool Registry
 
 - builtin：按 class_path 动态 import
 - mcp：按 config 连接 MCP Server，展开为 LangChain tools
+- http：按 config 把外部 API 封装为单个 StructuredTool
 - mcp 工具列表按 tool_id+config 指纹进程内缓存，避免每次组装都重连
 - 配置变更经 Redis pub/sub 跨 worker 失效（见 ``invalidate_mcp_tools_cache``）
 - MCP 加载走当前事件循环的 async 路径
@@ -11,6 +12,7 @@ Tool Registry
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -18,6 +20,7 @@ import logging
 import threading
 from typing import Any
 
+from deepagents_app.constants import TOOL_PROBE_TIMEOUT_SECONDS
 from deepagents_app.db.models import ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -127,6 +130,47 @@ async def load_mcp_tools(tool_def: ToolDefinition) -> list[Any]:
     return list(tools)
 
 
+async def probe_mcp_connection(cfg: dict[str, Any]) -> dict[str, Any]:
+    """
+    探测 MCP Server 是否可达：initialize + list_tools，不 call_tool。
+    """
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+    from deepagents_app.utils.mcp_safety import validate_mcp_config
+
+    safe = validate_mcp_config(dict(cfg or {}))
+    server_name = "connectivity-probe"
+    client = MultiServerMCPClient({server_name: _mcp_connection_from_config(safe)})
+    try:
+        tools = await asyncio.wait_for(
+            client.get_tools(server_name=server_name),
+            timeout=TOOL_PROBE_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        return {
+            "ok": False,
+            "message": "连通性测试失败",
+            "detail": f"等待 MCP Server 超过 {TOOL_PROBE_TIMEOUT_SECONDS:g} 秒",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MCP 连通性测试失败", exc_info=True)
+        return {
+            "ok": False,
+            "message": "连通性测试失败",
+            "detail": str(exc)[:300],
+        }
+    names = [str(getattr(t, "name", "") or "") for t in tools]
+    names = [n for n in names if n]
+    preview = "、".join(names[:8])
+    if len(names) > 8:
+        preview += "…"
+    return {
+        "ok": True,
+        "message": "连通性测试成功",
+        "detail": f"发现 {len(names)} 个工具" + (f"：{preview}" if preview else ""),
+    }
+
+
 def load_builtin_tool(tool_def: ToolDefinition) -> Any:
     """加载单个内置工具实例。"""
     if tool_def.status != "active":
@@ -145,8 +189,13 @@ async def expand_tool_definition(tool_def: ToolDefinition) -> list[Any]:
     """一条 ToolDefinition → 0..N 个可执行 LangChain tool。"""
     if tool_def.status != "active":
         return []
-    if (tool_def.tool_type or "builtin") == "mcp":
+    tool_type = tool_def.tool_type or "builtin"
+    if tool_type == "mcp":
         return await load_mcp_tools(tool_def)
+    if tool_type == "http":
+        from deepagents_app.registries.http_tools import load_http_tool
+
+        return [load_http_tool(tool_def)]
     return [load_builtin_tool(tool_def)]
 
 
@@ -170,7 +219,7 @@ async def interrupt_tool_names_from_payloads(
     """
     从工具快照/内嵌 payload 收集 requires_hitl 对应的运行时工具名。
 
-    - builtin：使用 ToolDefinition.name（与 LangChain tool.name 一致）
+    - builtin / http：使用 ToolDefinition.name（与 LangChain tool.name 一致）
     - mcp：优先 config.include_tools；否则展开 MCP 后取各工具名
     """
     names: dict[str, bool] = {}

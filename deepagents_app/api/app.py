@@ -5,7 +5,7 @@ FastAPI 应用工厂
 职责：
 - 应用启动时初始化日志、引擎、可选统一 GC 后台
 - 挂载 CORS 与各业务路由
-- lifespan 内初始化 checkpointer / 缓存失效监听 / GC
+- lifespan 内初始化 checkpointer / 缓存失效监听 / GC / HTTP 工具连接池
 """
 
 from __future__ import annotations
@@ -36,6 +36,10 @@ from deepagents_app.auth import close_auth_http_client
 from deepagents_app.config import get_settings
 from deepagents_app.db.session import get_async_engine, get_async_session_factory
 from deepagents_app.factory import close_checkpointer, init_checkpointer
+from deepagents_app.registries.http_tools import (
+    close_http_tool_client,
+    init_http_tool_client,
+)
 from deepagents_app.services.infra.cache_pubsub import (
     start_cache_invalidation_listener,
     stop_cache_invalidation_listener,
@@ -55,7 +59,7 @@ async def lifespan(_app: FastAPI):
     """
     应用生命周期钩子。
 
-    启动：日志、引擎、AsyncRedisSaver、鉴权配置校验、GC 后台（可选）。
+    启动：日志、引擎、AsyncRedisSaver、鉴权配置校验、HTTP 工具连接池、GC 后台（可选）。
     用户种子由 ``POST /api/bootstrap`` 按用户幂等灌入，不在此预灌。
     Memory 随方法论快照版本化；组装时按 version 物化。
     """
@@ -78,6 +82,7 @@ async def lifespan(_app: FastAPI):
 
     get_async_session_factory()
     await init_checkpointer(settings)
+    init_http_tool_client()
     await start_cache_invalidation_listener()
     start_gc_scheduler(settings)
 
@@ -96,6 +101,7 @@ async def lifespan(_app: FastAPI):
         await stop_cache_invalidation_listener()
         await close_shared_redis()
         await close_checkpointer()
+        await close_http_tool_client()
         await close_auth_http_client()
 
 

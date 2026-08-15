@@ -32,6 +32,7 @@ dependencies = [
     "greenlet>=3.0.0",
     # Redis 客户端（checkpoint / 缓存失效 pub/sub / SSE 全局限流直接使用）
     "redis>=5.0.0",
+    "fastmcp>=3.4.7",
 ]
 
 [build-system]

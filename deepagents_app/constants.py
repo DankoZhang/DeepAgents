@@ -11,3 +11,6 @@ DEMO_METHODOLOGY_ID = "demo_deepagents"
 # LLM provider：schemas / Settings / 目录校验共用同一真相源
 ModelProvider = Literal["openai", "anthropic", "openai_compatible"]
 ALLOWED_PROVIDERS: frozenset[str] = frozenset(get_args(ModelProvider))
+
+# MCP / HTTP 工具连通性探测超时
+TOOL_PROBE_TIMEOUT_SECONDS = 15.0

@@ -160,6 +160,7 @@ class ToolDefinition(Base):
 
     - builtin：种子内置，class_path 指向 Python 对象
     - mcp：MCP Server 连接；运行时展开为工具列表
+    - http：外部 API；config 含 url / input_schema，运行时展开为单个 StructuredTool
     """
 
     __tablename__ = "tool_definition"

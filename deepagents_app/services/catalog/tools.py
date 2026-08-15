@@ -3,7 +3,7 @@ Tool 注册管理
 =============
 
 - 内置工具（builtin）：种子写入；API 可改 status / requires_hitl
-- MCP 工具：前端/API 可创建与编辑连接配置及 HITL
+- MCP / HTTP 工具：前端/API 可创建与编辑执行配置及 HITL
 - 变更后默认 bump 引用该方法论，保证旧会话快照可重建
 """
 
@@ -26,6 +26,7 @@ from deepagents_app.services.versioning.revisions import (
     refresh_methodologies_for_agent_ids,
     refresh_methodologies_using_resource,
 )
+from deepagents_app.utils.http_tool_safety import validate_http_tool_config
 from deepagents_app.utils.mcp_safety import validate_mcp_config
 
 
@@ -86,7 +87,7 @@ async def create_builtin_tool(
     status: str = "active",
     tool_id: str | None = None,
 ) -> ToolDefinition:
-    """种子/内部用：写入 builtin 工具（不走对外「仅 MCP」创建 API）。"""
+    """种子/内部用：写入 builtin 工具（不走对外创建 API）。"""
 
     await ensure_unique_owned_name(
         db,
@@ -112,20 +113,18 @@ async def create_builtin_tool(
     return row
 
 
-async def create_mcp_tool(
+async def _create_registered_tool(
     db: AsyncSession,
     *,
     owner_user_id: str,
     name: str,
-    mcp_config: dict[str, Any],
-    description: str = "",
-    requires_hitl: bool = True,
-    status: str = "active",
-    tool_id: str | None = None,
+    tool_type: str,
+    config: dict[str, Any],
+    description: str,
+    requires_hitl: bool,
+    status: str,
+    tool_id: str | None,
 ) -> ToolDefinition:
-    """前端/API：仅创建 MCP 工具（连接信息放在 config）。"""
-    safe_config = validate_mcp_config(mcp_config)
-
     await ensure_unique_owned_name(
         db,
         ToolDefinition,
@@ -139,15 +138,65 @@ async def create_mcp_tool(
         owner_user_id=owner_user_id,
         name=name,
         description=description,
-        tool_type="mcp",
+        tool_type=tool_type,
         class_path=None,
         requires_hitl=bool(requires_hitl),
-        config=safe_config,
+        config=config,
         status=status,
     )
     db.add(row)
     await db.flush()
     return row
+
+
+async def create_mcp_tool(
+    db: AsyncSession,
+    *,
+    owner_user_id: str,
+    name: str,
+    mcp_config: dict[str, Any],
+    description: str = "",
+    requires_hitl: bool = True,
+    status: str = "active",
+    tool_id: str | None = None,
+) -> ToolDefinition:
+    """前端/API：创建 MCP 工具（连接信息放在 config）。"""
+    return await _create_registered_tool(
+        db,
+        owner_user_id=owner_user_id,
+        name=name,
+        tool_type="mcp",
+        config=validate_mcp_config(mcp_config),
+        description=description,
+        requires_hitl=requires_hitl,
+        status=status,
+        tool_id=tool_id,
+    )
+
+
+async def create_http_tool(
+    db: AsyncSession,
+    *,
+    owner_user_id: str,
+    name: str,
+    http_config: dict[str, Any],
+    description: str = "",
+    requires_hitl: bool = False,
+    status: str = "active",
+    tool_id: str | None = None,
+) -> ToolDefinition:
+    """前端/API：创建 HTTP 工具（接口信息放在 config）。"""
+    return await _create_registered_tool(
+        db,
+        owner_user_id=owner_user_id,
+        name=name,
+        tool_type="http",
+        config=validate_http_tool_config(http_config),
+        description=description,
+        requires_hitl=requires_hitl,
+        status=status,
+        tool_id=tool_id,
+    )
 
 
 async def update_tool(
@@ -158,6 +207,7 @@ async def update_tool(
     name: str | None = None,
     description: str | None = None,
     mcp_config: dict[str, Any] | None = None,
+    http_config: dict[str, Any] | None = None,
     requires_hitl: bool | None = None,
     status: str | None = None,
     bump_related: bool = True,
@@ -165,14 +215,19 @@ async def update_tool(
     """
     更新工具。
 
-    内置工具仅允许改 status / requires_hitl；MCP 可改名称/描述/连接配置/HITL。
-    ``bump_related=True`` 时升版所有引用该方法论。
+    内置工具仅允许改 status / requires_hitl；MCP / HTTP 可改名称/描述/执行配置/HITL。
+    不允许更改 tool_type。``bump_related=True`` 时升版所有引用该方法论。
     """
     row = await get_tool(db, tool_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"工具不存在：{tool_id}")
     if row.tool_type == "builtin":
-        if name is not None or description is not None or mcp_config is not None:
+        if (
+            name is not None
+            or description is not None
+            or mcp_config is not None
+            or http_config is not None
+        ):
             raise BusinessError(
                 "内置工具不可修改名称/描述/连接配置，仅可更新 status / requires_hitl"
             )
@@ -194,6 +249,10 @@ async def update_tool(
         if row.tool_type != "mcp":
             raise BusinessError("仅 MCP 工具可更新连接配置")
         row.config = validate_mcp_config(mcp_config)
+    if http_config is not None:
+        if row.tool_type != "http":
+            raise BusinessError("仅 HTTP 工具可更新接口配置")
+        row.config = validate_http_tool_config(http_config)
     if requires_hitl is not None:
         row.requires_hitl = bool(requires_hitl)
     if status is not None:
@@ -217,7 +276,7 @@ async def delete_tool(
     owner_user_id: str,
     bump_related: bool = True,
 ) -> None:
-    """删除 MCP 工具；内置工具禁止删除（应改为 disabled）。"""
+    """删除 MCP / HTTP 工具；内置工具禁止删除（应改为 disabled）。"""
     row = await get_tool(db, tool_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"工具不存在：{tool_id}")
@@ -231,7 +290,56 @@ async def delete_tool(
     ]
     await db.delete(row)
     await db.flush()
-    _invalidate_mcp_cache(tool_id)
+    if row.tool_type == "mcp":
+        _invalidate_mcp_cache(tool_id)
     await refresh_methodologies_for_agent_ids(
         db, agent_ids, bump_related=bump_related
+    )
+
+
+async def test_tool_connectivity(
+    *,
+    tool_type: str,
+    mcp_config: dict[str, Any] | None = None,
+    http_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按内联配置试连（不写库）。"""
+    if tool_type == "mcp":
+        if not mcp_config:
+            raise BusinessError("mcp 工具必须提供 mcp")
+        from deepagents_app.registries.tools import probe_mcp_connection
+
+        return await probe_mcp_connection(mcp_config)
+    if tool_type == "http":
+        if not http_config:
+            raise BusinessError("http 工具必须提供 http")
+        from deepagents_app.registries.http_tools import probe_http_connection
+
+        return await probe_http_connection(http_config)
+    raise BusinessError(f"不支持的 tool_type：{tool_type}")
+
+
+async def test_tool_by_id(
+    db: AsyncSession, tool_id: str, *, owner_user_id: str
+) -> dict[str, Any]:
+    """按目录 id 测连通性。"""
+    row = await get_tool(db, tool_id, owner_user_id=owner_user_id)
+    if row is None:
+        raise NotFoundError(f"工具不存在：{tool_id}")
+    if row.status != "active":
+        return {
+            "ok": False,
+            "message": f"工具状态为 {row.status}，未测试",
+            "detail": None,
+        }
+    if row.tool_type == "builtin":
+        return {
+            "ok": False,
+            "message": "内置工具无需连通性测试",
+            "detail": None,
+        }
+    return await test_tool_connectivity(
+        tool_type=row.tool_type,
+        mcp_config=dict(row.config or {}) if row.tool_type == "mcp" else None,
+        http_config=dict(row.config or {}) if row.tool_type == "http" else None,
     )

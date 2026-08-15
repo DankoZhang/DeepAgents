@@ -278,6 +278,146 @@ def test_mcp_tool_create_and_guardrails(client, demo_ids):
     assert bad_del.status_code == 400
 
 
+def test_http_tool_create_update_and_expand(client):
+    created = client.post(
+        "/api/tool",
+        json={
+            "name": "get_weather",
+            "description": "查询城市天气",
+            "tool_type": "http",
+            "http": {
+                "method": "GET",
+                "url": "http://127.0.0.1:9/weather/{city}",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "城市名"},
+                        "units": {
+                            "type": "string",
+                            "enum": ["metric", "imperial"],
+                            "description": "单位",
+                        },
+                    },
+                    "required": ["city"],
+                },
+                "headers": {"Authorization": "Bearer test"},
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    tool = created.json()
+    assert tool["tool_type"] == "http"
+    assert tool["requires_hitl"] is False
+    assert tool["config"]["method"] == "GET"
+    assert tool["config"]["param_in"]["city"] == "path"
+    assert tool["config"]["param_in"]["units"] == "query"
+    assert tool["config"]["headers"]["Authorization"] == "Bearer test"
+
+    listed = client.get("/api/tool/list", params={"tool_type": "http"})
+    assert listed.status_code == 200
+    assert any(t["id"] == tool["id"] for t in listed.json())
+
+    patched = client.patch(
+        f"/api/tool/{tool['id']}",
+        json={
+            "http": {
+                "method": "GET",
+                "url": "http://127.0.0.1:9/v2/weather",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "城市名"},
+                    },
+                    "required": ["city"],
+                },
+            }
+        },
+    )
+    assert patched.status_code == 200
+    assert patched.json()["config"]["url"] == "http://127.0.0.1:9/v2/weather"
+
+    mcp_on_http = client.patch(
+        f"/api/tool/{tool['id']}",
+        json={"mcp": {"transport": "stdio", "command": "npx"}},
+    )
+    assert mcp_on_http.status_code == 400
+
+    both = client.post(
+        "/api/tool",
+        json={
+            "name": "bad-both",
+            "mcp": {"transport": "stdio", "command": "npx"},
+            "http": {
+                "url": "http://127.0.0.1:9/x",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        },
+    )
+    assert both.status_code == 422
+
+    deleted = client.delete(f"/api/tool/{tool['id']}")
+    assert deleted.status_code == 200
+
+
+def test_http_tool_rejects_host_placeholder(client):
+    created = client.post(
+        "/api/tool",
+        json={
+            "name": "evil-host",
+            "http": {
+                "url": "http://{host}/weather",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"host": {"type": "string"}},
+                },
+            },
+        },
+    )
+    assert created.status_code == 400
+
+
+def test_tool_connectivity_endpoints(client, demo_ids, monkeypatch):
+    builtin = client.post(f"/api/tool/{demo_ids['tool_search_knowledge']}/test")
+    assert builtin.status_code == 200
+    assert builtin.json()["ok"] is False
+    assert "内置" in builtin.json()["message"]
+
+    class _Resp:
+        status_code = 204
+        text = ""
+
+    class _Client:
+        async def request(self, method, url, **kwargs):  # noqa: ANN001, ARG002
+            assert method == "GET"
+            assert "ping" in url
+            return _Resp()
+
+    monkeypatch.setattr(
+        "deepagents_app.registries.http_tools.get_http_tool_client",
+        lambda: _Client(),
+    )
+    inline = client.post(
+        "/api/tool/test",
+        json={
+            "tool_type": "http",
+            "http": {
+                "method": "POST",
+                "url": "http://127.0.0.1:9/orders/{id}",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                },
+            },
+        },
+    )
+    assert inline.status_code == 200, inline.text
+    body = inline.json()
+    assert body["ok"] is True
+    assert "HTTP 204" in body["detail"]
+    assert "GET" in body["detail"]
+
+
 def test_create_conversation_and_list(client, demo_ids):
     created = client.post(
         "/api/conversation",

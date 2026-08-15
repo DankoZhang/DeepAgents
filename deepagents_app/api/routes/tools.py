@@ -2,8 +2,8 @@
 Tool 注册 API
 =============
 
-- 列表 / 详情：builtin + mcp
-- 新建 / 删除：仅 MCP
+- 列表 / 详情：builtin + mcp + http
+- 新建 / 删除：MCP 与 HTTP（禁止 class_path）
 - 内置工具不可改执行体、不可删（可改 status / requires_hitl）
 """
 
@@ -13,14 +13,20 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.auth import get_current_user_id as require_user
-from deepagents_app.api.errors import require_entity
+from deepagents_app.api.errors import BusinessError, require_entity
 from deepagents_app.api.pagination import (
     cursor_query,
     limit_query,
     set_next_cursor,
     set_total_count,
 )
-from deepagents_app.api.schemas import ToolCreate, ToolOut, ToolUpdate
+from deepagents_app.api.schemas import (
+    ToolCreate,
+    ToolOut,
+    ToolTestRequest,
+    ToolTestResult,
+    ToolUpdate,
+)
 from deepagents_app.db.session import get_async_db
 from deepagents_app.services.catalog import tools as tools_svc
 router = APIRouter(tags=["tools"])
@@ -30,7 +36,7 @@ router = APIRouter(tags=["tools"])
 async def list_tools(
     response: Response,
     status: str | None = Query(None, description="active | disabled"),
-    tool_type: str | None = Query(None, description="builtin | mcp"),
+    tool_type: str | None = Query(None, description="builtin | mcp | http"),
     limit: int = Depends(limit_query),
     cursor: str | None = Depends(cursor_query),
     db: AsyncSession = Depends(get_async_db),
@@ -49,22 +55,59 @@ async def list_tools(
     return rows
 
 
+@router.post("/tool/test", response_model=ToolTestResult)
+async def test_tool_inline(
+    body: ToolTestRequest,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    """
+    连通性测试。
+
+    - 传 ``tool_id``：用目录已存配置测试
+    - 否则用 body 内联 mcp / http（保存前试连）
+    """
+    if body.tool_id:
+        return await tools_svc.test_tool_by_id(
+            db, body.tool_id, owner_user_id=user_id
+        )
+    return await tools_svc.test_tool_connectivity(
+        tool_type=str(body.tool_type),
+        mcp_config=body.mcp.model_dump() if body.mcp else None,
+        http_config=body.http.model_dump() if body.http else None,
+    )
+
+
 @router.post("/tool", response_model=ToolOut)
 async def create_tool(
     body: ToolCreate,
     db: AsyncSession = Depends(get_async_db),
     user_id: str = Depends(require_user),
 ):
-    """仅创建 MCP 工具（body.mcp 为连接配置；schema 层已禁止 class_path 式创建）。"""
+    """创建 MCP 或 HTTP 工具（schema 层已禁止 class_path 式创建）。"""
+    common = {
+        "owner_user_id": user_id,
+        "name": body.name,
+        "description": body.description,
+        "status": body.status,
+        "tool_id": body.id,
+    }
+    if body.tool_type == "http":
+        if body.http is None:
+            raise BusinessError("http 工具必须提供 http")
+        return await tools_svc.create_http_tool(
+            db,
+            http_config=body.http.model_dump(),
+            requires_hitl=False if body.requires_hitl is None else body.requires_hitl,
+            **common,
+        )
+    if body.mcp is None:
+        raise BusinessError("mcp 工具必须提供 mcp")
     return await tools_svc.create_mcp_tool(
         db,
-        owner_user_id=user_id,
-        name=body.name,
-        description=body.description,
         mcp_config=body.mcp.model_dump(),
-        requires_hitl=body.requires_hitl,
-        status=body.status,
-        tool_id=body.id,
+        requires_hitl=True if body.requires_hitl is None else body.requires_hitl,
+        **common,
     )
 
 
@@ -92,6 +135,7 @@ async def update_tool(
         name=body.name,
         description=body.description,
         mcp_config=body.mcp.model_dump() if body.mcp else None,
+        http_config=body.http.model_dump() if body.http else None,
         requires_hitl=body.requires_hitl,
         status=body.status,
     )
@@ -105,3 +149,12 @@ async def delete_tool(
 ):
     await tools_svc.delete_tool(db, tool_id, owner_user_id=user_id)
     return {"ok": True}
+
+
+@router.post("/tool/{tool_id}/test", response_model=ToolTestResult)
+async def test_tool(
+    tool_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    return await tools_svc.test_tool_by_id(db, tool_id, owner_user_id=user_id)
