@@ -1,4 +1,13 @@
-"""业务异常与 FastAPI HTTP 映射。"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   errors.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   errors.py
+
+业务异常与 FastAPI HTTP 映射。
+"""
 
 from __future__ import annotations
 

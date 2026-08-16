@@ -9,7 +9,7 @@
 - Redis Stack：LangGraph checkpoint、Agent / MCP 缓存跨 worker 失效、多 worker 下 SSE 全局限流
 - 按方法论动态 `create_deep_agent()` + 进程内 LRU；多进程经 Redis pub/sub 失效
 - 方法论版本快照（旧会话锁定创建时版本）
-- Skills 入库，组装时按内容指纹物化到 `workspace/users/<scope>/skills/`
+- Skills 入库（SKILL.md 或目录包 zip），组装时按内容指纹物化到 `workspace/users/<scope>/skills/`
 
 前端：[`../DeepAgents-frontend`](../DeepAgents-frontend)
 
@@ -185,6 +185,8 @@ python -m deepagents_app.db.migrate
 | GET | `/api/middleware/list` | 中间件注册表 |
 | GET | `/api/model/list` | 模型目录 |
 | GET | `/api/skill/list` | Skill 目录 |
+| POST | `/api/skill` | 用 SKILL.md 正文创建 Skill |
+| POST | `/api/skill/upload` | 上传技能目录 zip（SKILL.md + 附属文件） |
 | POST | `/api/conversation` | 创建会话（绑定方法论版本） |
 | GET | `/api/conversation/{thread_id}/messages` | 历史消息 |
 | POST | `/api/chat/stream` | 聊天（SSE） |

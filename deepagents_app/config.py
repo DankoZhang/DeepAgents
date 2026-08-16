@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   config.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   config.py
+
 应用配置
 ========
 
@@ -118,6 +125,18 @@ class Settings(BaseSettings):
     skills_gc_max_age_days: float = Field(default=14.0, ge=0, le=3650)
     # Skills 物化 GC：残留临时目录超过该小时数则删除
     skills_gc_tmp_max_age_hours: float = Field(default=1.0, ge=0.01, le=720)
+    # 上传技能包 zip：压缩体积上限（字节）
+    skill_package_max_bytes: int = Field(default=8 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    # 上传技能包：解压后体积上限（字节）
+    skill_package_max_uncompressed_bytes: int = Field(
+        default=32 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024
+    )
+    skill_package_max_files: int = Field(default=80, ge=1, le=500)
+    skill_package_max_depth: int = Field(default=4, ge=1, le=12)
+    # 附属文件后缀白名单（逗号分隔）；SKILL.md 始终允许
+    skill_package_allowed_suffixes: str = (
+        ".md,.py,.sh,.json,.yaml,.yml,.txt,.toml,.csv"
+    )
     # Skills GC 间隔（小时）；0=后台不跑 Skills（可用 ``python -m deepagents_app.services.infra.gc``）
     # 与 content_blob 共用一个 PeriodicTask；各自 Redis 单飞，不随 API_WORKERS 放大
     skills_gc_interval_hours: float = Field(default=24.0, ge=0, le=720)

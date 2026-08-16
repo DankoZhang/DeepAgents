@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   revisions.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   revisions.py
+
 方法论版本快照
 ==============
 
@@ -8,7 +15,7 @@
 - 配置变更时统一 ``bump_methodology``：
   - draft：不升版、不写快照（draft 无人读）；仅刷新时间戳并失效缓存
   - published：升版 + 新快照，并按保留策略裁剪历史
-- Agent / 模型变更时级联 bump；Tool / Skill 变更走 ``refresh_methodologies_using_resource``
+- Agent / 模型变更时级联 bump；Tool / Skill 变更走 ``propagate_methodology_change_using_resource``
   （可升版或仅失效缓存）
 """
 
@@ -25,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import NotFoundError
 from deepagents_app.config import get_settings
-from deepagents_app.db.loading import methodology_with_agents_options
+from deepagents_app.db.loading import load_methodology_with_agents
 from deepagents_app.db.models import (
     AgentDefinition,
     AgentSkill,
@@ -40,62 +47,56 @@ from deepagents_app.services.versioning.snapshots import serialize_agent_for_sna
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "serialize_methodology",
+    "serialize_methodology_for_snapshot",
     "snapshot_methodology",
     "get_revision",
     "list_revisions",
     "schedule_cache_invalidation",
     "flush_cache_invalidations",
     "schedule_cache_invalidation_for_agent_ids",
-    "refresh_methodologies_for_agent_ids",
-    "refresh_methodologies_using_resource",
+    "propagate_methodology_change_for_agent_ids",
+    "propagate_methodology_change_using_resource",
     "prune_methodology_revisions",
     "bump_methodology",
     "bump_methodologies_for_agent_ids",
     "bump_methodologies_using_resource",
-    "bump_methodologies_using_agent",
-    "bump_methodologies_using_model",
 ]
 
 
-async def _load_methodology_for_snapshot(
+async def _require_methodology_with_agents(
     db: AsyncSession, methodology_id: str
 ) -> Methodology:
-    """带 agents / tools / middlewares / skills / llm 预加载的方法论。"""
-    methodology = (
-        await db.scalars(
-            select(Methodology)
-            .options(*methodology_with_agents_options())
-            .where(Methodology.id == methodology_id)
-        )
-    ).one_or_none()
+    """快照序列化用：预加载方法论详情，不存在则抛 NotFoundError。"""
+    methodology = await load_methodology_with_agents(db, methodology_id)
     if methodology is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
     return methodology
 
 
-async def serialize_methodology(
+async def serialize_methodology_for_snapshot(
     db: AsyncSession,
     methodology_id: str | None = None,
     *,
     methodology: Methodology | None = None,
 ) -> dict[str, Any]:
     """
-    把当前方法论完整配置序列化为可重建的 JSON（含版本化 Memory）。
+    把当前方法论完整配置序列化为可重建的快照 JSON（含版本化 Memory）。
 
     可传已预加载的 ``methodology``（如 publish 刚查过的详情），避免再查一次；
     若其 agents 尚未 eager-load，仍会按 id 重新加载。
     """
     if methodology is None:
         if not methodology_id:
-            raise ValueError("serialize_methodology 需要 methodology 或 methodology_id")
-        methodology = await _load_methodology_for_snapshot(db, methodology_id)
+            raise ValueError(
+                "serialize_methodology_for_snapshot 需要 methodology 或 methodology_id"
+            )
+        methodology = await _require_methodology_with_agents(db, methodology_id)
     else:
         state = sa_inspect(methodology)
         if "agents" in state.unloaded:
-            methodology = await _load_methodology_for_snapshot(db, methodology.id)
+            methodology = await _require_methodology_with_agents(db, methodology.id)
 
-    from deepagents_app.services.versioning.memory import memory_payload_for_snapshot_async
+    from deepagents_app.services.versioning.memory import memory_payload_for_snapshot
 
     return {
         "id": methodology.id,
@@ -103,7 +104,7 @@ async def serialize_methodology(
         "description": methodology.description,
         "version": methodology.version,
         "status": methodology.status,
-        "memory": await memory_payload_for_snapshot_async(db, get_settings()),
+        "memory": await memory_payload_for_snapshot(db, get_settings()),
         "agents": [
             await serialize_agent_for_snapshot(db, agent)
             for agent in methodology.agents
@@ -118,7 +119,7 @@ async def snapshot_methodology(
     methodology: Methodology | None = None,
 ) -> MethodologyRevision:
     """按当前 ``methodology.version`` 写入/覆盖快照（同 version 重复调用会覆盖）。"""
-    payload = await serialize_methodology(
+    payload = await serialize_methodology_for_snapshot(
         db, methodology_id=methodology_id, methodology=methodology
     )
     version = int(payload["version"])
@@ -236,7 +237,7 @@ async def schedule_cache_invalidation_for_agent_ids(
     return True
 
 
-async def refresh_methodologies_for_agent_ids(
+async def propagate_methodology_change_for_agent_ids(
     db: AsyncSession,
     agent_ids: Iterable[str],
     *,
@@ -251,7 +252,7 @@ async def refresh_methodologies_for_agent_ids(
     return await schedule_cache_invalidation_for_agent_ids(db, ids)
 
 
-async def refresh_methodologies_using_resource(
+async def propagate_methodology_change_using_resource(
     db: AsyncSession,
     *,
     kind: str,
@@ -269,7 +270,7 @@ async def refresh_methodologies_using_resource(
         link.agent_id
         for link in await db.scalars(select(link_model).where(column == resource_id))
     ]
-    return await refresh_methodologies_for_agent_ids(
+    return await propagate_methodology_change_for_agent_ids(
         db, agent_ids, bump_related=bump_related
     )
 
@@ -410,7 +411,7 @@ async def bump_methodologies_using_resource(
     按资源类型解析引用该资源的 Agent，再级联 bump 相关方法论。
 
     ``kind``：``agent`` / ``model``。
-    Tool / Skill 变更请走 ``refresh_methodologies_using_resource``。
+    Tool / Skill 变更请走 ``propagate_methodology_change_using_resource``。
     返回是否命中至少一个方法论。
     """
     if kind == "agent":
@@ -426,13 +427,3 @@ async def bump_methodologies_using_resource(
         return await bump_methodologies_for_agent_ids(db, agent_ids)
 
     raise ValueError(f"未知 bump 资源类型：{kind}")
-
-
-async def bump_methodologies_using_agent(db: AsyncSession, agent_id: str) -> None:
-    """找出勾选了该全局 Agent 的全部方法论，逐个升版并快照。"""
-    await bump_methodologies_using_resource(db, kind="agent", resource_id=agent_id)
-
-
-async def bump_methodologies_using_model(db: AsyncSession, model_id: str) -> None:
-    """模型超参数变更：bump 所有引用该模型的 Agent 所在方法论。"""
-    await bump_methodologies_using_resource(db, kind="model", resource_id=model_id)

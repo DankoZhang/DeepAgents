@@ -1,10 +1,18 @@
-"""add model is_default
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   d3a8f1c2b4e6_add_model_is_default.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   d3a8f1c2b4e6_add_model_is_default.py
+
+add model is_default
 
 Revision ID: d3a8f1c2b4e6
 Revises: c960f621dfd0
 Create Date: 2026-08-13 20:30:00.000000
-
 """
+
 from typing import Sequence, Union
 
 from alembic import op

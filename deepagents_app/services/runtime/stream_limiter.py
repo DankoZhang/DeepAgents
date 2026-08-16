@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   stream_limiter.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   stream_limiter.py
+
 流式对话并发限流
 ==================
 

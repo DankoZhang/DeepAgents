@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   crud_helpers.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   crud_helpers.py
+
 Service 层 CRUD 样板
 ====================
 

@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   cache_pubsub.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   cache_pubsub.py
+
 跨 worker 缓存失效广播
 ======================
 

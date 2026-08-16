@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   methodology.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   methodology.py
+
 方法论 CRUD、发布、勾选全局 Agent
 ================================
 
@@ -19,7 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import BusinessError, ForbiddenError, NotFoundError
-from deepagents_app.db.loading import methodology_with_agents_options
+from deepagents_app.db.loading import load_methodology_with_agents
 from deepagents_app.db.models import AgentDefinition, Conversation, Methodology
 from deepagents_app.ownership import validate_resource_id
 from deepagents_app.db.pagination import DEFAULT_LIMIT, coerce_datetime, page_rows
@@ -66,16 +73,9 @@ async def get_methodology(
     db: AsyncSession, methodology_id: str, *, owner_user_id: str
 ) -> Methodology | None:
     """取单个方法论（含已勾选 Agent 及其 tools/middlewares/skills/llm）。"""
-    return (
-        await db.scalars(
-            select(Methodology)
-            .options(*methodology_with_agents_options())
-            .where(
-                Methodology.id == methodology_id,
-                Methodology.owner_user_id == owner_user_id,
-            )
-        )
-    ).one_or_none()
+    return await load_methodology_with_agents(
+        db, methodology_id, owner_user_id=owner_user_id
+    )
 
 
 async def create_methodology(

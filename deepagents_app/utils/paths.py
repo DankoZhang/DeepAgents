@@ -1,4 +1,13 @@
-"""路径安全辅助。"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   paths.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   paths.py
+
+路径安全辅助。
+"""
 
 from __future__ import annotations
 

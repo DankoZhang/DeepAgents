@@ -1,4 +1,13 @@
-"""SQLAlchemy Declarative Base。"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   base.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   base.py
+
+SQLAlchemy Declarative Base。
+"""
 
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase

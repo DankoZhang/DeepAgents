@@ -1,4 +1,13 @@
-"""Alembic 运行环境：URL 与 metadata 来自应用配置 / ORM。"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   env.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   env.py
+
+Alembic 运行环境：URL 与 metadata 来自应用配置 / ORM。
+"""
 
 from __future__ import annotations
 

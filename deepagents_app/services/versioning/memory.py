@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   memory.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   memory.py
+
 Memory（AGENTS.md）版本化
 ========================
 
@@ -81,7 +88,7 @@ def materialize_versioned_memory(
     return "/" + rel.as_posix()
 
 
-async def memory_payload_for_snapshot_async(
+async def memory_payload_for_snapshot(
     db: AsyncSession, settings: Settings | None = None
 ) -> dict[str, str]:
     """写入方法论快照的 Memory 片段（正文进 content_blob）。"""

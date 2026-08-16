@@ -1,8 +1,15 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   skills.py
+@Time    :   2026/08/16 18:09:54
+@Author  :   zhangce
+@Desc    :   skills.py
+
 Skill 目录与物化
 ================
 
-- 目录 CRUD：用户可维护 SKILL.md 正文（含 YAML frontmatter）
+- 目录 CRUD：JSON 创建只写 SKILL.md；上传 zip 额外写入 files 附属文件
 - 组装时按内容哈希物化到 ``workspace/skills/<fingerprint>/<agent_id>/``
   （只写不删；已发布目录可跨缓存生命周期复用）
 - 变更后默认 bump 引用该方法论；旧会话靠快照 content_hash + content_blob 还原重建
@@ -35,10 +42,15 @@ from deepagents_app.services.catalog.crud_helpers import (
     resolve_resource_id,
 )
 from deepagents_app.services.versioning.revisions import (
-    refresh_methodologies_for_agent_ids,
-    refresh_methodologies_using_resource,
+    propagate_methodology_change_for_agent_ids,
+    propagate_methodology_change_using_resource,
 )
 from deepagents_app.utils.paths import resolve_under_root
+from deepagents_app.utils.skill_package import (
+    SkillPackage,
+    load_skill_package_from_dir,
+    skill_files_map,
+)
 from deepagents_app.workspace import get_workspace_root
 
 logger = logging.getLogger(__name__)
@@ -94,11 +106,13 @@ async def create_skill(
     config: dict[str, Any] | None = None,
     status: str = "active",
     skill_id: str | None = None,
+    files: dict[str, str] | None = None,
 ) -> SkillDefinition:
     """
     创建 Skill。
 
     若 ``content`` 无 YAML frontmatter，会自动用 name/description 拼一层。
+    ``files`` 为附属文本（相对路径 → 正文）；JSON 创建接口不传则视为空。
     """
     name = name.strip()
     _validate_skill_name(name)
@@ -124,6 +138,7 @@ async def create_skill(
         name=name,
         description=(description or "").strip(),
         content=body,
+        files=skill_files_map(files),
         config=dict(config or {}),
         status=status,
     )
@@ -140,11 +155,12 @@ async def update_skill(
     name: str | None = None,
     description: str | None = None,
     content: str | None = None,
+    files: dict[str, str] | None = None,
     config: dict[str, Any] | None = None,
     status: str | None = None,
     bump_related: bool = True,
 ) -> SkillDefinition:
-    """更新 Skill；``bump_related=True`` 时升版所有引用该方法论。"""
+    """更新 Skill；``files is None`` 时保留已有附属文件（PATCH content 不丢包）。"""
     row = await get_skill(db, skill_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Skill 不存在：{skill_id}")
@@ -175,6 +191,8 @@ async def update_skill(
                 body=body,
             )
         row.content = body
+    if files is not None:
+        row.files = skill_files_map(files)
     if config is not None:
         merged = dict(row.config or {})
         merged.update(config)
@@ -184,7 +202,7 @@ async def update_skill(
 
     row.updated_time = datetime.now(timezone.utc)
     await db.flush()
-    await refresh_methodologies_using_resource(
+    await propagate_methodology_change_using_resource(
         db,
         kind="skill",
         resource_id=skill_id,
@@ -214,33 +232,102 @@ async def delete_skill(
     ]
     await db.delete(row)
     await db.flush()
-    await refresh_methodologies_for_agent_ids(
+    await propagate_methodology_change_for_agent_ids(
         db, agent_ids, bump_related=bump_related
     )
 
 
-# ── 快照还原与磁盘物化（Agent Factory 组装时调用）──────────────────────
+async def create_skill_from_package(
+    db: AsyncSession,
+    package: SkillPackage,
+    *,
+    owner_user_id: str,
+    name_override: str | None = None,
+    description_override: str | None = None,
+    status: str = "active",
+    skill_id: str | None = None,
+) -> SkillDefinition:
+    """由已解析的目录包创建 Skill（上传接口）。"""
+    name, description = _package_identity(
+        package, name_override=name_override, description_override=description_override
+    )
+    return await create_skill(
+        db,
+        owner_user_id=owner_user_id,
+        name=name,
+        description=description,
+        content=package.content,
+        files=package.files,
+        status=status,
+        skill_id=skill_id,
+    )
 
 
-def skill_definition_from_snapshot(payload: dict[str, Any]) -> SkillDefinition:
-    """从快照 dict 构造脱离 Session 的 SkillDefinition（仅供物化）。"""
+async def replace_skill_from_package(
+    db: AsyncSession,
+    skill_id: str,
+    package: SkillPackage,
+    *,
+    owner_user_id: str,
+    name_override: str | None = None,
+    description_override: str | None = None,
+    status: str | None = None,
+) -> SkillDefinition:
+    """用目录包整包替换已有 Skill 的 SKILL.md 与附属文件。"""
+    name, description = _package_identity(
+        package, name_override=name_override, description_override=description_override
+    )
+    return await update_skill(
+        db,
+        skill_id,
+        owner_user_id=owner_user_id,
+        name=name,
+        description=description,
+        content=package.content,
+        files=package.files,
+        status=status,
+    )
+
+
+def _package_identity(
+    package: SkillPackage,
+    *,
+    name_override: str | None,
+    description_override: str | None,
+) -> tuple[str, str]:
+    name = (name_override or package.name).strip()
+    description = (
+        package.description if description_override is None else description_override
+    )
+    return name, (description or "").strip()
+
+
+# ── 运行时 payload 还原与磁盘物化（Agent Factory 组装时调用）──────────
+
+
+def skill_definition_from_payload(payload: dict[str, Any]) -> SkillDefinition:
+    """从内嵌 payload 构造脱离 Session 的 SkillDefinition（仅供物化）。
+
+    ``files`` 须为 hydrate 之后的 ``{相对路径: 正文}``。
+    """
     return SkillDefinition(
         id=str(payload.get("id") or payload.get("name") or ""),
         name=str(payload.get("name") or ""),
         description=str(payload.get("description") or ""),
         content=str(payload.get("content") or ""),
+        files=skill_files_map(payload.get("files")),
         config=dict(payload.get("config") or {}),
         status=str(payload.get("status") or "active"),
     )
 
 
-def load_skills_from_snapshots(payloads: list[dict[str, Any]]) -> list[SkillDefinition]:
-    """按快照内嵌的 Skill payload 还原（顺序保留；仅 active）。"""
+def load_skills_from_payloads(payloads: list[dict[str, Any]]) -> list[SkillDefinition]:
+    """按内嵌 Skill payload 还原（live / 快照同形；顺序保留；仅 active）。"""
     result: list[SkillDefinition] = []
     for payload in payloads:
-        row = skill_definition_from_snapshot(payload)
+        row = skill_definition_from_payload(payload)
         if (row.status or "active") != "active":
-            logger.warning("快照中 Skill 已禁用，跳过：%s (%s)", row.name, row.id)
+            logger.warning("Skill 已禁用，跳过：%s (%s)", row.name, row.id)
             continue
         result.append(row)
     return result
@@ -257,6 +344,7 @@ def skills_fingerprint(skills: Sequence[SkillDefinition]) -> str:
         {
             "name": s.name,
             "content": s.content or "",
+            "files": skill_files_map(s.files),
             "status": s.status or "active",
         }
         for s in sorted(active, key=lambda row: row.name)
@@ -274,7 +362,8 @@ def materialize_agent_skills(
 ) -> str | None:
     """
     把 Agent 已绑 Skills 物化到
-    ``<workspace_root>/skills/<fingerprint>/<agent_id>/<name>/SKILL.md``。
+    ``<workspace_root>/skills/<fingerprint>/<agent_id>/<name>/``
+    （SKILL.md + 附属文件）。
 
     内容寻址 + 原子发布：已有 ``.complete`` 则复用；否则写临时目录再 rename。
     缓存淘汰 / 版本裁剪不再删除这些目录。
@@ -381,7 +470,7 @@ def touch_materialized_skills_complete(roots: Sequence[Path]) -> int:
 
 
 def _write_skills_tree(root: Path, skills: Sequence[SkillDefinition]) -> None:
-    """写入临时目录：各 Skill 子目录 + 完成标记。"""
+    """写入临时目录：各 Skill 子目录（SKILL.md + 附属文件）+ 完成标记。"""
     root.mkdir(parents=True, exist_ok=False)
     for skill in skills:
         try:
@@ -390,6 +479,13 @@ def _write_skills_tree(root: Path, skills: Sequence[SkillDefinition]) -> None:
             raise BusinessError(f"Skill 物化路径非法：{skill.name}") from exc
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(skill.content or "", encoding="utf-8")
+        for rel, body in skill_files_map(skill.files).items():
+            try:
+                target = resolve_under_root(skill_dir, rel)
+            except ValueError as exc:
+                raise BusinessError(f"Skill 附属文件路径非法：{rel}") from exc
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
     (root / _COMPLETE_MARKER).touch()
 
 
@@ -572,48 +668,7 @@ def build_skill_markdown(*, name: str, description: str, body: str) -> str:
     )
 
 
-def parse_skill_markdown(content: str) -> tuple[str | None, str | None]:
-    """从 SKILL.md 解析 frontmatter 的 name / description（失败返回 None）。"""
-    text = content.lstrip()
-    if not text.startswith("---"):
-        return None, None
-    end = text.find("\n---", 3)
-    if end < 0:
-        return None, None
-    fm = text[3:end].strip()
-    name: str | None = None
-    description: str | None = None
-    lines = fm.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.startswith("name:"):
-            name = line[len("name:") :].strip().strip("'\"")
-            i += 1
-            continue
-        if line.startswith("description:"):
-            rest = line[len("description:") :].strip()
-            # 支持 YAML 多行块标量 > / |
-            if rest in {">", "|", ""}:
-                parts: list[str] = []
-                i += 1
-                while i < len(lines) and (
-                    lines[i].startswith("  ")
-                    or lines[i].startswith("\t")
-                    or lines[i] == ""
-                ):
-                    parts.append(lines[i].strip())
-                    i += 1
-                description = "\n".join(p for p in parts if p).strip() or None
-            else:
-                description = rest.strip("'\"")
-                i += 1
-            continue
-        i += 1
-    return name, description
-
-
-async def import_skill_from_file(
+async def import_skill_from_path(
     db: AsyncSession,
     path: Path,
     *,
@@ -621,12 +676,11 @@ async def import_skill_from_file(
     skill_id: str | None = None,
     name_override: str | None = None,
 ) -> SkillDefinition | None:
-    """从 SKILL.md 文件幂等导入（已存在同 id 或同 name 则跳过创建）。"""
+    """从 SKILL.md 或技能目录幂等导入（已存在同 id 或同 name 则跳过创建）。"""
     if not path.exists():
         return None
-    content = path.read_text(encoding="utf-8")
-    fm_name, fm_desc = parse_skill_markdown(content)
-    name = (name_override or fm_name or path.parent.name).strip()
+    package = load_skill_package_from_dir(path)
+    name = (name_override or package.name).strip()
     if skill_id:
         existing_by_id = await get_skill(db, skill_id, owner_user_id=owner_user_id)
         if existing_by_id is not None:
@@ -641,12 +695,11 @@ async def import_skill_from_file(
     ).one_or_none()
     if existing is not None:
         return existing
-    return await create_skill(
+    return await create_skill_from_package(
         db,
+        package,
         owner_user_id=owner_user_id,
-        name=name,
-        description=fm_desc or "",
-        content=content,
+        name_override=name_override,
         skill_id=skill_id,
     )
 

@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   periodic.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   periodic.py
+
 周期性后台任务辅助
 ==================
 

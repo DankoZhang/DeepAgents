@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   snapshots.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   snapshots.py
+
 快照序列化
 ==========
 
@@ -22,11 +29,12 @@ from deepagents_app.db.models import (
     ToolDefinition,
 )
 from deepagents_app.services.versioning.content_blobs import ensure_content_blob
-from deepagents_app.services.catalog.llm_models import serialize_model_for_snapshot
+from deepagents_app.services.catalog.llm_models import serialize_model
+from deepagents_app.utils.skill_package import skill_files_map
 
 
-def serialize_tool_for_snapshot(row: ToolDefinition) -> dict[str, Any]:
-    """钉死工具元信息（含 MCP 连接 config），旧会话不随目录修改漂移。"""
+def serialize_tool(row: ToolDefinition) -> dict[str, Any]:
+    """工具元信息（含 MCP 连接 config）；live 组装与快照共用。"""
     return {
         "id": row.id,
         "name": row.name,
@@ -39,8 +47,8 @@ def serialize_tool_for_snapshot(row: ToolDefinition) -> dict[str, Any]:
     }
 
 
-def serialize_middleware_for_snapshot(row: MiddlewareDefinition) -> dict[str, Any]:
-    """钉死中间件 class_path + 构造 config。"""
+def serialize_middleware(row: MiddlewareDefinition) -> dict[str, Any]:
+    """中间件 class_path + 构造 config；live 组装与快照共用。"""
     return {
         "id": row.id,
         "name": row.name,
@@ -61,16 +69,29 @@ def _skill_common_fields(row: SkillDefinition) -> dict[str, Any]:
 
 
 def serialize_skill_for_live(row: SkillDefinition) -> dict[str, Any]:
-    """live 组装用：保留完整 content。"""
-    return {**_skill_common_fields(row), "content": row.content}
+    """live 组装用：保留完整 content 与附属文件正文。"""
+    return {
+        **_skill_common_fields(row),
+        "content": row.content,
+        "files": skill_files_map(row.files),
+    }
 
 
 async def serialize_skill_for_snapshot(
     db: AsyncSession, row: SkillDefinition
 ) -> dict[str, Any]:
-    """钉死 Skill 元信息；正文写入 content_blob，快照只存 hash。"""
+    """钉死 Skill 元信息；SKILL.md 与附属文件写入 content_blob，快照只存 hash。"""
     digest = await ensure_content_blob(db, row.content or "")
-    return {**_skill_common_fields(row), "content_hash": digest}
+    file_entries: list[dict[str, str]] = []
+    for path, body in skill_files_map(row.files).items():
+        file_entries.append(
+            {"path": path, "content_hash": await ensure_content_blob(db, body)}
+        )
+    return {
+        **_skill_common_fields(row),
+        "content_hash": digest,
+        "files": file_entries,
+    }
 
 
 def _agent_common_fields(agent: AgentDefinition) -> dict[str, Any]:
@@ -80,11 +101,9 @@ def _agent_common_fields(agent: AgentDefinition) -> dict[str, Any]:
         "name": agent.name,
         "model_id": agent.model_id,
         "config": dict(agent.config or {}),
-        "tools": [serialize_tool_for_snapshot(t) for t in agent.tools],
-        "middlewares": [
-            serialize_middleware_for_snapshot(m) for m in agent.middlewares
-        ],
-        "llm": serialize_model_for_snapshot(agent.llm_model),
+        "tools": [serialize_tool(t) for t in agent.tools],
+        "middlewares": [serialize_middleware(m) for m in agent.middlewares],
+        "llm": serialize_model(agent.llm_model),
     }
 
 

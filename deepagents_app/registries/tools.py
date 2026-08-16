@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   tools.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   tools.py
+
 Tool Registry
 =============
 
@@ -94,7 +101,8 @@ def invalidate_mcp_tools_cache(*, tool_id: str | None = None) -> None:
         logger.warning("广播 MCP 缓存失效失败", exc_info=True)
 
 
-async def _aload_mcp_tools(tool_def: ToolDefinition) -> list[Any]:
+async def _fetch_mcp_tools(tool_def: ToolDefinition) -> list[Any]:
+    """向 MCP Server 拉取工具列表（无缓存）。"""
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
     from deepagents_app.utils.mcp_safety import validate_mcp_config
@@ -121,7 +129,7 @@ async def load_mcp_tools(tool_def: ToolDefinition) -> list[Any]:
         if hit is not None and hit[0] == fingerprint:
             return list(hit[1])
     try:
-        tools = await _aload_mcp_tools(tool_def)
+        tools = await _fetch_mcp_tools(tool_def)
     except Exception:
         logger.exception("加载 MCP 工具失败：%s", tool_def.name)
         raise
@@ -199,8 +207,8 @@ async def expand_tool_definition(tool_def: ToolDefinition) -> list[Any]:
     return [load_builtin_tool(tool_def)]
 
 
-def tool_definition_from_snapshot(payload: dict[str, Any]) -> ToolDefinition:
-    """从快照 dict 构造脱离 Session 的 ToolDefinition（仅供运行时展开）。"""
+def tool_definition_from_payload(payload: dict[str, Any]) -> ToolDefinition:
+    """从内嵌 payload 构造脱离 Session 的 ToolDefinition（仅供运行时展开）。"""
     return ToolDefinition(
         id=str(payload.get("id") or payload.get("name") or ""),
         name=str(payload.get("name") or ""),
@@ -240,7 +248,7 @@ async def interrupt_tool_names_from_payloads(
                 continue
             try:
                 expanded = await expand_tool_definition(
-                    tool_definition_from_snapshot(payload)
+                    tool_definition_from_payload(payload)
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -259,8 +267,8 @@ async def interrupt_tool_names_from_payloads(
     return names
 
 
-async def load_tools_from_snapshots(payloads: list[dict[str, Any]]) -> list[Any]:
-    """按快照内嵌的工具 payload 展开（顺序保留、按 id 去重）。"""
+async def load_tools_from_payloads(payloads: list[dict[str, Any]]) -> list[Any]:
+    """按内嵌工具 payload 展开（live / 快照同形；顺序保留、按 id 去重）。"""
     tools: list[Any] = []
     seen: set[str] = set()
     for payload in payloads:
@@ -269,5 +277,5 @@ async def load_tools_from_snapshots(payloads: list[dict[str, Any]]) -> list[Any]
             continue
         if tid:
             seen.add(tid)
-        tools.extend(await expand_tool_definition(tool_definition_from_snapshot(payload)))
+        tools.extend(await expand_tool_definition(tool_definition_from_payload(payload)))
     return tools

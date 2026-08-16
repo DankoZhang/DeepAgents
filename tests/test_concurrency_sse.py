@@ -1,4 +1,13 @@
-"""并发与 SSE 心跳回归（不依赖 LLM）。"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   test_concurrency_sse.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   test_concurrency_sse.py
+
+并发与 SSE 心跳回归（不依赖 LLM）。
+"""
 
 from __future__ import annotations
 
@@ -83,7 +92,7 @@ async def test_failed_agent_build_drops_unowned_build_lock(monkeypatch):
     async def fail_load(*_args, **_kwargs):
         raise RuntimeError("模拟组装失败")
 
-    monkeypatch.setattr(af, "get_methodology_config", fail_load)
+    monkeypatch.setattr(af, "load_methodology_for_assembly", fail_load)
     with pytest.raises(RuntimeError, match="模拟组装失败"):
         await af.build_agent_from_methodology(
             object(),

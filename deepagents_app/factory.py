@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   factory.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   factory.py
+
 Deep Agent 共享组装工具
 ======================
 
@@ -43,10 +50,16 @@ def build_permissions() -> list[FilesystemPermission]:
     示例策略：
     - 允许读写整个 workspace（backend root 映射为 /）
     - 拒绝直接改写审计日志（防止 Agent 篡改证据）
+    - 拒绝改写物化 Skills 目录（防止 Agent 篡改目录技能）
     """
     return [
         FilesystemPermission(
             paths=["/audit/**"],
+            operations=["write"],
+            mode="deny",
+        ),
+        FilesystemPermission(
+            paths=["/skills/**"],
             operations=["write"],
             mode="deny",
         ),

@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   tools.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   tools.py
+
 Tool 注册管理
 =============
 
@@ -23,8 +30,8 @@ from deepagents_app.services.catalog.crud_helpers import (
     resolve_resource_id,
 )
 from deepagents_app.services.versioning.revisions import (
-    refresh_methodologies_for_agent_ids,
-    refresh_methodologies_using_resource,
+    propagate_methodology_change_for_agent_ids,
+    propagate_methodology_change_using_resource,
 )
 from deepagents_app.utils.http_tool_safety import validate_http_tool_config
 from deepagents_app.utils.mcp_safety import validate_mcp_config
@@ -260,7 +267,7 @@ async def update_tool(
     await db.flush()
     if row.tool_type == "mcp":
         _invalidate_mcp_cache(tool_id)
-    await refresh_methodologies_using_resource(
+    await propagate_methodology_change_using_resource(
         db,
         kind="tool",
         resource_id=tool_id,
@@ -292,7 +299,7 @@ async def delete_tool(
     await db.flush()
     if row.tool_type == "mcp":
         _invalidate_mcp_cache(tool_id)
-    await refresh_methodologies_for_agent_ids(
+    await propagate_methodology_change_for_agent_ids(
         db, agent_ids, bump_related=bump_related
     )
 

@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   middleware.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   middleware.py
+
 Middleware Registry
 ===================
 
@@ -24,8 +31,8 @@ def load_middleware_object(mw_def: MiddlewareDefinition) -> Any:
     return obj
 
 
-def middleware_definition_from_snapshot(payload: dict[str, Any]) -> MiddlewareDefinition:
-    """从快照 dict 构造脱离 Session 的 MiddlewareDefinition（仅供运行时实例化）。"""
+def middleware_definition_from_payload(payload: dict[str, Any]) -> MiddlewareDefinition:
+    """从内嵌 payload 构造脱离 Session 的 MiddlewareDefinition（仅供运行时实例化）。"""
     return MiddlewareDefinition(
         id=str(payload.get("id") or payload.get("name") or ""),
         name=str(payload.get("name") or ""),
@@ -34,8 +41,8 @@ def middleware_definition_from_snapshot(payload: dict[str, Any]) -> MiddlewareDe
     )
 
 
-def load_middlewares_from_snapshots(payloads: list[dict[str, Any]]) -> list[Any]:
-    """按快照内嵌的中间件 payload 实例化（顺序保留）。"""
+def load_middlewares_from_payloads(payloads: list[dict[str, Any]]) -> list[Any]:
+    """按内嵌中间件 payload 实例化（live / 快照同形；顺序保留）。"""
     return [
-        load_middleware_object(middleware_definition_from_snapshot(p)) for p in payloads
+        load_middleware_object(middleware_definition_from_payload(p)) for p in payloads
     ]

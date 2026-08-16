@@ -1,10 +1,18 @@
-"""initial_schema
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   c960f621dfd0_initial_schema.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   c960f621dfd0_initial_schema.py
+
+initial_schema
 
 Revision ID: c960f621dfd0
 Revises: 
 Create Date: 2026-08-09 22:14:14.424114
-
 """
+
 from typing import Sequence, Union
 
 from alembic import op

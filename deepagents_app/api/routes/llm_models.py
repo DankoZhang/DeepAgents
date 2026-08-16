@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   llm_models.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   llm_models.py
+
 大模型目录 API
 ==============
 

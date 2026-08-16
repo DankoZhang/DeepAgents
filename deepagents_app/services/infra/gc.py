@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   gc.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   gc.py
+
 运行时 GC（Skills 物化目录 + 孤儿 content_blob）
 =============================================
 

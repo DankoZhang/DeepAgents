@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   test_api.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   test_api.py
+
 API / 配置库冒烟测试（不依赖 LLM）。
 
 运行::
@@ -238,6 +245,7 @@ def test_skill_crud_and_agent_bind(client):
     skill = created.json()
     assert skill["name"] == "my-skill"
     assert "Do the skill carefully" in skill["content"]
+    assert skill.get("files") == {}
 
     agent = client.post(
         "/api/agent",
@@ -694,6 +702,7 @@ def test_snapshot_locks_skill_and_tool_payloads(client, demo_ids):
     skill_snap = snap_agent["skills"][0]
     assert "content_hash" in skill_snap
     assert "content" not in skill_snap
+    assert skill_snap.get("files") == []
     from deepagents_app.services.versioning.content_blobs import hydrate_snapshot_content
 
     async def _hydrate():

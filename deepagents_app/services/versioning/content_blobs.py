@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   content_blobs.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   content_blobs.py
+
 内容寻址正文（Content Blob）
 ============================
 
@@ -82,6 +89,21 @@ async def get_content_blobs(
     return {row.hash: row.content for row in rows}
 
 
+def _skill_file_hashes(skill: dict[str, Any]) -> set[str]:
+    """快照中附属文件的 content_hash 集合。"""
+    found: set[str] = set()
+    files = skill.get("files")
+    if not isinstance(files, list):
+        return found
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        digest = item.get("content_hash")
+        if isinstance(digest, str) and digest:
+            found.add(digest)
+    return found
+
+
 def _collect_hashes_from_snapshot(snapshot: dict[str, Any] | None) -> set[str]:
     """从一份方法论快照 JSON 收集所有 content_hash。"""
     found: set[str] = set()
@@ -106,6 +128,7 @@ def _collect_hashes_from_snapshot(snapshot: dict[str, Any] | None) -> set[str]:
             sh = skill.get("content_hash")
             if isinstance(sh, str) and sh:
                 found.add(sh)
+            found |= _skill_file_hashes(skill)
     return found
 
 
@@ -127,6 +150,36 @@ def _require_blob_body(
         short = digest[:12] if len(digest) > 12 else digest
         raise NotFoundError(f"快照引用的 {label} 正文缺失：hash={short}…")
     return bodies[digest]
+
+
+def _hydrate_skill_files(raw: Any, bodies: dict[str, str]) -> dict[str, str]:
+    """快照 files 清单 → 相对路径到正文；旧快照无 files 则为空。"""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        raise NotFoundError(
+            "快照 Skill 附属文件仅为明文、缺少 content_hash；请重新发布方法论"
+        )
+    if not isinstance(raw, list):
+        return {}
+    out: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "")
+        if not path:
+            continue
+        digest = item.get("content_hash")
+        if digest:
+            out[path] = _require_blob_body(
+                bodies, str(digest), label="Skill file"
+            )
+            continue
+        if item.get("content"):
+            raise NotFoundError(
+                "快照 Skill 附属文件仅为明文、缺少 content_hash；请重新发布方法论"
+            )
+    return out
 
 
 async def hydrate_snapshot_content(
@@ -152,8 +205,11 @@ async def hydrate_snapshot_content(
         if agent.get("system_prompt_hash"):
             needed.add(str(agent["system_prompt_hash"]))
         for skill in agent.get("skills") or []:
-            if isinstance(skill, dict) and skill.get("content_hash"):
+            if not isinstance(skill, dict):
+                continue
+            if skill.get("content_hash"):
                 needed.add(str(skill["content_hash"]))
+            needed |= _skill_file_hashes(skill)
 
     bodies = await get_content_blobs(db, needed)
 
@@ -198,6 +254,7 @@ async def hydrate_snapshot_content(
                 raise NotFoundError(
                     "快照 Skill 仅为明文、缺少 content_hash；请重新发布方法论"
                 )
+            s["files"] = _hydrate_skill_files(s.get("files"), bodies)
             skills.append(s)
         a["skills"] = skills
         agents.append(a)

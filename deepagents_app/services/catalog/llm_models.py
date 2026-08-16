@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   llm_models.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   llm_models.py
+
 大模型目录
 ==========
 
@@ -249,9 +256,13 @@ async def update_model(
     await db.flush()
 
     if bump_related:
-        from deepagents_app.services.versioning.revisions import bump_methodologies_using_model
+        from deepagents_app.services.versioning.revisions import (
+            bump_methodologies_using_resource,
+        )
 
-        await bump_methodologies_using_model(db, model_id)
+        await bump_methodologies_using_resource(
+            db, kind="model", resource_id=model_id
+        )
     return row
 
 
@@ -397,11 +408,11 @@ async def test_model_by_id(
 # ── 组装解析：快照/目录 → 可调用的 ChatModel ──────────────────────────
 
 
-def serialize_model_for_snapshot(
+def serialize_model(
     row: ModelDefinition | None,
 ) -> dict[str, Any] | None:
     """
-    写入方法论快照的模型配置。
+    模型配置（live 组装与快照共用）。
 
     不含 api_key：重建时按 model_id 从 live 目录回填密钥。
     """

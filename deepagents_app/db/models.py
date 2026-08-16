@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   models.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   models.py
+
 ORM 模型
 ========
 
@@ -193,7 +200,7 @@ class ToolDefinition(Base):
 
 class SkillDefinition(Base):
     """
-    Skill 目录：完整 SKILL.md 存 content，运行时物化到 workspace。
+    Skill 目录：SKILL.md 存 content，附属文件存 files（相对路径 → 正文）。
 
     ``name`` 同时作为物化子目录名（须为安全 slug）。
     方法论快照不内嵌正文，只存 content_blob.hash 引用。
@@ -209,6 +216,7 @@ class SkillDefinition(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    files: Mapped[dict[str, str]] = mapped_column(JsonType, default=dict, nullable=False)
     config: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     created_time: Mapped[datetime] = mapped_column(

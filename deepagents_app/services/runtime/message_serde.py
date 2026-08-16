@@ -1,4 +1,13 @@
-"""LangChain / LangGraph 消息与中断载荷的前端序列化。"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   message_serde.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   message_serde.py
+
+LangChain / LangGraph 消息与中断载荷的前端序列化。
+"""
 
 from __future__ import annotations
 

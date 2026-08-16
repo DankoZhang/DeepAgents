@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   schemas.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   schemas.py
+
 请求 / 响应 schemas（Pydantic）
 ==============================
 
@@ -498,6 +505,7 @@ class SkillOut(BaseModel):
     name: str
     description: str
     content: str
+    files: dict[str, str] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
     status: str
     created_time: datetime

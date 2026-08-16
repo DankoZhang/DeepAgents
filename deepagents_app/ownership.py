@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   ownership.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   ownership.py
+
 用户归属辅助
 ============
 

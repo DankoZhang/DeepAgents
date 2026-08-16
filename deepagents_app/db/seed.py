@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   seed.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   seed.py
+
 默认种子数据（按用户）
 ====================
 
@@ -26,7 +33,7 @@ from deepagents_app.services.catalog.methodology import (
     publish_methodology,
 )
 from deepagents_app.services.catalog.middlewares import create_middleware
-from deepagents_app.services.catalog.skills import import_skill_from_file
+from deepagents_app.services.catalog.skills import import_skill_from_path
 from deepagents_app.services.catalog.tools import create_builtin_tool
 from deepagents_app.workspace import user_workspace_dir
 from deepagents_app.supervisor.prompts import SUPERVISOR_SYSTEM_PROMPT
@@ -154,7 +161,7 @@ async def seed_tools_and_middlewares(db: AsyncSession, *, owner_user_id: str) ->
 
 async def seed_skills(db: AsyncSession, *, owner_user_id: str) -> None:
     for item in DEFAULT_SKILLS:
-        row = await import_skill_from_file(
+        row = await import_skill_from_path(
             db,
             item["path"],
             owner_user_id=owner_user_id,

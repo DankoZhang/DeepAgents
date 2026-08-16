@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   agents.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   agents.py
+
 Agent 配置管理
 ==============
 
@@ -32,7 +39,7 @@ from deepagents_app.services.catalog.crud_helpers import (
     resolve_resource_id,
 )
 from deepagents_app.services.versioning.revisions import (
-    bump_methodologies_using_agent,
+    bump_methodologies_using_resource,
     bump_methodology,
 )
 
@@ -161,7 +168,7 @@ async def create_agent(
         )
 
     if bump_related:
-        await bump_methodologies_using_agent(db, row.id)
+        await bump_methodologies_using_resource(db, kind="agent", resource_id=row.id)
     return await get_agent(db, row.id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
@@ -238,7 +245,9 @@ async def update_agent(
 
     await db.flush()
     if bump_related:
-        await bump_methodologies_using_agent(db, agent_id)
+        await bump_methodologies_using_resource(
+            db, kind="agent", resource_id=agent_id
+        )
     return await get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 
@@ -387,7 +396,9 @@ async def _bind_and_reload(
         )
     await db.flush()
     if bump_related:
-        await bump_methodologies_using_agent(db, agent_id)
+        await bump_methodologies_using_resource(
+            db, kind="agent", resource_id=agent_id
+        )
     return await get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
 
 

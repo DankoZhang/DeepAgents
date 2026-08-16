@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   test_smoke.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   test_smoke.py
+
 不依赖 LLM 的本地冒烟测试：知识库检索。
 
 运行::

@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   test_services_unit.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   test_services_unit.py
+
 services 层单测（不依赖 LLM / 不经 HTTP）。
 
 运行::
@@ -154,7 +161,7 @@ async def test_mcp_tools_cache_hit(monkeypatch):
         calls["n"] += 1
         return [object()]
 
-    monkeypatch.setattr(tools_reg, "_aload_mcp_tools", fake_aload)
+    monkeypatch.setattr(tools_reg, "_fetch_mcp_tools", fake_aload)
     row = ToolDefinition(
         id="tool_mcp_cache",
         name="mcp-cache",
@@ -419,7 +426,7 @@ async def test_interrupt_tool_names_from_payloads():
     }
 
 
-def test_resolve_interrupt_on_merges_system_and_catalog(monkeypatch):
+def test_resolve_interrupt_on_merges_system_and_payloads(monkeypatch):
     from deepagents_app import config
     from deepagents_app.services.runtime.agent_factory import _resolve_interrupt_on
 
@@ -429,7 +436,7 @@ def test_resolve_interrupt_on_merges_system_and_catalog(monkeypatch):
     merged = _resolve_interrupt_on(
         settings,
         supervisor_config={},
-        catalog_interrupt_on={"run_shell_command": True},
+        payload_interrupt_on={"run_shell_command": True},
     )
     assert merged is not None
     assert merged["run_shell_command"] is True
@@ -440,13 +447,13 @@ def test_resolve_interrupt_on_merges_system_and_catalog(monkeypatch):
     monkeypatch.setenv("ENABLE_HITL", "false")
     config.get_settings.cache_clear()
     settings = config.get_settings()
-    catalog_only = _resolve_interrupt_on(
+    payload_only = _resolve_interrupt_on(
         settings,
         supervisor_config={},
-        catalog_interrupt_on={"run_shell_command": True},
+        payload_interrupt_on={"run_shell_command": True},
     )
-    assert catalog_only == {"run_shell_command": True}
-    assert "write_file" not in catalog_only
+    assert payload_only == {"run_shell_command": True}
+    assert "write_file" not in payload_only
     config.get_settings.cache_clear()
 
 
@@ -456,7 +463,7 @@ async def test_memory_versioned_in_snapshot_and_materialize(db_session, tmp_path
     from deepagents_app.services.versioning import memory as memory_mod
     from deepagents_app.services.versioning.content_blobs import get_content_blob
     from deepagents_app.services.versioning.memory import materialize_versioned_memory
-    from deepagents_app.services.versioning.revisions import serialize_methodology
+    from deepagents_app.services.versioning.revisions import serialize_methodology_for_snapshot
     from deepagents_app.workspace import user_workspace_dir
 
     pinned = "# pinned memory v-test\n"
@@ -465,7 +472,7 @@ async def test_memory_versioned_in_snapshot_and_materialize(db_session, tmp_path
     original = memory_mod.read_project_memory
     memory_mod.read_project_memory = lambda _settings=None: pinned
     try:
-        payload = await serialize_methodology(db_session, mid)
+        payload = await serialize_methodology_for_snapshot(db_session, mid)
     finally:
         memory_mod.read_project_memory = original
 
@@ -821,7 +828,7 @@ async def test_resolve_model_spec_rejects_disabled_even_with_snapshot_llm(
         api_key="sk-test-resolve",
         status="active",
     )
-    snapshot_llm = models_svc.serialize_model_for_snapshot(row)
+    snapshot_llm = models_svc.serialize_model(row)
     assert snapshot_llm is not None
 
     ok = await models_svc.resolve_model_spec_for_agent(
@@ -866,7 +873,7 @@ async def test_resolve_model_spec_rejects_missing_catalog_api_key(db_session):
         api_key=None,
         status="active",
     )
-    snapshot_llm = models_svc.serialize_model_for_snapshot(row)
+    snapshot_llm = models_svc.serialize_model(row)
 
     with pytest.raises(BusinessError, match="未配置 API Key"):
         await models_svc.resolve_model_spec_for_agent(

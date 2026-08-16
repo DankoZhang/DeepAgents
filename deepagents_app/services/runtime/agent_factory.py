@@ -1,4 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+@File    :   agent_factory.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   agent_factory.py
+
 Agent Factory（方法论驱动）
 ==========================
 
@@ -35,13 +42,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deepagents_app.api.errors import BusinessError, NotFoundError
 from deepagents_app.backends import build_filesystem_backend
 from deepagents_app.config import Settings, get_settings
-from deepagents_app.db.loading import methodology_with_agents_options
+from deepagents_app.db.loading import load_methodology_with_agents
 from deepagents_app.db.models import AgentDefinition, Methodology, SkillDefinition
 from deepagents_app.factory import (
     build_checkpointer,
@@ -51,10 +57,10 @@ from deepagents_app.factory import (
 )
 from deepagents_app.llm import build_chat_model_from_spec
 from deepagents_app.ownership import user_scope_key
-from deepagents_app.registries.middleware import load_middlewares_from_snapshots
+from deepagents_app.registries.middleware import load_middlewares_from_payloads
 from deepagents_app.registries.tools import (
     interrupt_tool_names_from_payloads,
-    load_tools_from_snapshots,
+    load_tools_from_payloads,
 )
 from deepagents_app.services.catalog.llm_models import resolve_model_spec_for_agent
 from deepagents_app.services.versioning.memory import (
@@ -65,7 +71,7 @@ from deepagents_app.services.versioning.revisions import get_revision
 from deepagents_app.services.versioning.content_blobs import hydrate_snapshot_content
 from deepagents_app.services.versioning.snapshots import serialize_agent_for_live
 from deepagents_app.services.catalog.skills import (
-    load_skills_from_snapshots,
+    load_skills_from_payloads,
     materialize_agent_skills,
     materialized_skills_dir_from_virtual,
     touch_materialized_skills_complete,
@@ -267,21 +273,16 @@ def invalidate_agent_cache(
 # ── 配置加载与规格归一 ──────────────────────────────────────────────
 
 
-async def get_methodology_config(
+async def load_methodology_for_assembly(
     db: AsyncSession,
     methodology_id: str,
     *,
     owner_user_id: str | None = None,
 ) -> Methodology:
     """查询方法论 live 行（含 agents / tools / middlewares / skills / llm）。"""
-    stmt = (
-        select(Methodology)
-        .options(*methodology_with_agents_options())
-        .where(Methodology.id == methodology_id)
+    methodology = await load_methodology_with_agents(
+        db, methodology_id, owner_user_id=owner_user_id
     )
-    if owner_user_id is not None:
-        stmt = stmt.where(Methodology.owner_user_id == owner_user_id)
-    methodology = (await db.scalars(stmt)).one_or_none()
     if methodology is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
     return methodology
@@ -340,8 +341,8 @@ async def _resolve_runtime_bindings(
     """
     从归一后的 Agent dict 解析组装字段。
 
-    要求快照 / 归一结果内嵌 tools / middlewares / skills 完整 payload，
-    运行时直接展开，不再按 id 回查 live 目录表。
+    要求 live 归一结果 / hydrate 后的快照内嵌 tools / middlewares / skills
+    完整 payload，运行时直接展开，不再按 id 回查 live 目录表。
     """
     agent_id = str(agent.get("id") or agent["name"])
     name = str(agent["name"])
@@ -356,10 +357,10 @@ async def _resolve_runtime_bindings(
         raise BusinessError(f"Agent {agent_id} 缺少 skills payload，无法组装")
 
     # MCP 一条可展开为多个底层 tool；非 active 展开为空列表
-    tools = await load_tools_from_snapshots(list(agent.get("tools") or []))
-    middleware = load_middlewares_from_snapshots(list(agent.get("middlewares") or []))
+    tools = await load_tools_from_payloads(list(agent.get("tools") or []))
+    middleware = load_middlewares_from_payloads(list(agent.get("middlewares") or []))
     # 仅保留 active Skill，供后续物化
-    skills = load_skills_from_snapshots(list(agent.get("skills") or []))
+    skills = load_skills_from_payloads(list(agent.get("skills") or []))
     return agent_id, name, system_prompt, config, tools, middleware, skills
 
 
@@ -412,7 +413,7 @@ def _assemble_create_kwargs(
     supervisor_middleware: list[Any],
     supervisor_config: dict[str, Any],
     subagents: list[dict[str, Any]],
-    catalog_interrupt_on: dict[str, bool] | None = None,
+    payload_interrupt_on: dict[str, bool] | None = None,
     supervisor_skills: list[str] | None = None,
     memory_paths: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -420,7 +421,7 @@ def _assemble_create_kwargs(
     interrupt_on = _resolve_interrupt_on(
         settings,
         supervisor_config=supervisor_config,
-        catalog_interrupt_on=catalog_interrupt_on,
+        payload_interrupt_on=payload_interrupt_on,
     )
 
     create_kwargs: dict[str, Any] = {
@@ -452,25 +453,25 @@ def _resolve_interrupt_on(
     settings: Settings,
     *,
     supervisor_config: dict[str, Any],
-    catalog_interrupt_on: dict[str, bool] | None,
+    payload_interrupt_on: dict[str, bool] | None,
 ) -> dict[str, bool] | None:
     """
     HITL 名单 = 系统默认（框架原生，受 ``enable_hitl`` 总闸）∪
-    目录工具 ``requires_hitl``（不受总闸影响）∪ Supervisor 显式配置。
+    绑定工具 ``requires_hitl``（不受总闸影响）∪ Supervisor 显式配置。
     """
     merged: dict[str, bool] = {}
     system = build_interrupt_on(settings)
     if system:
         merged.update(system)
-    if catalog_interrupt_on:
-        merged.update(catalog_interrupt_on)
+    if payload_interrupt_on:
+        merged.update(payload_interrupt_on)
     explicit = supervisor_config.get("interrupt_on")
     if isinstance(explicit, dict):
         merged.update({str(k): bool(v) for k, v in explicit.items()})
     return merged or None
 
 
-async def _catalog_interrupt_on_from_agents(
+async def _interrupt_on_from_agent_payloads(
     agents: list[dict[str, Any]],
 ) -> dict[str, bool]:
     """汇总方法论内所有 Agent 绑定工具的 requires_hitl 运行时名。"""
@@ -539,7 +540,7 @@ async def _compile_from_agents(
         supervisor, subagents_defs = _split_roles(specs, context=context)
 
         # 子 Agent：各自展开工具/中间件；Skills 按内容指纹物化（只写不删）
-        # <workspace>/skills/<fingerprint>/<agent_id>/<name>/SKILL.md
+        # <workspace>/skills/<fingerprint>/<agent_id>/<name>/{SKILL.md, 附属文件}
         subagents = [
             await _build_subagent_spec(
                 db,
@@ -573,7 +574,7 @@ async def _compile_from_agents(
 
         # Memory：快照正文优先；live 读项目级文件；按方法论版本物化
         # 磁盘读写 + create_deep_agent 放到线程池，锁内也不堵事件循环
-        catalog_interrupt_on = await _catalog_interrupt_on_from_agents(specs)
+        payload_interrupt_on = await _interrupt_on_from_agent_payloads(specs)
 
         def _materialize_and_create() -> Any:
             resolved_memory = (
@@ -609,7 +610,7 @@ async def _compile_from_agents(
                 supervisor_middleware=supervisor_middleware,
                 supervisor_config=supervisor_config,
                 subagents=final_subagents,
-                catalog_interrupt_on=catalog_interrupt_on,
+                payload_interrupt_on=payload_interrupt_on,
                 supervisor_skills=supervisor_skills,
                 memory_paths=memory_paths,
             )
@@ -757,7 +758,7 @@ async def build_agent_from_methodology(
         owner = owner_user_id
         target_version = version
     else:
-        methodology = await get_methodology_config(
+        methodology = await load_methodology_for_assembly(
             db,
             methodology_id,
             owner_user_id=owner_user_id,
@@ -779,7 +780,7 @@ async def build_agent_from_methodology(
                     return cached
 
             if methodology is None:
-                methodology = await get_methodology_config(
+                methodology = await load_methodology_for_assembly(
                     db,
                     methodology_id,
                     owner_user_id=owner_user_id,

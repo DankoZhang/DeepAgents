@@ -1,4 +1,13 @@
-"""跨模块共享常量。"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@File    :   constants.py
+@Time    :   2026/08/16 18:46:00
+@Author  :   zhangce
+@Desc    :   constants.py
+
+跨模块共享常量。
+"""
 
 from __future__ import annotations
 
