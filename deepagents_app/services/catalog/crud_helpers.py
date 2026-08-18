@@ -9,12 +9,13 @@
 Service 层 CRUD 样板
 ====================
 
-收敛「按 owner 取行」「同名唯一」「创建时解析主键」三类重复逻辑。
+收敛「按 owner 取行」「同名唯一」「创建时解析主键」「副本命名」四类重复逻辑。
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from typing import Any, TypeVar
 
 from sqlalchemy import select
@@ -24,6 +25,10 @@ from deepagents_app.api.errors import BusinessError
 from deepagents_app.ownership import validate_resource_id
 
 T = TypeVar("T")
+
+# 复制时的名称后缀；与 Agent / Skill / Tool 的 String(128) 对齐
+COPY_NAME_SUFFIX = "_new"
+RESOURCE_NAME_MAX_LEN = 128
 
 
 def resolve_resource_id(
@@ -75,3 +80,35 @@ async def ensure_unique_owned_name(
         stmt = stmt.where(model.id != exclude_id)  # type: ignore[attr-defined]
     if (await db.scalars(stmt)).one_or_none() is not None:
         raise BusinessError(message or f"已存在同名{label}：{name}")
+
+
+def format_copy_name(source_name: str, *, index: int = 1) -> str:
+    """``原名_new``；重名时 ``原名_new2`` …，超长则截断原名前缀。"""
+    suffix = COPY_NAME_SUFFIX if index <= 1 else f"{COPY_NAME_SUFFIX}{index}"
+    budget = RESOURCE_NAME_MAX_LEN - len(suffix)
+    if budget < 1:
+        return suffix[:RESOURCE_NAME_MAX_LEN]
+    return f"{(source_name or '')[:budget]}{suffix}"
+
+
+async def next_owned_copy_name(
+    db: AsyncSession,
+    model: type[Any],
+    *,
+    owner_user_id: str,
+    source_name: str,
+    label: str,
+    validate: Callable[[str], None] | None = None,
+) -> str:
+    """在当前用户下生成未被占用的副本名。"""
+    for index in range(1, 1001):
+        candidate = format_copy_name(source_name, index=index)
+        if validate is not None:
+            validate(candidate)
+        stmt = select(model).where(
+            model.owner_user_id == owner_user_id,  # type: ignore[attr-defined]
+            model.name == candidate,  # type: ignore[attr-defined]
+        )
+        if (await db.scalars(stmt)).one_or_none() is None:
+            return candidate
+    raise BusinessError(f"无法为{label}生成副本名称")

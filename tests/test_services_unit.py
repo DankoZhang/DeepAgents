@@ -31,6 +31,26 @@ def test_validate_resource_id_rejects_path_traversal():
     validate_resource_id("ok_agent-1")
 
 
+def test_format_copy_name_suffix_and_truncate():
+    from deepagents_app.services.catalog.crud_helpers import (
+        COPY_NAME_SUFFIX,
+        RESOURCE_NAME_MAX_LEN,
+        format_copy_name,
+    )
+
+    assert format_copy_name("foo") == "foo_new"
+    assert format_copy_name("foo", index=2) == "foo_new2"
+    long_name = "a" * RESOURCE_NAME_MAX_LEN
+    copied = format_copy_name(long_name)
+    assert copied.endswith(COPY_NAME_SUFFIX)
+    assert len(copied) == RESOURCE_NAME_MAX_LEN
+
+    from deepagents_app.services.catalog.skills import _validate_skill_name
+
+    _validate_skill_name("copy-skill_new")
+    _validate_skill_name("copy-skill_new2")
+
+
 async def test_list_methodologies_pagination(db_session):
     from deepagents_app.services.catalog import methodology as methodology_svc
     rows, total, next_cursor = await methodology_svc.list_methodologies(
@@ -95,6 +115,58 @@ async def test_agent_cache_lru_eviction(db_session, monkeypatch, tmp_path):
     assert "u:b:v1" not in af._build_locks
     assert "u:a:v1" in af._cache
     assert "u:c:v1" in af._cache
+    af.invalidate_agent_cache()
+
+
+async def test_cache_hit_misses_when_skill_files_gone(tmp_path):
+    """GC 删掉物化目录后，缓存命中必须当 miss，不能返回悬空编译体。"""
+    import shutil
+
+    from deepagents_app.services.catalog.skills import _COMPLETE_MARKER
+    from deepagents_app.services.runtime import agent_factory as af
+
+    af.invalidate_agent_cache()
+    root = tmp_path / "skills" / "abc123" / "agent1"
+    root.mkdir(parents=True)
+    (root / _COMPLETE_MARKER).write_text("", encoding="utf-8")
+    key = "u:meth:v1"
+    agent = object()
+    af._cache_put(key, agent, skill_roots=[root])
+
+    hit = await af._cache_hit(key)
+    assert hit is agent
+    assert key in af._cache
+
+    shutil.rmtree(root)
+    miss = await af._cache_hit(key)
+    assert miss is None
+    assert key not in af._cache
+    assert key not in af._cache_skill_roots
+    af.invalidate_agent_cache()
+
+
+async def test_cache_hit_missing_skills_does_not_drop_rebuilt_entry(tmp_path, monkeypatch):
+    """盘点期间若已写入新编译体，不得按旧对象身份把新条目删掉。"""
+    from deepagents_app.services.catalog.skills import _COMPLETE_MARKER
+    from deepagents_app.services.runtime import agent_factory as af
+
+    af.invalidate_agent_cache()
+    root = tmp_path / "skills" / "abc123" / "agent1"
+    root.mkdir(parents=True)
+    (root / _COMPLETE_MARKER).write_text("", encoding="utf-8")
+    key = "u:meth:v1"
+    stale = object()
+    rebuilt = object()
+    af._cache_put(key, stale, skill_roots=[root])
+
+    def _touch_and_rebuild(roots):
+        af._cache_put(key, rebuilt, skill_roots=[root])
+        return 0
+
+    monkeypatch.setattr(af, "touch_materialized_skills_complete", _touch_and_rebuild)
+    miss = await af._cache_hit(key)
+    assert miss is None
+    assert af._cache.get(key) is rebuilt
     af.invalidate_agent_cache()
 
 
@@ -726,11 +798,11 @@ async def test_hydrate_missing_blob_raises(db_session):
 
 
 async def test_hydrate_plaintext_only_snapshot_rejected(db_session):
-    """快照须含 content_blob hash；仅明文正文无法重建。"""
+    """快照须含 content_blob hash；明文内嵌无法重建。"""
     from deepagents_app.api.errors import NotFoundError
     from deepagents_app.services.versioning.content_blobs import hydrate_snapshot_content
 
-    with pytest.raises(NotFoundError, match="仅为明文"):
+    with pytest.raises(NotFoundError, match="缺少 content_hash"):
         await hydrate_snapshot_content(
             db_session,
             {

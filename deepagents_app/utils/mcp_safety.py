@@ -53,7 +53,8 @@ def validate_mcp_config(
     """校验并返回规范化后的 MCP config（浅拷贝）。"""
     settings = settings or get_settings()
     out = dict(cfg or {})
-    transport = str(out.get("transport") or "stdio").strip().lower()
+    # 与 McpServerConfig 默认一致；缺字段不回退 stdio（stdio 默认禁用）
+    transport = str(out.get("transport") or "streamable_http").strip().lower()
     out["transport"] = transport
 
     if transport == "stdio":

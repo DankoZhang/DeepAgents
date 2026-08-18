@@ -16,6 +16,7 @@ Tool 注册管理
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from sqlalchemy import select
@@ -27,6 +28,7 @@ from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.services.catalog.crud_helpers import (
     ensure_unique_owned_name,
     get_owned,
+    next_owned_copy_name,
     resolve_resource_id,
 )
 from deepagents_app.services.versioning.revisions import (
@@ -204,6 +206,40 @@ async def create_http_tool(
         status=status,
         tool_id=tool_id,
     )
+
+
+async def copy_tool(
+    db: AsyncSession,
+    tool_id: str,
+    *,
+    owner_user_id: str,
+) -> ToolDefinition:
+    """复制 MCP / HTTP 工具：配置原样拷贝，仅名称加 ``_new``。内置工具不可复制。"""
+    row = await get_tool(db, tool_id, owner_user_id=owner_user_id)
+    if row is None:
+        raise NotFoundError(f"工具不存在：{tool_id}")
+    if row.tool_type == "builtin":
+        raise BusinessError("内置工具不可复制")
+    name = await next_owned_copy_name(
+        db,
+        ToolDefinition,
+        owner_user_id=owner_user_id,
+        source_name=row.name,
+        label="工具",
+    )
+    config = deepcopy(dict(row.config or {}))
+    common = {
+        "owner_user_id": owner_user_id,
+        "name": name,
+        "description": row.description,
+        "requires_hitl": bool(row.requires_hitl),
+        "status": row.status,
+    }
+    if row.tool_type == "mcp":
+        return await create_mcp_tool(db, mcp_config=config, **common)
+    if row.tool_type == "http":
+        return await create_http_tool(db, http_config=config, **common)
+    raise BusinessError(f"不支持复制的 tool_type：{row.tool_type}")
 
 
 async def update_tool(

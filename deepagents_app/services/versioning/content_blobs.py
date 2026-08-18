@@ -153,32 +153,20 @@ def _require_blob_body(
 
 
 def _hydrate_skill_files(raw: Any, bodies: dict[str, str]) -> dict[str, str]:
-    """快照 files 清单 → 相对路径到正文；旧快照无 files 则为空。"""
+    """快照 files：``[{path, content_hash}, ...]`` → ``{相对路径: 正文}``。"""
     if not raw:
         return {}
-    if isinstance(raw, dict):
-        raise NotFoundError(
-            "快照 Skill 附属文件仅为明文、缺少 content_hash；请重新发布方法论"
-        )
     if not isinstance(raw, list):
-        return {}
+        raise NotFoundError("快照 Skill files 须为 [{path, content_hash}, ...] 清单")
     out: dict[str, str] = {}
     for item in raw:
         if not isinstance(item, dict):
             continue
         path = str(item.get("path") or "")
-        if not path:
-            continue
         digest = item.get("content_hash")
-        if digest:
-            out[path] = _require_blob_body(
-                bodies, str(digest), label="Skill file"
-            )
-            continue
-        if item.get("content"):
-            raise NotFoundError(
-                "快照 Skill 附属文件仅为明文、缺少 content_hash；请重新发布方法论"
-            )
+        if not path or not digest:
+            raise NotFoundError("快照 Skill 附属文件缺少 path 或 content_hash")
+        out[path] = _require_blob_body(bodies, str(digest), label="Skill file")
     return out
 
 
@@ -188,42 +176,21 @@ async def hydrate_snapshot_content(
     """
     将快照中的 ``*_hash`` 解析为正文，供组装使用。
 
-    一次 IN 查询批量取回所需 blob，避免 N+1。
-    引用 hash 在库中不存在时抛 ``NotFoundError``（避免空 prompt 静默跑飞）。
+    契约：Memory / system_prompt / Skill 只认 content_blob hash，禁止明文内嵌。
+    一次 IN 查询批量取回所需 blob；hash 缺失或 blob 不存在时抛 ``NotFoundError``。
     """
     if not isinstance(snapshot, dict):
         return {}
     out = dict(snapshot)
+    bodies = await get_content_blobs(db, _collect_hashes_from_snapshot(out))
 
-    needed: set[str] = set()
     mem = out.get("memory")
-    if isinstance(mem, dict) and mem.get("content_hash"):
-        needed.add(str(mem["content_hash"]))
-    for agent in out.get("agents") or []:
-        if not isinstance(agent, dict):
-            continue
-        if agent.get("system_prompt_hash"):
-            needed.add(str(agent["system_prompt_hash"]))
-        for skill in agent.get("skills") or []:
-            if not isinstance(skill, dict):
-                continue
-            if skill.get("content_hash"):
-                needed.add(str(skill["content_hash"]))
-            needed |= _skill_file_hashes(skill)
-
-    bodies = await get_content_blobs(db, needed)
-
     if isinstance(mem, dict):
         mem = dict(mem)
         digest = mem.get("content_hash")
-        if digest:
-            mem["content"] = _require_blob_body(
-                bodies, str(digest), label="Memory"
-            )
-        elif mem.get("content"):
-            raise NotFoundError(
-                "快照 Memory 仅为明文、缺少 content_hash；请重新发布方法论"
-            )
+        if not digest:
+            raise NotFoundError("快照 Memory 缺少 content_hash")
+        mem["content"] = _require_blob_body(bodies, str(digest), label="Memory")
         out["memory"] = mem
 
     agents: list[dict[str, Any]] = []
@@ -232,28 +199,22 @@ async def hydrate_snapshot_content(
             continue
         a = dict(agent)
         digest = a.get("system_prompt_hash")
-        if digest:
-            a["system_prompt"] = _require_blob_body(
-                bodies, str(digest), label="system_prompt"
-            )
-        elif a.get("system_prompt"):
-            raise NotFoundError(
-                "快照 system_prompt 仅为明文、缺少 system_prompt_hash；请重新发布方法论"
-            )
+        if not digest:
+            raise NotFoundError("快照 system_prompt 缺少 system_prompt_hash")
+        a["system_prompt"] = _require_blob_body(
+            bodies, str(digest), label="system_prompt"
+        )
         skills: list[dict[str, Any]] = []
         for skill in a.get("skills") or []:
             if not isinstance(skill, dict):
                 continue
             s = dict(skill)
             skill_digest = s.get("content_hash")
-            if skill_digest:
-                s["content"] = _require_blob_body(
-                    bodies, str(skill_digest), label="Skill"
-                )
-            elif s.get("content"):
-                raise NotFoundError(
-                    "快照 Skill 仅为明文、缺少 content_hash；请重新发布方法论"
-                )
+            if not skill_digest:
+                raise NotFoundError("快照 Skill 缺少 content_hash")
+            s["content"] = _require_blob_body(
+                bodies, str(skill_digest), label="Skill"
+            )
             s["files"] = _hydrate_skill_files(s.get("files"), bodies)
             skills.append(s)
         a["skills"] = skills

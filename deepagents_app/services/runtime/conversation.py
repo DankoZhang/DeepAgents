@@ -9,8 +9,9 @@
 会话服务
 ========
 
-创建 Conversation 时锁定方法论 version；后续聊天始终按该版本重建 Agent，
-不受 live 表后续编辑影响。
+创建 Conversation 时写入 ``methodology_version``。
+后续聊天把该 version 传给 Agent Factory：等于 live.version 时读当前表，
+落后于 live 时才读快照。
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ async def create_conversation(
     """
     创建会话并锁定当前方法论 version。
 
-    后续 chat 一律按 ``methodology_version`` 重建 Agent，与 live 表解耦。
+    钉死创建当下的 ``methodology.version``。若之后未升版，聊天仍走 live 组装。
     """
     methodology = await db.get(Methodology, methodology_id)
     if methodology is None or methodology.owner_user_id != user_id:

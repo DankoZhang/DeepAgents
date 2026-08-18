@@ -36,6 +36,7 @@ from deepagents_app.api.schemas import (
 )
 from deepagents_app.db.session import get_async_db
 from deepagents_app.services.catalog import tools as tools_svc
+
 router = APIRouter(tags=["tools"])
 
 
@@ -116,6 +117,16 @@ async def create_tool(
         requires_hitl=True if body.requires_hitl is None else body.requires_hitl,
         **common,
     )
+
+
+@router.post("/tool/{tool_id}/copy", response_model=ToolOut)
+async def copy_tool(
+    tool_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    """复制 MCP / HTTP 工具；内置工具不可复制。"""
+    return await tools_svc.copy_tool(db, tool_id, owner_user_id=user_id)
 
 
 @router.get("/tool/{tool_id}", response_model=ToolOut)

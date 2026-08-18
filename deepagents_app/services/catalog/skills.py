@@ -39,6 +39,7 @@ from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.services.catalog.crud_helpers import (
     ensure_unique_owned_name,
     get_owned,
+    next_owned_copy_name,
     resolve_resource_id,
 )
 from deepagents_app.services.versioning.revisions import (
@@ -55,7 +56,7 @@ from deepagents_app.workspace import get_workspace_root
 
 logger = logging.getLogger(__name__)
 
-# name 同时用作物化目录名，故限制字符集
+# name 同时用作物化目录名，故限制字符集（总长 ≤ 128，与库字段对齐）
 _SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 _COMPLETE_MARKER = ".complete"
 
@@ -145,6 +146,36 @@ async def create_skill(
     db.add(row)
     await db.flush()
     return row
+
+
+async def copy_skill(
+    db: AsyncSession,
+    skill_id: str,
+    *,
+    owner_user_id: str,
+) -> SkillDefinition:
+    """复制 Skill：content / files / config / status 原样拷贝，仅名称加 ``_new``。"""
+    row = await get_skill(db, skill_id, owner_user_id=owner_user_id)
+    if row is None:
+        raise NotFoundError(f"Skill 不存在：{skill_id}")
+    name = await next_owned_copy_name(
+        db,
+        SkillDefinition,
+        owner_user_id=owner_user_id,
+        source_name=row.name,
+        label="Skill",
+        validate=_validate_skill_name,
+    )
+    return await create_skill(
+        db,
+        owner_user_id=owner_user_id,
+        name=name,
+        description=row.description,
+        content=row.content,
+        config=dict(row.config or {}),
+        status=row.status,
+        files=skill_files_map(row.files),
+    )
 
 
 async def update_skill(
@@ -455,6 +486,10 @@ def touch_materialized_skills_complete(roots: Sequence[Path]) -> int:
     刷新物化目录上的 ``.complete`` mtime，供 GC 判断「近期仍在用」。
 
     Agent LRU 命中时调用，避免长期缓存命中导致目录被误删。
+
+    Returns:
+        成功刷新的标记数。小于 ``len(roots)`` 表示有目录已被删或 touch 失败，
+        调用方应视为缓存 miss 并重新物化。
     """
     touched = 0
     for root in roots:
@@ -499,7 +534,7 @@ def _skills_workspace_root(
 
 
 def _assert_safe_path_segment(segment: str, *, label: str) -> None:
-    """拒绝 ``.`` / ``..`` / 含分隔符的路径段（防御历史脏主键）。"""
+    """拒绝 ``.`` / ``..`` / 含分隔符的路径段，防止物化目录穿越 workspace。"""
     value = segment or ""
     if (
         not value
@@ -515,23 +550,17 @@ def _safe_materialize_root(
     settings: Settings,
     *,
     scope: str,
-    agent_id: str | None = None,
+    agent_id: str,
     workspace_root: Path | None = None,
 ) -> Path:
     """
-    解析物化目录，强制落在 ``<workspace_root>/skills`` 内。
+    解析物化目录，强制落在 ``<workspace_root>/skills/<scope>/<agent_id>``。
 
     ``scope`` 为内容指纹（单段）；任一段含穿越都会被拦截。
     """
-    scope_parts = Path(scope).parts
-    if not scope_parts:
-        raise BusinessError("Skills scope 不能为空")
-    for part in scope_parts:
-        _assert_safe_path_segment(part, label="skills scope")
-    if agent_id is not None:
-        _assert_safe_path_segment(agent_id, label="agent id")
-
-    relative = f"{scope}/{agent_id}" if agent_id else scope
+    _assert_safe_path_segment(scope, label="skills scope")
+    _assert_safe_path_segment(agent_id, label="agent id")
+    relative = f"{scope}/{agent_id}"
     try:
         return resolve_under_root(
             _skills_workspace_root(settings, workspace_root=workspace_root),
@@ -708,5 +737,6 @@ def _validate_skill_name(name: str) -> None:
     """校验 Skill name：既是展示名，也是物化目录名。"""
     if not _SKILL_NAME_RE.match(name):
         raise BusinessError(
-            "Skill name 须为字母/数字开头，仅含字母数字、连字符、下划线（亦作物化目录名）"
+            "Skill name 须为字母/数字开头，仅含字母数字、连字符、下划线"
+            "（最长 128，亦作物化目录名）"
         )

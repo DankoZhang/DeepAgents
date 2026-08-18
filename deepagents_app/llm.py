@@ -97,7 +97,7 @@ def build_chat_model(
         url = base_url if base_url is not None else settings.openai_base_url
         if not url:
             raise BusinessError("openai_compatible 模式必须设置 base_url / OPENAI_BASE_URL")
-        # Settings 路径允许 EMPTY（如本地无 key 的占位）；目录路径已在 _resolve_api_key 拒绝空密钥
+        # 仅 Settings/.env 路径允许占位 EMPTY；目录模型缺密钥已在 _resolve_api_key 拒绝
         kwargs["api_key"] = key or "EMPTY"
         kwargs["base_url"] = url
         logger.info(

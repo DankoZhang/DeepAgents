@@ -13,8 +13,7 @@
 - 草稿态改 Agent 勾选 / 被引用 Agent 变更 → 不升版、不写快照（draft 无人读快照）
 - 已发布方法论的配置变更 → 升版并写新快照，并按保留策略裁剪历史
 - 仅改名称/描述 → 不升版
-- 创建草稿时不写快照；发布时钉死当前 version 快照
-- 发布时钉死当前 version 快照（不额外升版）
+- 创建草稿时不写快照；发布时钉死当前 version（不额外升版）
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ from deepagents_app.db.loading import load_methodology_with_agents
 from deepagents_app.db.models import AgentDefinition, Conversation, Methodology
 from deepagents_app.ownership import validate_resource_id
 from deepagents_app.db.pagination import DEFAULT_LIMIT, coerce_datetime, page_rows
+from deepagents_app.services.catalog.agents import agent_is_enabled, agent_role
 from deepagents_app.services.catalog.crud_helpers import ensure_unique_owned_name
 from deepagents_app.services.versioning.revisions import (
     bump_methodology,
@@ -188,9 +188,9 @@ async def bind_methodology_agents(
     """
     方法论勾选 / 替换全局 Agent 列表。
 
-    ``bump_version=True``（默认）：视为配置变更 →
-    draft 覆盖当前快照；published 升版 + 快照 + 失效缓存。
-    ``bump_version=False``：仅改关联，留给调用方自行 snapshot（如创建流程）。
+    ``bump_version=True``（默认）：走 ``bump_methodology``——
+    draft 不升版、不写快照；published 升版 + 新快照 + 失效缓存。
+    ``bump_version=False``：只改关联（如创建草稿时勾选 Agent）。
     """
     methodology = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if methodology is None:
@@ -232,12 +232,13 @@ async def publish_methodology(
     row = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"方法论不存在：{methodology_id}")
+    # 与组装共用 agent_role / agent_is_enabled，未写 enabled 视为未启用
     require_single_supervisor(
         list(row.agents),
         context="发布失败",
-        role_of=lambda a: str((a.config or {}).get("role") or "subagent").lower(),
+        role_of=agent_role,
         name_of=lambda a: a.name,
-        enabled_of=lambda a: bool((a.config or {}).get("enabled", True)),
+        enabled_of=agent_is_enabled,
     )
     row.status = "published"
     row.updated_time = datetime.now(timezone.utc)

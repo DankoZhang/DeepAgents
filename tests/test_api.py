@@ -268,6 +268,103 @@ def test_skill_crud_and_agent_bind(client):
     assert any(s["id"] == skill["id"] for s in listed.json())
 
 
+def test_copy_agent_skill_and_tools(client, demo_ids):
+    """复制 Agent / Skill / MCP / HTTP：除名称加 _new 外内容一致。"""
+    skill = client.post(
+        "/api/skill",
+        json={
+            "name": "copy-skill",
+            "description": "skill-desc",
+            "content": "---\nname: copy-skill\ndescription: skill-desc\n---\nkeep-me\n",
+            "status": "active",
+        },
+    ).json()
+    mcp = client.post(
+        "/api/tool",
+        json={
+            "name": "copy-mcp",
+            "description": "mcp-desc",
+            "mcp": {"transport": "stdio", "command": "npx", "args": ["-y", "demo"]},
+            "requires_hitl": True,
+        },
+    ).json()
+    http = client.post(
+        "/api/tool",
+        json={
+            "name": "copy-http",
+            "description": "http-desc",
+            "tool_type": "http",
+            "http": {
+                "method": "GET",
+                "url": "http://127.0.0.1:9/weather/{city}",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        },
+    ).json()
+    agent = client.post(
+        "/api/agent",
+        json={
+            "name": "copy-agent",
+            "system_prompt": "prompt-keep",
+            "config": {
+                "role": "subagent",
+                "description": "desc-keep",
+                "enabled": True,
+            },
+            "tool_ids": [mcp["id"], http["id"]],
+            "skill_ids": [skill["id"]],
+        },
+    ).json()
+
+    copied_agent = client.post(f"/api/agent/{agent['id']}/copy")
+    assert copied_agent.status_code == 200, copied_agent.text
+    body = copied_agent.json()
+    assert body["id"] != agent["id"]
+    assert body["name"] == "copy-agent_new"
+    assert body["system_prompt"] == "prompt-keep"
+    assert body["model_id"] == agent["model_id"]
+    assert body["enabled"] is False
+    assert body["methodology_id"] is None
+    assert body["config"].get("role") == "subagent"
+    assert body["config"].get("description") == "desc-keep"
+    assert {t["id"] for t in body["tools"]} == {mcp["id"], http["id"]}
+    assert {s["id"] for s in body["skills"]} == {skill["id"]}
+
+    again = client.post(f"/api/agent/{agent['id']}/copy")
+    assert again.status_code == 200
+    assert again.json()["name"] == "copy-agent_new2"
+
+    copied_skill = client.post(f"/api/skill/{skill['id']}/copy")
+    assert copied_skill.status_code == 200, copied_skill.text
+    sk = copied_skill.json()
+    assert sk["id"] != skill["id"]
+    assert sk["name"] == "copy-skill_new"
+    assert sk["description"] == skill["description"]
+    assert sk["content"] == skill["content"]
+    assert sk["files"] == skill["files"]
+    assert sk["status"] == skill["status"]
+
+    copied_mcp = client.post(f"/api/tool/{mcp['id']}/copy")
+    assert copied_mcp.status_code == 200, copied_mcp.text
+    assert copied_mcp.json()["name"] == "copy-mcp_new"
+    assert copied_mcp.json()["tool_type"] == "mcp"
+    assert copied_mcp.json()["config"] == mcp["config"]
+    assert copied_mcp.json()["requires_hitl"] is True
+
+    copied_http = client.post(f"/api/tool/{http['id']}/copy")
+    assert copied_http.status_code == 200, copied_http.text
+    assert copied_http.json()["name"] == "copy-http_new"
+    assert copied_http.json()["tool_type"] == "http"
+    assert copied_http.json()["config"] == http["config"]
+
+    builtin = client.post(f"/api/tool/{demo_ids['tool_search_knowledge']}/copy")
+    assert builtin.status_code == 400
+
+
 def test_mcp_tool_create_and_guardrails(client, demo_ids):
     created = client.post(
         "/api/tool",
@@ -834,7 +931,9 @@ def test_skills_materialize_rejects_escaped_scope(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "get_settings", lambda: settings)
 
     with pytest.raises(BusinessError):
-        _safe_materialize_root(settings, scope="../../../../outside")
+        _safe_materialize_root(
+            settings, scope="../../../../outside", agent_id="agent_ok"
+        )
     with pytest.raises(BusinessError):
         materialize_agent_skills(settings, "../../PWNAGENT", [])
     with pytest.raises(BusinessError):

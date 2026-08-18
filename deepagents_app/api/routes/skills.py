@@ -92,6 +92,16 @@ async def create_skill(
     )
 
 
+@router.post("/skill/{skill_id}/copy", response_model=SkillOut)
+async def copy_skill(
+    skill_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    """复制 Skill：content / files 一并拷贝，仅名称加 ``_new``。"""
+    return await skills_svc.copy_skill(db, skill_id, owner_user_id=user_id)
+
+
 @router.post("/skill/upload", response_model=SkillOut)
 async def upload_skill(
     file: UploadFile = File(..., description="技能目录 zip（含 SKILL.md）"),

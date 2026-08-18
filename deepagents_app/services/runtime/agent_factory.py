@@ -23,12 +23,14 @@ Agent Factory（方法论驱动）
 缓存：
   - key = user_scope + methodology_id + version
   - 有上限 LRU；淘汰 / 失效时清理构建锁
-  - Skills 按内容指纹物化（只写不删），与缓存生命周期解耦
+  - Skills 按内容指纹物化（只写不删），与缓存淘汰解耦
+  - 命中时 touch ``.complete``；目录已被 GC 清掉则当 miss 并重建
   - 进程内 LRU；失效经 Redis pub/sub 广播到其他 worker
 
 版本：
-  - 旧会话按 Conversation.methodology_version 从快照重建
-  - 与 live.version 一致时直接读当前表
+  - 会话带 ``Conversation.methodology_version``
+  - 该 version **等于** live.version → 读当前表组装（未升版的目录改动会立刻生效）
+  - 该 version **落后于** live → 从 ``MethodologyRevision`` 快照重建
   - live / snapshot 先归一成同形 dict，再走 ``_compile_from_agents``
 """
 
@@ -62,6 +64,7 @@ from deepagents_app.registries.tools import (
     interrupt_tool_names_from_payloads,
     load_tools_from_payloads,
 )
+from deepagents_app.services.catalog.agents import agent_is_enabled, agent_role
 from deepagents_app.services.catalog.llm_models import resolve_model_spec_for_agent
 from deepagents_app.services.versioning.memory import (
     materialize_versioned_memory,
@@ -163,13 +166,31 @@ async def _cache_hit(key: str) -> Any | None:
     命中缓存则返回编译体，并刷新关联 Skills ``.complete`` mtime。
 
     长期 LRU 命中若不 touch，GC 会按过期 mtime 删掉仍在用的物化目录。
+    若记录的物化目录已无 ``.complete``（已被 GC 删掉），视为 miss：丢掉
+    本条缓存，让调用方重新组装并物化。丢弃时用对象身份比对，避免盘点
+    期间已重建的新条目被误删。
     """
     cached = _cache_get(key)
     if cached is None:
         return None
     roots = _cache_skill_roots_for(key)
     if roots:
-        await asyncio.to_thread(touch_materialized_skills_complete, roots)
+        touched = await asyncio.to_thread(touch_materialized_skills_complete, roots)
+        if touched != len(roots):
+            dropped = False
+            with _cache_lock:
+                if _cache.get(key) is cached:
+                    del _cache[key]
+                    _cache_skill_roots.pop(key, None)
+                    dropped = True
+            logger.warning(
+                "Agent 缓存 miss（Skills 物化目录缺失）：%s touched=%s/%s dropped=%s",
+                key,
+                touched,
+                len(roots),
+                dropped,
+            )
+            return None
     logger.info("命中 Agent 缓存：%s", key)
     return cached
 
@@ -297,23 +318,6 @@ def _normalize_agent_spec(agent: AgentDefinition | dict[str, Any]) -> dict[str, 
     if isinstance(agent, dict):
         return agent
     return serialize_agent_for_live(agent)
-
-
-def _agent_role(agent: dict[str, Any]) -> str:
-    """从 config.role 读取角色；缺省视为 subagent。"""
-    cfg = agent.get("config") or {}
-    return str(cfg.get("role", "subagent")).lower()
-
-
-def _agent_enabled(agent: dict[str, Any]) -> bool:
-    """
-    组装时是否纳入该 Agent。
-
-    缺省 True：旧快照没有 ``enabled`` 字段时仍参与编译。
-    目录编辑锁相反，未写视为未启用，见 ``agents.agent_is_enabled``。
-    """
-    cfg = agent.get("config") or {}
-    return bool(cfg.get("enabled", True))
 
 
 # ── 运行时绑定：模型 / 工具 / 中间件 / Skill ──────────────────────────
@@ -498,9 +502,9 @@ def _split_roles(
     return require_single_supervisor(
         agents,
         context=context,
-        role_of=_agent_role,
+        role_of=agent_role,
         name_of=lambda a: str(a.get("name") or a.get("id") or "?"),
-        enabled_of=_agent_enabled,
+        enabled_of=agent_is_enabled,
     )
 
 
@@ -577,11 +581,11 @@ async def _compile_from_agents(
         )
         supervisor_skills = [skills_path] if skills_path else None
 
-        # Memory：快照正文优先；live 读项目级文件；按方法论版本物化
-        # 磁盘读写 + create_deep_agent 放到线程池，锁内也不堵事件循环
+        # 汇总各 Agent 绑定工具的 requires_hitl 运行时名，稍后并入 interrupt_on
         payload_interrupt_on = await _interrupt_on_from_agent_payloads(specs)
 
         def _materialize_and_create() -> Any:
+            # 传入的 memory_content：快照正文；未传则读项目级 AGENTS.md
             resolved_memory = (
                 memory_content
                 if memory_content is not None
@@ -621,6 +625,7 @@ async def _compile_from_agents(
             )
             return create_deep_agent(**kwargs), memory_virtual
 
+        # 磁盘读写 + create_deep_agent 放到线程池，避免卡住事件循环
         agent, memory_virtual = await asyncio.to_thread(_materialize_and_create)
         skill_virtuals: list[str] = []
         if skills_path:
@@ -709,7 +714,11 @@ async def _build_and_cache(
     key: str,
     use_cache: bool,
 ) -> Any:
-    """按 live / snapshot 组装；成功后统一写入 LRU 缓存。"""
+    """按 live / snapshot 组装；成功后统一写入 LRU 缓存。
+
+    会话钉死的 version 若仍等于 live.version，走当前表（含尚未升版的目录改动）。
+    落后于 live 才读 ``MethodologyRevision``。这是组装入口的版本分叉，不是快照等价。
+    """
     if version == methodology.version:
         agent, skill_roots = await _build_from_live(db, methodology, settings)
     else:
@@ -745,6 +754,7 @@ async def build_agent_from_methodology(
     - ``version is None`` 或等于 live.version → 读当前表组装
     - ``version`` 落后于 live → 从 ``MethodologyRevision`` 快照重建（旧会话）
     - 同 key 命中进程缓存则直接返回，避免重复 ``create_deep_agent`` / 重复物化 Skills
+    - 命中时若关联 Skills 目录已被 GC 清掉，视为 miss，走重新组装
     - 聊天路径通常同时传入 ``owner_user_id`` + ``version``：先查缓存，命中则不做
       方法论全量 eager-load
 

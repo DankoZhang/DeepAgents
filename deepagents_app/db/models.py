@@ -202,7 +202,7 @@ class SkillDefinition(Base):
     """
     Skill 目录：SKILL.md 存 content，附属文件存 files（相对路径 → 正文）。
 
-    ``name`` 同时作为物化子目录名（须为安全 slug）。
+    ``name`` 同时作为物化子目录名（须为安全 slug，最长 128）。
     方法论快照不内嵌正文，只存 content_blob.hash 引用。
     """
 

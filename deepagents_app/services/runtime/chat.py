@@ -124,7 +124,8 @@ async def prepare_chat(
     """
     短事务加载会话并组装 Agent，返回后 Session 已关闭。
 
-    供 SSE / resume 共用：LLM 执行阶段释放连接池。
+    供 SSE / resume 共用：LLM 执行阶段不再占用连接池与未提交事务。
+    组装可能登记了缓存失效，须在 close 前 commit 并 flush。
     """
     settings = settings or get_settings()
     db = get_async_session_factory()()
@@ -205,17 +206,10 @@ async def _aiter_stream_events(
     """
     流式事件：(event, data)。
 
-    TypeError 仅在创建 astream 迭代器时兜底到 ainvoke，避免半途重跑重复计费。
+    使用 ``stream_mode="messages"``。迭代中途 TypeError 不再改走 ainvoke，
+    避免半段 token 后再完整跑一遍导致重复计费。
     """
-    try:
-        stream = agent.astream(payload, config=config, stream_mode="messages")
-    except TypeError:
-        result = await agent.ainvoke(payload, config=config)
-        text = extract_final_text(result if isinstance(result, dict) else {})
-        if text:
-            yield "token", {"text": text}
-        return
-
+    stream = agent.astream(payload, config=config, stream_mode="messages")
     yielded_token = False
     try:
         async for item in stream:

@@ -132,7 +132,7 @@ async def snapshot_methodology(
         )
     ).one_or_none()
     if existing is not None:
-        # 同 version 覆盖：例如发布时再钉一次，避免多插一行
+        # 同 version 覆盖：publish 再钉一次当前版，避免重复插入
         existing.snapshot = payload
         existing.created_time = datetime.now(timezone.utc)
         await db.flush()

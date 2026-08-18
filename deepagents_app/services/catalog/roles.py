@@ -28,18 +28,15 @@ def require_single_supervisor(
     context: str,
     role_of: Callable[[T], str],
     name_of: Callable[[T], str],
-    enabled_of: Callable[[T], bool] | None = None,
+    enabled_of: Callable[[T], bool],
 ) -> tuple[T, list[T]]:
     """
     从 enabled Agent 中拆出唯一 Supervisor 与其余 SubAgent。
 
-    ``role_of`` 应返回小写角色名（``supervisor`` / ``subagent`` 等）。
-    ``enabled_of`` 若提供，先过滤再校验（发布 / 组装必须传入，口径一致）。
-    未传 ``enabled_of`` 时不过滤，仅校验角色唯一性。
+    发布与组装必须传入同一套 ``role_of`` / ``enabled_of``，避免门禁分叉。
+    ``role_of`` 返回小写角色名（``supervisor`` / ``subagent``）。
     """
-    pool: Sequence[T] = (
-        [a for a in agents if enabled_of(a)] if enabled_of is not None else agents
-    )
+    pool = [a for a in agents if enabled_of(a)]
     supervisors = [a for a in pool if role_of(a) == "supervisor"]
     others = [a for a in pool if role_of(a) != "supervisor"]
     if not supervisors:

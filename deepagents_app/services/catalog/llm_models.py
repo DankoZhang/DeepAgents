@@ -461,6 +461,7 @@ async def resolve_model_spec_for_agent(
     优先级：快照 llm（密钥一律按 model_id 从 live 回填）> model_id 目录；
     凡能解析到目录 ``model_id`` 的，一律读 live，要求 ``status=active``
     且已配置 API Key（禁止因内嵌 llm / 缺密钥而串用进程级默认密钥）。
+    因此禁用或改密 live 模型会立刻影响仍锁定该 model_id 的旧会话。
     皆无则返回 None（上层回退 Settings/.env，仅未绑定目录模型时）。
     """
     mid: str | None = None

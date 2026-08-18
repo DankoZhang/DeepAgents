@@ -50,7 +50,7 @@ def resolve_class_path(class_path: str) -> Any:
 
 
 def _mcp_connection_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    transport = str(cfg.get("transport") or "stdio")
+    transport = str(cfg.get("transport") or "streamable_http")
     conn: dict[str, Any] = {"transport": transport}
     if transport == "stdio":
         conn["command"] = cfg["command"]
@@ -185,12 +185,7 @@ def load_builtin_tool(tool_def: ToolDefinition) -> Any:
         raise ValueError(f"工具已禁用：{tool_def.name}")
     if not tool_def.class_path:
         raise ValueError(f"内置工具缺少 class_path：{tool_def.name}")
-    obj = resolve_class_path(tool_def.class_path)
-    if callable(obj) and not hasattr(obj, "name") and not hasattr(obj, "invoke"):
-        cfg = tool_def.config or {}
-        if cfg.get("instantiate"):
-            return obj(**{k: v for k, v in cfg.items() if k != "instantiate"})
-    return obj
+    return resolve_class_path(tool_def.class_path)
 
 
 async def expand_tool_definition(tool_def: ToolDefinition) -> list[Any]:

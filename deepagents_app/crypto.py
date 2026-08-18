@@ -10,7 +10,7 @@
 ==========
 
 模型目录中的 ``api_key`` 落库前加密；运行时再解密。
-密文前缀 ``enc:v1:``；无此前缀的历史明文一律拒绝解密。
+密文前缀 ``enc:v1:``；无此前缀的明文一律拒绝解密。
 
 生产必须设置 ``SECRETS_ENCRYPTION_KEY``（Fernet url-safe base64 密钥）。
 轮转时可把旧密钥放进 ``SECRETS_ENCRYPTION_PREVIOUS_KEYS``（逗号分隔），

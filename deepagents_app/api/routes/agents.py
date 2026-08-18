@@ -94,6 +94,16 @@ async def create_agent(
     )
 
 
+@router.post("/agent/{agent_id}/copy", response_model=AgentOut)
+async def copy_agent(
+    agent_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    """复制 Agent：除名称加 ``_new`` 外配置与绑定保持一致；副本为未启用。"""
+    return await agents_svc.copy_agent(db, agent_id, owner_user_id=user_id)
+
+
 @router.patch("/agent/{agent_id}", response_model=AgentOut)
 async def update_agent(
     agent_id: str,

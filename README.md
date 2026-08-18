@@ -116,7 +116,7 @@ OPENAI_API_KEY=sk-...
 
 ## Schema 迁移
 
-单一基线迁移在 `migrations/versions/`。变更请用 Alembic（`alembic.ini` → `migrations/`；勿在仓库根再建 `alembic/` 目录，会遮蔽 PyPI 包）：
+迁移文件在 `migrations/versions/`。变更请用 Alembic（`alembic.ini` → `migrations/`；勿在仓库根再建 `alembic/` 目录，会遮蔽 PyPI 包）：
 
 ```bash
 alembic revision --autogenerate -m "your change"
@@ -243,7 +243,7 @@ python -m deepagents_app.services.infra.gc blobs
 DeepAgents/
 ├── server.py               # 入口（uvicorn / gunicorn + UvicornWorker）
 ├── alembic.ini
-├── migrations/             # Schema 迁移（单一 initial 基线）
+├── migrations/             # Schema 迁移
 ├── docker-compose.yml      # PostgreSQL + Redis Stack（named volume）
 ├── Dockerfile              # 默认 gunicorn 多 worker；依赖以 uv.lock 为准
 ├── pyproject.toml / uv.lock

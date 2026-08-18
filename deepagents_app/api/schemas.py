@@ -13,15 +13,11 @@
 ``model_config = {"from_attributes": True}`` 表示可从 SQLAlchemy 模型属性直接构造。
 """
 
-# 推迟注解求值，允许前向引用
 from __future__ import annotations
 
-# datetime：会话/方法论时间戳字段类型
 from datetime import datetime
-# Any：JSON 扩展字段；Literal：限制枚举取值
 from typing import Any, Literal
 
-# BaseModel：schema 基类；Field：默认值/工厂；model_validator：跨字段校验
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 from deepagents_app.constants import ModelProvider
@@ -172,7 +168,7 @@ class ModelTestResult(BaseModel):
 class AgentCreate(BaseModel):
     """POST /api/agent 请求体：创建全局 Agent。"""
 
-    name: str  # 全局唯一名称
+    name: str  # 当前用户内唯一名称
     system_prompt: str = ""  # 系统提示词
     model_id: str | None = None  # 绑定模型目录；缺省用当前用户 is_default 模型
     # 扩展字段：role(supervisor|subagent) / description / enabled /
@@ -307,10 +303,9 @@ class McpServerConfig(BaseModel):
     运行时由 langchain-mcp-adapters 按这些字段连接 Server，并拉取其工具列表。
     """
 
-    # 传输协议：决定后面用 command 还是 url
+    # transport：stdio / sse / streamable_http（API 默认 streamable_http）
     # - stdio：本机拉起子进程（默认禁用，需 MCP_STDIO_ENABLED + 命令白名单）
-    # - sse：HTTP Server-Sent Events（旧式远程 MCP）
-    # - streamable_http：HTTP 流式传输（较新的远程 MCP）
+    # - sse / streamable_http：远程 MCP HTTP 端点
     transport: Literal["stdio", "sse", "streamable_http"] = "streamable_http"
     # stdio 必填：可执行文件，如 npx / uvx / python
     command: str | None = None
@@ -382,7 +377,7 @@ class HttpToolConfig(BaseModel):
 class ToolCreate(BaseModel):
     """POST /api/tool：创建 MCP 或 HTTP 工具（内置工具由种子写入）。"""
 
-    name: str  # 全局唯一名；http 时亦为运行时 LangChain tool.name
+    name: str  # 当前用户内唯一名；http 时亦为运行时 LangChain tool.name
     description: str = ""
     tool_type: Literal["mcp", "http"] | None = None  # 缺省时按 mcp/http 块推断
     mcp: McpServerConfig | None = None  # tool_type=mcp 时必填
@@ -498,7 +493,7 @@ class MiddlewareOut(BaseModel):
 class SkillCreate(BaseModel):
     """POST /api/skill：新建 Skill（content 为完整 SKILL.md 或纯正文）。"""
 
-    name: str  # 全局唯一；亦作物化子目录名
+    name: str  # 当前用户内唯一；亦作物化子目录名
     description: str = ""
     content: str  # 完整 SKILL.md 或正文（无 frontmatter 时服务端自动包装）
     config: dict[str, Any] = Field(default_factory=dict)

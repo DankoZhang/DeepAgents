@@ -18,6 +18,7 @@ Agent 本身不隶属单一方法论；方法论通过勾选引用。
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import Any
 
 from sqlalchemy import select
@@ -38,6 +39,7 @@ from deepagents_app.services.catalog.llm_models import get_default_model
 from deepagents_app.db.pagination import DEFAULT_LIMIT, page_rows
 from deepagents_app.services.catalog.crud_helpers import (
     ensure_unique_owned_name,
+    next_owned_copy_name,
     resolve_resource_id,
 )
 from deepagents_app.services.versioning.revisions import (
@@ -109,11 +111,9 @@ def agent_role(agent: AgentDefinition | dict[str, Any]) -> str:
 
 
 def agent_is_enabled(agent: AgentDefinition | dict[str, Any]) -> bool:
-    """
-    目录态是否已启用：锁定编辑，且主 Agent 对应方法论应为 published。
+    """是否已启用：锁定编辑，且主 Agent 对应方法论应为 published。
 
-    未写 ``enabled`` 视为未启用（新产品默认）。组装旧快照时缺省 True，
-    见 ``agent_factory._agent_enabled``，口径不同。
+    未写 ``enabled`` 视为未启用。发布与组装共用本函数，缺字段不得参与编译。
     """
     cfg = agent.config if isinstance(agent, AgentDefinition) else agent.get("config")
     return bool((cfg or {}).get("enabled"))
@@ -228,6 +228,44 @@ async def create_agent(
     if bump_related:
         await bump_methodologies_using_resource(db, kind="agent", resource_id=row.id)
     return await get_agent(db, row.id, owner_user_id=owner_user_id)  # type: ignore[return-value]
+
+
+async def copy_agent(
+    db: AsyncSession,
+    agent_id: str,
+    *,
+    owner_user_id: str,
+) -> AgentDefinition:
+    """
+    复制 Agent：配置 / Prompt / 模型 / 绑定原样拷贝，仅名称加 ``_new``。
+
+    副本始终未启用，并去掉 ``methodology_id``，避免和源主 Agent 抢同一方法论。
+    """
+    source = await get_agent(db, agent_id, owner_user_id=owner_user_id)
+    if source is None:
+        raise NotFoundError(f"Agent 不存在：{agent_id}")
+    name = await next_owned_copy_name(
+        db,
+        AgentDefinition,
+        owner_user_id=owner_user_id,
+        source_name=source.name,
+        label="Agent",
+    )
+    cfg = deepcopy(dict(source.config or {}))
+    cfg["enabled"] = False
+    cfg.pop("methodology_id", None)
+    return await create_agent(
+        db,
+        owner_user_id=owner_user_id,
+        name=name,
+        system_prompt=source.system_prompt,
+        model_id=source.model_id,
+        config=cfg,
+        tool_ids=[t.id for t in source.tools],
+        middleware_ids=[m.id for m in source.middlewares],
+        skill_ids=[s.id for s in source.skills],
+        bump_related=False,
+    )
 
 
 async def update_agent(

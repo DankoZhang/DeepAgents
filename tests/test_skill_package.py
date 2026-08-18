@@ -143,6 +143,12 @@ def test_skill_upload_patch_keeps_files(client):
     assert skill["name"] == "pkg-skill"
     assert skill["files"]["scripts/run.py"] == "print(1)\n"
 
+    copied = client.post(f"/api/skill/{skill['id']}/copy")
+    assert copied.status_code == 200, copied.text
+    assert copied.json()["name"] == "pkg-skill_new"
+    assert copied.json()["content"] == skill["content"]
+    assert copied.json()["files"] == skill["files"]
+
     patched = client.patch(
         f"/api/skill/{skill['id']}",
         json={"content": _skill_md(body="# updated\n")},
