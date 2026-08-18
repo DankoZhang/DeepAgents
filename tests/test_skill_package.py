@@ -200,7 +200,7 @@ def test_skill_upload_snapshot_locks_files(client):
         json={
             "name": "pkg-supervisor",
             "system_prompt": "supervisor",
-            "config": {"role": "supervisor"},
+            "config": {"role": "supervisor", "enabled": True},
             "skill_ids": [skill["id"]],
         },
     ).json()

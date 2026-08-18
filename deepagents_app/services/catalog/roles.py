@@ -35,6 +35,7 @@ def require_single_supervisor(
 
     ``role_of`` 应返回小写角色名（``supervisor`` / ``subagent`` 等）。
     ``enabled_of`` 若提供，先过滤再校验（发布 / 组装必须传入，口径一致）。
+    未传 ``enabled_of`` 时不过滤，仅校验角色唯一性。
     """
     pool: Sequence[T] = (
         [a for a in agents if enabled_of(a)] if enabled_of is not None else agents

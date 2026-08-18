@@ -561,7 +561,7 @@ async def test_publish_rejects_multiple_supervisors(db_session):
         owner_user_id=TEST_USER,
         name="sup-a",
         system_prompt="a",
-        config={"role": "supervisor"},
+        config={"role": "supervisor", "enabled": True},
         bump_related=False,
     )
     a2 = await agents_svc.create_agent(
@@ -569,7 +569,7 @@ async def test_publish_rejects_multiple_supervisors(db_session):
         owner_user_id=TEST_USER,
         name="sup-b",
         system_prompt="b",
-        config={"role": "supervisor"},
+        config={"role": "supervisor", "enabled": True},
         bump_related=False,
     )
     meth = await methodology_svc.create_methodology(

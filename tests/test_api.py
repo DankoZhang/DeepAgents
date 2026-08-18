@@ -65,11 +65,15 @@ def test_seeded_demo_methodology(client, demo_ids):
     assert detail.status_code == 200
     body = detail.json()
     assert body["status"] == "published"
+    assert body["name"] == "supervisor"
     names = {a["name"] for a in body["agents"]}
     assert names == {
         "supervisor",
         "qa-expert",
     }
+    assert all(a.get("enabled") is True for a in body["agents"])
+    supervisor = next(a for a in body["agents"] if a["name"] == "supervisor")
+    assert supervisor.get("methodology_id") == demo_ids["methodology"]
     assert all(a.get("model_id") == demo_ids["model"] for a in body["agents"])
     assert all(
         a.get("llm_model") and a["llm_model"]["id"] == demo_ids["model"]
@@ -473,23 +477,23 @@ def test_agent_bind_tools(client, demo_ids):
 def test_methodology_publish_and_version_lock(client):
     client.post(
         "/api/methodology",
-        json={"name": "版本锁定", "id": "version_lock"},
+        json={"name": "vl-supervisor", "id": "version_lock"},
     )
     agent = client.post(
         "/api/agent",
         json={
             "name": "vl-supervisor",
             "system_prompt": "supervisor",
-            "config": {"role": "supervisor"},
+            "config": {"role": "supervisor", "methodology_id": "version_lock"},
         },
     ).json()
     client.post(
         "/api/methodology/version_lock/agents",
         json={"agent_ids": [agent["id"]], "replace": True},
     )
-    published = client.post("/api/methodology/version_lock/publish")
-    assert published.status_code == 200
-    v1 = published.json()["version"]
+    enabled = client.post(f"/api/agent/{agent['id']}/enable")
+    assert enabled.status_code == 200, enabled.text
+    v1 = client.get("/api/methodology/version_lock").json()["version"]
 
     conv = client.post(
         "/api/conversation",
@@ -497,10 +501,15 @@ def test_methodology_publish_and_version_lock(client):
     ).json()
     assert conv["methodology_version"] == v1
 
-    client.patch(
+    disabled = client.post(f"/api/agent/{agent['id']}/disable")
+    assert disabled.status_code == 200
+    patched = client.patch(
         f"/api/agent/{agent['id']}",
         json={"system_prompt": "supervisor v2"},
     )
+    assert patched.status_code == 200
+    reenabled = client.post(f"/api/agent/{agent['id']}/enable")
+    assert reenabled.status_code == 200
     meta = client.get("/api/methodology/version_lock").json()
     assert meta["version"] > v1
     # 旧会话仍锁定 v1
@@ -512,17 +521,17 @@ def test_methodology_publish_and_version_lock(client):
 
 
 def test_draft_agent_edit_does_not_bump_version(client):
-    """草稿方法论：被引用 Agent 变更只覆盖快照，不升版。"""
+    """草稿（未启用）时改 Agent 不升版；停用后编辑再启用才升版。"""
     client.post(
         "/api/methodology",
-        json={"name": "草稿累积", "id": "draft_accum"},
+        json={"name": "da-supervisor", "id": "draft_accum"},
     )
     agent = client.post(
         "/api/agent",
         json={
             "name": "da-supervisor",
             "system_prompt": "v1",
-            "config": {"role": "supervisor"},
+            "config": {"role": "supervisor", "methodology_id": "draft_accum"},
         },
     ).json()
     client.post(
@@ -540,14 +549,20 @@ def test_draft_agent_edit_does_not_bump_version(client):
     after = client.get("/api/methodology/draft_accum").json()
     assert after["version"] == v0
 
-    # 发布后同样变更应升版
-    published = client.post("/api/methodology/draft_accum/publish").json()
+    enabled = client.post(f"/api/agent/{agent['id']}/enable")
+    assert enabled.status_code == 200, enabled.text
+    published = client.get("/api/methodology/draft_accum").json()
     assert published["status"] == "published"
     assert published["version"] == v0
-    client.patch(
+
+    client.post(f"/api/agent/{agent['id']}/disable")
+    patched = client.patch(
         f"/api/agent/{agent['id']}",
         json={"system_prompt": "v3-published"},
     )
+    assert patched.status_code == 200
+    reenabled = client.post(f"/api/agent/{agent['id']}/enable")
+    assert reenabled.status_code == 200
     bumped = client.get("/api/methodology/draft_accum").json()
     assert bumped["version"] > v0
 
@@ -583,20 +598,21 @@ def test_revision_prune_keeps_referenced_versions(client, monkeypatch):
     monkeypatch.setenv("METHODOLOGY_REVISION_KEEP", "1")
     config.get_settings.cache_clear()
 
-    client.post("/api/methodology", json={"name": "裁剪", "id": "prune_meth"})
+    client.post("/api/methodology", json={"name": "prune-sup", "id": "prune_meth"})
     agent = client.post(
         "/api/agent",
         json={
             "name": "prune-sup",
             "system_prompt": "s0",
-            "config": {"role": "supervisor"},
+            "config": {"role": "supervisor", "methodology_id": "prune_meth"},
         },
     ).json()
     client.post(
         "/api/methodology/prune_meth/agents",
         json={"agent_ids": [agent["id"]], "replace": True},
     )
-    client.post("/api/methodology/prune_meth/publish")
+    enabled = client.post(f"/api/agent/{agent['id']}/enable")
+    assert enabled.status_code == 200, enabled.text
     v_pub = client.get("/api/methodology/prune_meth").json()["version"]
     conv = client.post(
         "/api/conversation",
@@ -605,10 +621,12 @@ def test_revision_prune_keeps_referenced_versions(client, monkeypatch):
     assert conv["methodology_version"] == v_pub
 
     for i in range(4):
-        client.patch(
+        assert client.post(f"/api/agent/{agent['id']}/disable").status_code == 200
+        assert client.patch(
             f"/api/agent/{agent['id']}",
             json={"system_prompt": f"s{i+1}"},
-        )
+        ).status_code == 200
+        assert client.post(f"/api/agent/{agent['id']}/enable").status_code == 200
 
     versions = client.get("/api/methodology/prune_meth/versions").json()
     version_nums = {v["version"] for v in versions}
@@ -679,7 +697,7 @@ def test_snapshot_locks_skill_and_tool_payloads(client, demo_ids):
         json={
             "name": "pl-supervisor",
             "system_prompt": "supervisor",
-            "config": {"role": "supervisor"},
+            "config": {"role": "supervisor", "enabled": True},
             "skill_ids": [skill["id"]],
             "tool_ids": [mcp["id"], demo_ids["tool_search_knowledge"]],
         },
@@ -786,7 +804,7 @@ def test_reject_path_traversal_ids(client):
             "name": "pwn-sup",
             "id": "../../PWNAGENT",
             "system_prompt": "x",
-            "config": {"role": "supervisor"},
+            "config": {"role": "supervisor", "enabled": True},
         },
     )
     assert bad_agent.status_code == 400
@@ -1225,3 +1243,94 @@ def test_chat_e2e_with_fake_model(client, demo_ids, monkeypatch):
     assert msgs.status_code == 200, msgs.text
     history = msgs.json()
     assert history.get("messages") or history
+
+
+def test_agent_enable_publishes_same_name_methodology(client):
+    """主 Agent 启用即发布同名方法论；启用后禁止改任何信息。"""
+    sub = client.post(
+        "/api/agent",
+        json={
+            "name": "enable-sub",
+            "system_prompt": "sub",
+            "config": {"role": "subagent"},
+        },
+    ).json()
+    sup = client.post(
+        "/api/agent",
+        json={
+            "name": "enable-main",
+            "system_prompt": "main",
+            "config": {
+                "role": "supervisor",
+                "subagent_ids": [sub["id"]],
+            },
+        },
+    ).json()
+    assert sup["enabled"] is False
+
+    enabled_sub = client.post(f"/api/agent/{sub['id']}/enable")
+    assert enabled_sub.status_code == 200, enabled_sub.text
+    assert enabled_sub.json()["enabled"] is True
+    locked_sub = client.patch(
+        f"/api/agent/{sub['id']}",
+        json={"system_prompt": "nope"},
+    )
+    assert locked_sub.status_code == 400
+    assert "先停用" in locked_sub.json()["detail"]
+
+    enabled = client.post(f"/api/agent/{sup['id']}/enable")
+    assert enabled.status_code == 200, enabled.text
+    body = enabled.json()
+    assert body["enabled"] is True
+    mid = body["methodology_id"]
+    assert mid
+    meth = client.get(f"/api/methodology/{mid}")
+    assert meth.status_code == 200
+    assert meth.json()["name"] == "enable-main"
+    assert meth.json()["status"] == "published"
+    names = {a["name"] for a in meth.json()["agents"]}
+    assert names == {"enable-main", "enable-sub"}
+
+    locked = client.patch(
+        f"/api/agent/{sup['id']}",
+        json={"system_prompt": "changed"},
+    )
+    assert locked.status_code == 400
+    tools_locked = client.post(
+        f"/api/agent/{sup['id']}/tools",
+        json={"tool_ids": []},
+    )
+    assert tools_locked.status_code == 400
+
+    disabled = client.post(f"/api/agent/{sup['id']}/disable")
+    assert disabled.status_code == 200
+    assert disabled.json()["enabled"] is False
+    assert client.get(f"/api/methodology/{mid}").json()["status"] == "draft"
+
+    patched = client.patch(
+        f"/api/agent/{sup['id']}",
+        json={"system_prompt": "after-disable"},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["system_prompt"] == "after-disable"
+    assert patched.json()["enabled"] is False
+
+    renamed = client.patch(
+        f"/api/agent/{sup['id']}",
+        json={"name": "enable-main-renamed"},
+    )
+    assert renamed.status_code == 200
+    assert client.get(f"/api/methodology/{mid}").json()["name"] == "enable-main-renamed"
+
+    conv_draft_blocked = client.post("/api/conversation", json={"methodology_id": mid})
+    assert conv_draft_blocked.status_code == 400
+
+    reenabled = client.post(f"/api/agent/{sup['id']}/enable")
+    assert reenabled.status_code == 200
+    assert reenabled.json()["enabled"] is True
+    meth2 = client.get(f"/api/methodology/{mid}").json()
+    assert meth2["status"] == "published"
+    assert meth2["name"] == "enable-main-renamed"
+    assert meth2["version"] >= 2
+    conv = client.post("/api/conversation", json={"methodology_id": mid})
+    assert conv.status_code == 200

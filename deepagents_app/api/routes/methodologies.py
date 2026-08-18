@@ -34,6 +34,8 @@ from deepagents_app.api.schemas import (
 )
 from deepagents_app.db.session import get_async_db
 from deepagents_app.services.catalog import methodology as methodology_svc
+
+
 router = APIRouter(tags=["methodology"])
 
 
@@ -142,6 +144,22 @@ async def publish_methodology(
     user_id: str = Depends(require_user),
 ):
     return await methodology_svc.publish_methodology(
+        db, methodology_id, owner_user_id=user_id
+    )
+
+
+@router.post("/methodology/{methodology_id}/unpublish", response_model=MethodologyOut)
+async def unpublish_methodology(
+    methodology_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    """
+    将方法论退回 draft。
+
+    管理 / 测试接口；产品主路径请用 ``POST /agent/{id}/disable``。
+    """
+    return await methodology_svc.unpublish_methodology(
         db, methodology_id, owner_user_id=user_id
     )
 

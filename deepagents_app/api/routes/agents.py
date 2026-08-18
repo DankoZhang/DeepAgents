@@ -35,6 +35,8 @@ from deepagents_app.api.schemas import (
 )
 from deepagents_app.db.session import get_async_db
 from deepagents_app.services.catalog import agents as agents_svc
+
+
 router = APIRouter(tags=["agents"])
 
 
@@ -121,6 +123,38 @@ async def delete_agent(
 ):
     await agents_svc.delete_agent(db, agent_id, owner_user_id=user_id)
     return {"ok": True}
+
+
+@router.post("/agent/{agent_id}/enable", response_model=AgentOut)
+async def enable_agent(
+    agent_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    """
+    启用 Agent 并锁定编辑。
+
+    主 Agent 会创建或更新同名方法论并 publish；子 Agent 只置 ``config.enabled``。
+    """
+    return await agents_svc.enable_agent(
+        db, agent_id, owner_user_id=user_id
+    )
+
+
+@router.post("/agent/{agent_id}/disable", response_model=AgentOut)
+async def disable_agent(
+    agent_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user_id: str = Depends(require_user),
+):
+    """
+    停用 Agent 并解锁编辑。
+
+    主 Agent 会把关联方法论退回 draft；已有会话不受影响。
+    """
+    return await agents_svc.disable_agent(
+        db, agent_id, owner_user_id=user_id
+    )
 
 
 @router.post("/agent/{agent_id}/tools", response_model=AgentOut)

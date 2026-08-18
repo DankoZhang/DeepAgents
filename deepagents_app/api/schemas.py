@@ -175,7 +175,8 @@ class AgentCreate(BaseModel):
     name: str  # 全局唯一名称
     system_prompt: str = ""  # 系统提示词
     model_id: str | None = None  # 绑定模型目录；缺省用当前用户 is_default 模型
-    # 扩展字段：role(supervisor|subagent) / description / enabled 等
+    # 扩展字段：role(supervisor|subagent) / description / enabled /
+    # subagent_ids / methodology_id 等。enabled 仅能经启用/停用接口改。
     config: dict[str, Any] = Field(default_factory=dict)
     tool_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的工具 id
     middleware_ids: list[str] = Field(default_factory=list)  # 创建时一并绑定的中间件 id
@@ -217,7 +218,11 @@ class AgentBindSkills(BaseModel):
 
 
 class AgentOut(BaseModel):
-    """Agent 详情/列表响应。"""
+    """
+    Agent 详情/列表响应。
+
+    ``enabled`` / ``methodology_id`` 从 ``config`` 抽出，方便前端不必再翻 JSON。
+    """
 
     id: str
     name: str
@@ -230,6 +235,19 @@ class AgentOut(BaseModel):
     skills: list[SkillBrief] = Field(default_factory=list)  # 已绑定 Skill 摘要
 
     model_config = {"from_attributes": True}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def enabled(self) -> bool:
+        """是否已启用（启用后不可编辑；主 Agent 启用即发布方法论）。"""
+        return bool((self.config or {}).get("enabled"))
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def methodology_id(self) -> str | None:
+        """主 Agent 启用后关联的方法论 id；子 Agent 通常为空。"""
+        mid = (self.config or {}).get("methodology_id")
+        return str(mid) if mid else None
 
 
 # ── Methodology ──────────────────────────────────────────────────────────

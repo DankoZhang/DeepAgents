@@ -10,6 +10,7 @@
 - 按方法论动态 `create_deep_agent()` + 进程内 LRU；多进程经 Redis pub/sub 失效
 - 方法论版本快照（旧会话锁定创建时版本）
 - Skills 入库（SKILL.md 或目录包 zip），组装时按内容指纹物化到 `workspace/users/<scope>/skills/`
+- 主 Agent 启用即发布同名方法论；启用后锁定编辑
 
 前端：[`../DeepAgents-frontend`](../DeepAgents-frontend)
 

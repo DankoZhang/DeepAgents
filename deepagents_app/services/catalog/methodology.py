@@ -248,6 +248,28 @@ async def publish_methodology(
     return row
 
 
+async def unpublish_methodology(
+    db: AsyncSession, methodology_id: str, *, owner_user_id: str
+) -> Methodology:
+    """
+    停用：status 回到 draft，不删快照、不降 version。
+
+    旧会话仍按 Conversation.methodology_version 重建；新建会话会因
+    非 published 被拒绝。产品主路径由主 Agent disable 调用本函数。
+    """
+    row = await get_methodology(db, methodology_id, owner_user_id=owner_user_id)
+    if row is None:
+        raise NotFoundError(f"方法论不存在：{methodology_id}")
+    if row.status == "draft":
+        return row
+    row.status = "draft"
+    row.updated_time = datetime.now(timezone.utc)
+    # 已缓存的 compiled agent 必须失效，避免继续按 published 组装新请求
+    schedule_cache_invalidation(db, methodology_id)
+    await db.flush()
+    return row
+
+
 async def get_methodology_versions(
     db: AsyncSession, methodology_id: str, *, owner_user_id: str
 ) -> list[dict]:

@@ -306,7 +306,12 @@ def _agent_role(agent: dict[str, Any]) -> str:
 
 
 def _agent_enabled(agent: dict[str, Any]) -> bool:
-    """从 config.enabled 读取是否参与组装；缺省 True。"""
+    """
+    组装时是否纳入该 Agent。
+
+    缺省 True：旧快照没有 ``enabled`` 字段时仍参与编译。
+    目录编辑锁相反，未写视为未启用，见 ``agents.agent_is_enabled``。
+    """
     cfg = agent.get("config") or {}
     return bool(cfg.get("enabled", True))
 

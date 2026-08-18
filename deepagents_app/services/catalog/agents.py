@@ -11,11 +11,13 @@ Agent 配置管理
 
 全局 Agent CRUD，以及绑定 Tool / Middleware / Skill。
 Agent 本身不隶属单一方法论；方法论通过勾选引用。
+``config.enabled`` 表示已启用：参与组装、锁定编辑；主 Agent 启用时发布同名方法论。
 变更后默认 ``bump_related``，级联升版所有引用该方法论，保证旧会话可快照重建。
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sqlalchemy import select
@@ -41,7 +43,16 @@ from deepagents_app.services.catalog.crud_helpers import (
 from deepagents_app.services.versioning.revisions import (
     bump_methodologies_using_resource,
     bump_methodology,
+    get_revision,
 )
+
+
+logger = logging.getLogger(__name__)
+
+# 启用后禁止 PATCH / 绑定 / 删除，必须先停用
+_ENABLED_LOCK_MESSAGE = "Agent 已启用，请先停用后再编辑"
+# PATCH 的 config merge 不得改这两项；只允许走 enable / disable 接口
+_PRESERVED_CONFIG_KEYS = ("enabled", "methodology_id")
 
 
 async def list_agents(
@@ -91,6 +102,53 @@ async def get_agent(
     ).one_or_none()
 
 
+def agent_role(agent: AgentDefinition | dict[str, Any]) -> str:
+    """读取 ``config.role``；缺省 subagent。"""
+    cfg = agent.config if isinstance(agent, AgentDefinition) else agent.get("config")
+    return str((cfg or {}).get("role", "subagent")).lower()
+
+
+def agent_is_enabled(agent: AgentDefinition | dict[str, Any]) -> bool:
+    """
+    目录态是否已启用：锁定编辑，且主 Agent 对应方法论应为 published。
+
+    未写 ``enabled`` 视为未启用（新产品默认）。组装旧快照时缺省 True，
+    见 ``agent_factory._agent_enabled``，口径不同。
+    """
+    cfg = agent.config if isinstance(agent, AgentDefinition) else agent.get("config")
+    return bool((cfg or {}).get("enabled"))
+
+
+def _reject_if_enabled(agent: AgentDefinition) -> None:
+    """已启用则拒绝修改，避免改到正在被会话引用的配置。"""
+    if agent_is_enabled(agent):
+        raise BusinessError(_ENABLED_LOCK_MESSAGE)
+
+
+def _subagent_ids_of(agent: AgentDefinition) -> list[str]:
+    """读取主 Agent ``config.subagent_ids``，去空、去重、保序。"""
+    raw = (agent.config or {}).get("subagent_ids") or []
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw:
+        sid = str(item).strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def _set_enabled(agent: AgentDefinition, enabled: bool, **extra: Any) -> None:
+    """写入 ``config.enabled``；``extra`` 用于同时记下 ``methodology_id``。"""
+    cfg = dict(agent.config or {})
+    cfg["enabled"] = enabled
+    cfg.update(extra)
+    agent.config = cfg
+
+
 async def create_agent(
     db: AsyncSession,
     *,
@@ -119,10 +177,10 @@ async def create_agent(
         db, model_id, owner_user_id=owner_user_id
     )
 
-    # role/enabled 存在 config JSON：默认子 Agent 且启用
+    # role/enabled 存在 config JSON：默认子 Agent、未启用（可编辑、不参与组装）
     cfg = dict(config or {})
     cfg.setdefault("role", "subagent")
-    cfg.setdefault("enabled", True)
+    cfg.setdefault("enabled", False)
 
     row = AgentDefinition(
         id=resolve_resource_id(agent_id, prefix="agent_", label="agent id"),
@@ -190,6 +248,7 @@ async def update_agent(
     row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
+    _reject_if_enabled(row)
 
     if name is not None and name != row.name:
         await ensure_unique_owned_name(
@@ -201,6 +260,10 @@ async def update_agent(
             label="Agent",
         )
         row.name = name
+        if agent_role(row) == "supervisor":
+            await _sync_supervisor_methodology_name(
+                db, row, owner_user_id=owner_user_id
+            )
     if system_prompt is not None:
         row.system_prompt = system_prompt
     if model_id is not None:
@@ -208,8 +271,15 @@ async def update_agent(
             db, model_id, owner_user_id=owner_user_id
         )
     if config is not None:
+        # 客户端即使传入 enabled / methodology_id 也丢弃，以库内值为准
+        incoming = dict(config)
+        for key in _PRESERVED_CONFIG_KEYS:
+            incoming.pop(key, None)
         merged = dict(row.config or {})
-        merged.update(config)
+        merged.update(incoming)
+        for key in _PRESERVED_CONFIG_KEYS:
+            if key in (row.config or {}):
+                merged[key] = row.config[key]
         row.config = merged
     if tool_ids is not None:
         await _set_agent_relations(
@@ -266,6 +336,7 @@ async def delete_agent(
     row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
+    _reject_if_enabled(row)
     # 删除后 MethodologyAgent 会级联没掉，必须先收集
     methodology_ids = [
         r.methodology_id
@@ -280,6 +351,198 @@ async def delete_agent(
             methodology = await db.get(Methodology, mid)
             if methodology:
                 await bump_methodology(db, methodology)
+
+
+async def enable_agent(
+    db: AsyncSession, agent_id: str, *, owner_user_id: str
+) -> AgentDefinition:
+    """
+    启用 Agent：锁定编辑。
+
+    主 Agent（supervisor）同时用当前自身 + ``config.subagent_ids``
+    创建或更新同名方法论并发布。子 Agent 只把 ``enabled`` 置为 True。
+    """
+    row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
+    if row is None:
+        raise NotFoundError(f"Agent 不存在：{agent_id}")
+    if agent_is_enabled(row):
+        return row
+    if agent_role(row) == "supervisor":
+        await _enable_supervisor(db, row, owner_user_id=owner_user_id)
+    else:
+        # 子 Agent 只改自身；已发布方法论需升版，下次组装才纳入
+        _set_enabled(row, True)
+        await db.flush()
+        await bump_methodologies_using_resource(
+            db, kind="agent", resource_id=agent_id
+        )
+    return await get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
+
+
+async def disable_agent(
+    db: AsyncSession, agent_id: str, *, owner_user_id: str
+) -> AgentDefinition:
+    """停用 Agent：解锁编辑。主 Agent 同时将关联方法论退回 draft。"""
+    row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
+    if row is None:
+        raise NotFoundError(f"Agent 不存在：{agent_id}")
+    if not agent_is_enabled(row):
+        return row
+    if agent_role(row) == "supervisor":
+        await _disable_supervisor(db, row, owner_user_id=owner_user_id)
+    else:
+        # 停用后从后续组装中排除，已发布方法论同样升版
+        _set_enabled(row, False)
+        await db.flush()
+        await bump_methodologies_using_resource(
+            db, kind="agent", resource_id=agent_id
+        )
+    return await get_agent(db, agent_id, owner_user_id=owner_user_id)  # type: ignore[return-value]
+
+
+async def _enable_supervisor(
+    db: AsyncSession, supervisor: AgentDefinition, *, owner_user_id: str
+) -> None:
+    """
+    主 Agent 启用：保证存在同名方法论并发布。
+
+    成员 = 自身 + ``config.subagent_ids``。发布校验只统计 enabled Agent，
+    因此必须先把 supervisor.enabled 置 True。若当前 version 已有快照，
+    先强制升版，避免覆盖旧会话锁定的那一版。
+    """
+    from deepagents_app.services.catalog import methodology as methodology_svc
+
+    member_ids = await _supervisor_member_ids(
+        db, supervisor, owner_user_id=owner_user_id
+    )
+    methodology = await _resolve_supervisor_methodology(
+        db, supervisor, owner_user_id=owner_user_id
+    )
+    if methodology is None:
+        # 种子可预写 methodology_id，创建时复用该主键
+        preferred_id = str((supervisor.config or {}).get("methodology_id") or "") or None
+        methodology = await methodology_svc.create_methodology(
+            db,
+            owner_user_id=owner_user_id,
+            name=supervisor.name,
+            description=str((supervisor.config or {}).get("description") or ""),
+            methodology_id=preferred_id,
+            agent_ids=member_ids,
+        )
+    else:
+        if methodology.name != supervisor.name:
+            methodology = await methodology_svc.update_methodology(
+                db,
+                methodology.id,
+                owner_user_id=owner_user_id,
+                name=supervisor.name,
+            )
+        methodology = await methodology_svc.bind_methodology_agents(
+            db,
+            methodology.id,
+            member_ids,
+            owner_user_id=owner_user_id,
+            replace=True,
+            bump_version=False,
+        )
+    _set_enabled(supervisor, True, methodology_id=methodology.id)
+    await db.flush()
+    prior = await get_revision(db, methodology.id, methodology.version)
+    if prior is not None:
+        await bump_methodology(db, methodology, force=True)
+    await methodology_svc.publish_methodology(
+        db, methodology.id, owner_user_id=owner_user_id
+    )
+
+
+async def _disable_supervisor(
+    db: AsyncSession, supervisor: AgentDefinition, *, owner_user_id: str
+) -> None:
+    """
+    主 Agent 停用：先把方法论退回 draft，再关 ``enabled``。
+
+    顺序不能反：若 published 方法论里 supervisor 已 disabled，组装会报缺少 Supervisor。
+    旧会话仍按锁定 version 读快照，不受影响。
+    """
+    from deepagents_app.services.catalog import methodology as methodology_svc
+
+    mid = str((supervisor.config or {}).get("methodology_id") or "")
+    if mid:
+        try:
+            await methodology_svc.unpublish_methodology(
+                db, mid, owner_user_id=owner_user_id
+            )
+        except NotFoundError:
+            logger.warning(
+                "停用主 Agent 时方法论不存在，仅关闭 enabled：agent=%s methodology=%s",
+                supervisor.id,
+                mid,
+            )
+    _set_enabled(supervisor, False)
+    await db.flush()
+
+
+async def _supervisor_member_ids(
+    db: AsyncSession, supervisor: AgentDefinition, *, owner_user_id: str
+) -> list[str]:
+    """主 Agent + 配置中的子 Agent；校验归属与角色。"""
+    ids = [supervisor.id]
+    for sid in _subagent_ids_of(supervisor):
+        if sid == supervisor.id:
+            raise BusinessError("子 Agent 列表不能包含主 Agent 自身")
+        sub = await db.get(AgentDefinition, sid)
+        if sub is None:
+            raise NotFoundError(f"子 Agent 不存在：{sid}")
+        if sub.owner_user_id != owner_user_id:
+            raise ForbiddenError(f"子 Agent 不属于当前用户：{sid}")
+        if agent_role(sub) == "supervisor":
+            raise BusinessError(f"不能把主 Agent 当作子 Agent 绑定：{sub.name}")
+        ids.append(sid)
+    return ids
+
+
+async def _resolve_supervisor_methodology(
+    db: AsyncSession, supervisor: AgentDefinition, *, owner_user_id: str
+) -> Methodology | None:
+    """优先 ``config.methodology_id``，否则按同名方法论复用（名称与主 Agent 一致）。"""
+    mid = str((supervisor.config or {}).get("methodology_id") or "")
+    if mid:
+        row = await db.get(Methodology, mid)
+        if row is not None and row.owner_user_id == owner_user_id:
+            return row
+        if row is not None:
+            raise ForbiddenError(f"方法论不属于当前用户：{mid}")
+    found = (
+        await db.scalars(
+            select(Methodology).where(
+                Methodology.owner_user_id == owner_user_id,
+                Methodology.name == supervisor.name,
+            )
+        )
+    ).one_or_none()
+    return found
+
+
+async def _sync_supervisor_methodology_name(
+    db: AsyncSession, supervisor: AgentDefinition, *, owner_user_id: str
+) -> None:
+    """停用态改主 Agent 名称时，同步关联方法论名称。"""
+    from deepagents_app.services.catalog import methodology as methodology_svc
+
+    mid = str((supervisor.config or {}).get("methodology_id") or "")
+    if not mid:
+        return
+    methodology = await db.get(Methodology, mid)
+    if methodology is None or methodology.owner_user_id != owner_user_id:
+        return
+    if methodology.name == supervisor.name:
+        return
+    await methodology_svc.update_methodology(
+        db,
+        mid,
+        owner_user_id=owner_user_id,
+        name=supervisor.name,
+    )
 
 
 async def bind_agent_tools(
@@ -372,6 +635,7 @@ async def _bind_and_reload(
     row = await get_agent(db, agent_id, owner_user_id=owner_user_id)
     if row is None:
         raise NotFoundError(f"Agent 不存在：{agent_id}")
+    _reject_if_enabled(row)
     if replace:
         await _set_agent_relations(
             db,
